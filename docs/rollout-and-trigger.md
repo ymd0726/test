@@ -21,10 +21,10 @@ Phase 2 の日次パイプライン（`docs/daily-pipeline-prompt.md`）の STEP
 > → 完了判定を伴う本格運用は **下流 TOOL-15（タスク・課題フラグ管理）** で実タスクDB
 > （山田タスク管理DB `collection://4ca7dacc-...` 等）と突合して解決する。
 
-### 通知先（候補・要確認）
-- 第一候補：**#a-every-朝礼**（channel_id `C0A8S0RESTB`）
-  — 日次の「超ライトなタスク共有」ch。毎朝の要対応通知と相性が良い。
-- 専用ch（例 #ai-通知）を新設する案も可。→ バッチ質問で確定。
+### 通知先（確定）
+- **当面 #prv**（private, channel_id `C0A6NMGGR53`, 作成者 ymd）へ投稿。
+- 投稿タイミングは**朝礼前 08:00 JST**（取込・集約の04:00とは分離）。
+- 将来チーム展開時に #a-every-朝礼（`C0A8S0RESTB`）等へ切替可能。
 
 ### メッセージ書式（案・@メンション不使用）
 ```
@@ -43,15 +43,19 @@ Phase 2 の日次パイプライン（`docs/daily-pipeline-prompt.md`）の STEP
 - 送信は Slack MCP `slack_send_message`（`channel_id` 指定、テキストのみ）。
 - まずは `slack_send_message_draft`（下書き）で内容確認 → 問題なければ本送信、という運用も可能。
 
-## Phase 4: Claude Code 定時トリガー設定
+## Phase 4: Claude Code 定時トリガー設定（2本構成・確定）
 
-### トリガー構成（作成は確認後）
-- ツール：claude-code-remote `create_trigger`
-- name：`日次コンテキスト化パイプライン`
-- スケジュール：毎日 04:00 JST。cronはUTC基準のため **`0 19 * * *`**（前日19:00 UTC = 当日04:00 JST）。
-- セッション方式：`create_new_session_on_fire: true`（毎回クリーンな新セッションで自己完結実行）。
-- prompt：`docs/daily-pipeline-prompt.md` の本体プロンプト全文（標準入力として自己完結する形）。
-- notifications：完了サマリーを push で受け取る（任意）。
+ツール：claude-code-remote `create_trigger`、いずれも `create_new_session_on_fire: true`・`notifications {push:true}`。
+
+| トリガー | 役割 | JST | cron(UTC) | Slack |
+| --- | --- | --- | --- | --- |
+| 🅰 日次コンテキスト化A（取込＋集約） | STEP①②（生ログ取込→📚集約マージ） | 04:00 | `0 19 * * *` | なし |
+| 🅱 日次タスク期限通知B（→#prv） | STEP③（期限抽出→Slack投稿） | 08:00 | `0 23 * * *` | #prv `C0A6NMGGR53` へ live投稿 |
+
+- 各 prompt は新セッションで自己完結する全文を埋め込み済み（🅰=本リポジトリ `daily-pipeline-prompt.md` のSTEP①②相当、
+  🅱=STEP③＋#prv投稿）。
+- **作成は承認ゲート保留中**：本セッションで `create_trigger` がMCP承認待ちのため未確定。
+  承認後に2本作成すれば本稼働。`list_triggers` / `fire_trigger`(手動発火) / `delete_trigger`(停止) で運用。
 
 ### 立ち上げ手順（ドライラン → 本稼働）
 1. **手動ドライラン**：トリガーを作るか、または本セッションでパイプラインを1回手動実行。
