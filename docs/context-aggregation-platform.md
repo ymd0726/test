@@ -56,6 +56,12 @@
 
 ## 4. 集約コンテキストDB（新設）設計
 
+> **作成済み（実体）**: 📚 集約コンテキストDB
+> - DB: `https://app.notion.com/p/da2c39a9e7554dbdbc5a5be7f306a230`
+> - data source: `collection://082df36b-76ce-41a5-bcb4-9ffea0d71c7a`
+> - 配置: 「DB保管ページ」配下（既存コンテキストDBと同居）
+> - 構造テンプレ・サンプル: `https://app.notion.com/p/38f35c2adb5681238da8efee0170b786`
+
 ### プロパティ
 | プロパティ | 型 | 説明 |
 |---|---|---|
