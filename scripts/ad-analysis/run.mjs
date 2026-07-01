@@ -19,6 +19,9 @@ const ANALYSIS_DB_ID = "75d963602bf24c4fbb6b4fbcd3ef02be"; // 広告分析ログ
 const NOTION_VERSION = "2022-06-28";
 const MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-5";
 const DRY_RUN = String(process.env.DRY_RUN || "").toLowerCase() === "true";
+// 週次で「何週前」を対象にするか。raw_cl(来店/成約データ)の到着遅れを考慮し既定=2(=先々週)。
+// 案件により到着ペースが違うため、将来はCLDBに per案件 のラグ列を持たせて上書きも可能。
+const WEEK_LAG = Number(process.env.WEEK_LAG_WEEKS || 2);
 const SHEET_CHAR_BUDGET = 200000; // Claude へ渡すシート本文の上限（縦長シートでも対象期間を含めるため大きめ）
 
 // ---- 環境変数 ------------------------------------------------
@@ -451,12 +454,13 @@ function todayISO() {
   return `${Y}-${pad(M + 1)}-${pad(D)}`;
 }
 function lastWeekJST() {
+  // WEEK_LAG 週前の月〜日を対象にする（既定=2=先々週。データ到着遅れ対策）
   const { Y, M, D, dow } = jstParts();
   const base = Date.UTC(Y, M, D);
   const sinceMon = (dow + 6) % 7; // 月曜からの経過日数
-  const lastMon = new Date(base - (sinceMon + 7) * 86400000);
-  const lastSun = new Date(base - (sinceMon + 1) * 86400000);
-  return { start: iso(lastMon), end: iso(lastSun), tag: `${String(lastMon.getUTCFullYear()).slice(2)}W${pad(isoWeek(lastMon))}` };
+  const mon = new Date(base - (sinceMon + 7 * WEEK_LAG) * 86400000);
+  const sun = new Date(mon.getTime() + 6 * 86400000);
+  return { start: iso(mon), end: iso(sun), tag: `${String(mon.getUTCFullYear()).slice(2)}W${pad(isoWeek(mon))}` };
 }
 function lastMonthJST() {
   const { Y, M } = jstParts();
