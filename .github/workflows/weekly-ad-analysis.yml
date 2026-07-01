@@ -1,0 +1,39 @@
+name: 週次 広告分析エージェント
+
+# 毎週月曜 07:07 JST に前週(月〜日)分を分析して Notion「広告分析ログDB」へ upsert する。
+# GitHub Actions の cron は UTC 固定なので JST-9h = 日曜 22:07 UTC。
+on:
+  schedule:
+    - cron: "7 22 * * 0"   # Sun 22:07 UTC = Mon 07:07 JST
+  workflow_dispatch:        # 手動テスト実行用（Actions画面の "Run workflow"）
+    inputs:
+      dry_run:
+        description: "true にすると Notion へ書き込まず結果だけ出力"
+        required: false
+        default: "false"
+
+concurrency:
+  group: ad-analysis-weekly
+  cancel-in-progress: false
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install deps
+        working-directory: scripts/ad-analysis
+        run: npm ci || npm install
+      - name: Run weekly analysis
+        working-directory: scripts/ad-analysis
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: node run.mjs weekly

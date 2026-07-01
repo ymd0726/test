@@ -1,0 +1,14 @@
+{
+  "name": "ad-analysis-agent",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "継続分析エージェント: 集計表を読み Claude で分析し Notion 広告分析ログDB へ upsert する",
+  "scripts": {
+    "weekly": "node run.mjs weekly",
+    "monthly": "node run.mjs monthly"
+  },
+  "dependencies": {
+    "googleapis": "^144.0.0"
+  }
+}
