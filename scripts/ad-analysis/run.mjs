@@ -339,8 +339,9 @@ async function analyzeWithClaude(clientName, period, sheetText) {
 }
 
 注意:
+- 出力はJSONオブジェクトのみ。前置き・説明文・コードフェンス(```)を一切付けない。必ず } で閉じる。
 - 数値は必ず集計表の実数を使い、推測しない。読めない値は null。
-- body_markdown は見出し(##)と箇条書き(-)のみ。表は使わない。
+- body_markdown は見出し(##)と箇条書き(-)のみ、全体で1000字以内に収める。表は使わない。
 - 媒体CVが0/空で実質CPAが出せない場合は実質CPA=null、主要課題タグに"計測ズレ"を含める。
 
 --- 集計表ここから ---
@@ -356,14 +357,20 @@ ${sheetText}
     },
     body: JSON.stringify({
       model: MODEL,
-      max_tokens: 2000,
+      max_tokens: 4000,
       messages: [{ role: "user", content: prompt }],
     }),
   });
   const j = await r.json();
   if (!r.ok) throw new Error(`Anthropic -> ${r.status} ${j.error?.message || ""}`);
   const text = j.content?.map((b) => b.text || "").join("") || "";
-  return parseJson(text);
+  const stop = j.stop_reason;
+  try {
+    return parseJson(text);
+  } catch (e) {
+    console.error(`[claude-raw] stop=${stop} len=${text.length} head=${JSON.stringify(text.slice(0, 300))}`);
+    throw e;
+  }
 }
 
 function parseJson(text) {
