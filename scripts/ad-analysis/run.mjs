@@ -22,7 +22,8 @@ const DRY_RUN = String(process.env.DRY_RUN || "").toLowerCase() === "true";
 // 週次で「何週前」を対象にするか。raw_cl(来店/成約データ)の到着遅れを考慮し既定=2(=先々週)。
 // 案件により到着ペースが違うため、将来はCLDBに per案件 のラグ列を持たせて上書きも可能。
 const WEEK_LAG = Number(process.env.WEEK_LAG_WEEKS || 2);
-const SHEET_CHAR_BUDGET = 200000; // Claude へ渡すシート本文の上限（縦長シートでも対象期間を含めるため大きめ）
+const SHEET_CHAR_BUDGET = 25000; // Claude へ渡すシート本文の上限（対象期間の行に絞るので小さめでよい）
+const SHEET_MAX_COLS = 30; // 各行の先頭N列だけ渡す（幅広シートのトークン浪費を防ぐ。主要KPIは先頭列に集約）
 
 // ---- 環境変数 ------------------------------------------------
 const NOTION_TOKEN = req("NOTION_TOKEN");
@@ -270,7 +271,7 @@ async function readSheet(spreadsheetId, gid, tabName, period) {
   const rows = res.data.values || [];
   if (!rows.length) return "";
   const toLine = (r) => {
-    const a = r.map((c) => (c == null ? "" : String(c)));
+    const a = r.slice(0, SHEET_MAX_COLS).map((c) => (c == null ? "" : String(c)));
     while (a.length && a[a.length - 1] === "") a.pop(); // 末尾の空セルを削ってトークン節約
     return a.join("\t");
   };
