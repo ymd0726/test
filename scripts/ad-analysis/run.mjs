@@ -65,7 +65,7 @@ for (const c of clients) {
       results.skipped.push(`${c.name}（集計表URL解析不可）`);
       continue;
     }
-    const sheetText = await readSheet(parsed.spreadsheetId, parsed.gid, c.tabName);
+    const sheetText = await readSheet(parsed.spreadsheetId, parsed.gid, c.tabName, period);
     if (!sheetText) {
       results.skipped.push(`${c.name}（シート読取不可/空）`);
       continue;
@@ -230,8 +230,23 @@ function parseSheetUrl(url) {
   return { spreadsheetId: idm[1], gid: gm ? gm[1] : null };
 }
 
-// gid（無ければタブ名、無ければ先頭タブ）のシートを読み、CSV風テキストにして返す
-async function readSheet(spreadsheetId, gid, tabName) {
+// 対象期間の各日を「M/D」形式トークンにする（週次=7個, 月次=その月の全日）
+function periodTokens(period) {
+  const [ys, ms, ds] = period.start.split("-").map(Number);
+  const [ye, me, de] = period.end.split("-").map(Number);
+  const toks = [];
+  let t = Date.UTC(ys, ms - 1, ds);
+  const end = Date.UTC(ye, me - 1, de);
+  while (t <= end) {
+    const d = new Date(t);
+    toks.push(`${d.getUTCMonth() + 1}/${d.getUTCDate()}`);
+    t += 86400000;
+  }
+  return toks;
+}
+
+// gid（無ければタブ名、無ければ先頭タブ）のシートを読み、対象期間の行に絞ってテキスト化する
+async function readSheet(spreadsheetId, gid, tabName, period) {
   const meta = await sheetsApi.spreadsheets.get({ spreadsheetId });
   const all = meta.data.sheets || [];
   let sheet = null;
@@ -252,19 +267,41 @@ async function readSheet(spreadsheetId, gid, tabName) {
   const rows = res.data.values || [];
   if (!rows.length) return "";
   const toLine = (r) => r.map((c) => (c == null ? "" : String(c))).join("\t");
-  // シート全体を上から順に渡す（日次セクションは連続しているため、上限内で対象期間まで含める）。
-  let text = `# tab: ${title} (総行数=${rows.length})\n`;
-  let truncated = false;
-  for (let i = 0; i < rows.length; i++) {
-    const line = toLine(rows[i]);
-    if (text.length + line.length + 1 > SHEET_CHAR_BUDGET) {
-      truncated = true;
-      break;
-    }
-    text += line + "\n";
+  const headN = Math.min(25, rows.length); // 見出し/サマリー行の文脈
+
+  // 対象期間の日付(M/D)を含む行＋前後1行に絞る。巨大シートでも対象週を確実に含める。
+  const tokens = periodTokens(period);
+  const hits = [];
+  for (let i = headN; i < rows.length; i++) {
+    const joined = rows[i].join(" ");
+    if (tokens.some((t) => joined.includes(t))) hits.push(i);
   }
-  console.log(`[sheet] ${title} rows=${rows.length} sentChars=${text.length} truncated=${truncated}`);
-  if (truncated) text += "…(以下省略: 上限超過)\n";
+
+  let text;
+  if (hits.length) {
+    const keep = new Set();
+    for (let i = 0; i < headN; i++) keep.add(i);
+    for (const i of hits) [i - 1, i, i + 1].forEach((j) => keep.add(j));
+    const idx = [...keep].filter((i) => i >= 0 && i < rows.length).sort((a, b) => a - b);
+    text = `# tab: ${title} (総行数=${rows.length}, 対象期間該当行=${hits.length})\n`;
+    let prev = -2;
+    for (const i of idx) {
+      if (i !== prev + 1) text += "…\n";
+      const line = toLine(rows[i]);
+      if (text.length + line.length + 1 > SHEET_CHAR_BUDGET) break;
+      text += line + "\n";
+      prev = i;
+    }
+  } else {
+    // 該当日次が無い場合は先頭から詰める（週次/月次サマリー行を拾えるように）
+    text = `# tab: ${title} (総行数=${rows.length}, 対象期間の日次行なし→先頭から)\n`;
+    for (let i = 0; i < rows.length; i++) {
+      const line = toLine(rows[i]);
+      if (text.length + line.length + 1 > SHEET_CHAR_BUDGET) break;
+      text += line + "\n";
+    }
+  }
+  console.log(`[sheet] ${title} rows=${rows.length} hits=${hits.length} sentChars=${text.length}`);
   return text;
 }
 
