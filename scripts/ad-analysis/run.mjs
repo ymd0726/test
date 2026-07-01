@@ -269,7 +269,11 @@ async function readSheet(spreadsheetId, gid, tabName, period) {
   });
   const rows = res.data.values || [];
   if (!rows.length) return "";
-  const toLine = (r) => r.map((c) => (c == null ? "" : String(c))).join("\t");
+  const toLine = (r) => {
+    const a = r.map((c) => (c == null ? "" : String(c)));
+    while (a.length && a[a.length - 1] === "") a.pop(); // 末尾の空セルを削ってトークン節約
+    return a.join("\t");
+  };
   const headN = Math.min(25, rows.length); // 見出し/サマリー行の文脈
 
   // 対象期間の日付(M/D)を含む行＋前後1行に絞る。巨大シートでも対象週を確実に含める。
@@ -357,7 +361,7 @@ ${sheetText}
     },
     body: JSON.stringify({
       model: MODEL,
-      max_tokens: 4000,
+      max_tokens: 8000,
       messages: [{ role: "user", content: prompt }],
     }),
   });
