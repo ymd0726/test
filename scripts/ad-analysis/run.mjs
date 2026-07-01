@@ -19,7 +19,7 @@ const ANALYSIS_DB_ID = "75d963602bf24c4fbb6b4fbcd3ef02be"; // 広告分析ログ
 const NOTION_VERSION = "2022-06-28";
 const MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-5";
 const DRY_RUN = String(process.env.DRY_RUN || "").toLowerCase() === "true";
-const SHEET_CHAR_BUDGET = 60000; // Claude へ渡すシート本文の上限（トークン節約）
+const SHEET_CHAR_BUDGET = 200000; // Claude へ渡すシート本文の上限（縦長シートでも対象期間を含めるため大きめ）
 
 // ---- 環境変数 ------------------------------------------------
 const NOTION_TOKEN = req("NOTION_TOKEN");
@@ -252,19 +252,19 @@ async function readSheet(spreadsheetId, gid, tabName) {
   const rows = res.data.values || [];
   if (!rows.length) return "";
   const toLine = (r) => r.map((c) => (c == null ? "" : String(c))).join("\t");
-  // 直近の実績は末尾にあることが多い。「先頭(見出し/サマリー)＋末尾(直近)」を渡す。
-  const headN = Math.min(20, rows.length);
-  let text = `# tab: ${title}（先頭=見出し/サマリー, 末尾=直近データ。対象期間の行は末尾側から探すこと）\n`;
-  text += `## 先頭 ${headN} 行\n` + rows.slice(0, headN).map(toLine).join("\n") + "\n## 末尾(直近)\n";
-  const tail = [];
-  let used = text.length;
-  for (let i = rows.length - 1; i >= headN; i--) {
+  // シート全体を上から順に渡す（日次セクションは連続しているため、上限内で対象期間まで含める）。
+  let text = `# tab: ${title} (総行数=${rows.length})\n`;
+  let truncated = false;
+  for (let i = 0; i < rows.length; i++) {
     const line = toLine(rows[i]);
-    if (used + line.length + 1 > SHEET_CHAR_BUDGET) break;
-    tail.push(line);
-    used += line.length + 1;
+    if (text.length + line.length + 1 > SHEET_CHAR_BUDGET) {
+      truncated = true;
+      break;
+    }
+    text += line + "\n";
   }
-  text += tail.reverse().join("\n");
+  console.log(`[sheet] ${title} rows=${rows.length} sentChars=${text.length} truncated=${truncated}`);
+  if (truncated) text += "…(以下省略: 上限超過)\n";
   return text;
 }
 
@@ -275,7 +275,7 @@ async function analyzeWithClaude(clientName, period, sheetText) {
   const prompt =
 `あなたは広告運用の分析アシスタントです。以下は案件「${clientName}」の集計表(タブ抽出・タブ区切り)です。
 対象期間: ${period.start} 〜 ${period.end}（${GRAN}）。この期間の実績を集計表から読み取ってください。
-ヒント: 日付は「6/22」等の形式のことがあります。対象期間の行は「末尾(直近)」側にあることが多いので、そこから探してください。${GRAN}の場合は日次行を対象期間で合算/該当行から算出してよいです。
+ヒント: 日付は「6/22」等の形式のことがあります。まず対象期間に該当する日次行を探し、${GRAN==="週次"?"その週(月〜日)の日次を合算":"その月の日次を合算/月次サマリー行を使用"}してKPIを出してください。日次が見つからない場合のみ、週次/月次の集計セクションから対象期間に該当する行を特定してください。
 
 出力は次のJSONだけを返してください（前後に文章やコードフェンスを付けない）:
 {
