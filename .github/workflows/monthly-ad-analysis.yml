@@ -1,0 +1,40 @@
+name: 月次 広告分析エージェント
+
+# 毎月1日の翌朝 07:10 JST に前月分を分析して Notion「広告分析ログDB」へ upsert する。
+# cron は UTC 固定。JST 07:10 = 前日 22:10 UTC。日付ズレを避けるため毎月2日の 22:10 UTC(=3日07:10 JST)ではなく、
+# 「毎月1日 22:10 UTC(=2日 07:10 JST)」で運用する（前月が対象なので日付ズレは問題にならない）。
+on:
+  schedule:
+    - cron: "10 22 1 * *"   # 1st 22:10 UTC = 2nd 07:10 JST
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "true にすると Notion へ書き込まず結果だけ出力"
+        required: false
+        default: "false"
+
+concurrency:
+  group: ad-analysis-monthly
+  cancel-in-progress: false
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install deps
+        working-directory: scripts/ad-analysis
+        run: npm ci || npm install
+      - name: Run monthly analysis
+        working-directory: scripts/ad-analysis
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: node run.mjs monthly
