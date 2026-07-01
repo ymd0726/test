@@ -19,7 +19,11 @@ const ANALYSIS_DB_ID = "75d963602bf24c4fbb6b4fbcd3ef02be"; // 広告分析ログ
 const NOTION_VERSION = "2022-06-28";
 const MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-5";
 const DRY_RUN = String(process.env.DRY_RUN || "").toLowerCase() === "true";
-const SHEET_CHAR_BUDGET = 45000; // Claude へ渡すシート本文の上限（トークン節約）
+// 週次で「何週前」を対象にするか。raw_cl(来店/成約データ)の到着遅れを考慮し既定=2(=先々週)。
+// 案件により到着ペースが違うため、将来はCLDBに per案件 のラグ列を持たせて上書きも可能。
+const WEEK_LAG = Number(process.env.WEEK_LAG_WEEKS || 2);
+const SHEET_CHAR_BUDGET = 25000; // Claude へ渡すシート本文の上限（対象期間の行に絞るので小さめでよい）
+const SHEET_MAX_COLS = 30; // 各行の先頭N列だけ渡す（幅広シートのトークン浪費を防ぐ。主要KPIは先頭列に集約）
 
 // ---- 環境変数 ------------------------------------------------
 const NOTION_TOKEN = req("NOTION_TOKEN");
@@ -65,7 +69,7 @@ for (const c of clients) {
       results.skipped.push(`${c.name}（集計表URL解析不可）`);
       continue;
     }
-    const sheetText = await readSheet(parsed.spreadsheetId, parsed.gid, c.tabName);
+    const sheetText = await readSheet(parsed.spreadsheetId, parsed.gid, c.tabName, period);
     if (!sheetText) {
       results.skipped.push(`${c.name}（シート読取不可/空）`);
       continue;
@@ -230,8 +234,23 @@ function parseSheetUrl(url) {
   return { spreadsheetId: idm[1], gid: gm ? gm[1] : null };
 }
 
-// gid（無ければタブ名、無ければ先頭タブ）のシートを読み、CSV風テキストにして返す
-async function readSheet(spreadsheetId, gid, tabName) {
+// 対象期間の各日を「M/D」形式トークンにする（週次=7個, 月次=その月の全日）
+function periodTokens(period) {
+  const [ys, ms, ds] = period.start.split("-").map(Number);
+  const [ye, me, de] = period.end.split("-").map(Number);
+  const toks = [];
+  let t = Date.UTC(ys, ms - 1, ds);
+  const end = Date.UTC(ye, me - 1, de);
+  while (t <= end) {
+    const d = new Date(t);
+    toks.push(`${d.getUTCMonth() + 1}/${d.getUTCDate()}`);
+    t += 86400000;
+  }
+  return toks;
+}
+
+// gid（無ければタブ名、無ければ先頭タブ）のシートを読み、対象期間の行に絞ってテキスト化する
+async function readSheet(spreadsheetId, gid, tabName, period) {
   const meta = await sheetsApi.spreadsheets.get({ spreadsheetId });
   const all = meta.data.sheets || [];
   let sheet = null;
@@ -246,17 +265,51 @@ async function readSheet(spreadsheetId, gid, tabName) {
   const res = await sheetsApi.spreadsheets.values.get({
     spreadsheetId,
     range: `'${title}'`,
-    valueRenderOption: "UNFORMATTED_VALUE",
+    valueRenderOption: "FORMATTED_VALUE", // 日付を読める形式(例 6/22)で取得
+    dateTimeRenderOption: "FORMATTED_STRING",
   });
   const rows = res.data.values || [];
-  let text = `# tab: ${title}\n`;
-  for (const r of rows) {
-    text += r.map((c) => (c == null ? "" : String(c))).join("\t") + "\n";
-    if (text.length > SHEET_CHAR_BUDGET) {
-      text += "…(以下省略)";
-      break;
+  if (!rows.length) return "";
+  const toLine = (r) => {
+    const a = r.slice(0, SHEET_MAX_COLS).map((c) => (c == null ? "" : String(c)));
+    while (a.length && a[a.length - 1] === "") a.pop(); // 末尾の空セルを削ってトークン節約
+    return a.join("\t");
+  };
+  const headN = Math.min(25, rows.length); // 見出し/サマリー行の文脈
+
+  // 対象期間の日付(M/D)を含む行＋前後1行に絞る。巨大シートでも対象週を確実に含める。
+  const tokens = periodTokens(period);
+  const hits = [];
+  for (let i = headN; i < rows.length; i++) {
+    const joined = rows[i].join(" ");
+    if (tokens.some((t) => joined.includes(t))) hits.push(i);
+  }
+
+  let text;
+  if (hits.length) {
+    const keep = new Set();
+    for (let i = 0; i < headN; i++) keep.add(i);
+    for (const i of hits) [i - 1, i, i + 1].forEach((j) => keep.add(j));
+    const idx = [...keep].filter((i) => i >= 0 && i < rows.length).sort((a, b) => a - b);
+    text = `# tab: ${title} (総行数=${rows.length}, 対象期間該当行=${hits.length})\n`;
+    let prev = -2;
+    for (const i of idx) {
+      if (i !== prev + 1) text += "…\n";
+      const line = toLine(rows[i]);
+      if (text.length + line.length + 1 > SHEET_CHAR_BUDGET) break;
+      text += line + "\n";
+      prev = i;
+    }
+  } else {
+    // 該当日次が無い場合は先頭から詰める（週次/月次サマリー行を拾えるように）
+    text = `# tab: ${title} (総行数=${rows.length}, 対象期間の日次行なし→先頭から)\n`;
+    for (let i = 0; i < rows.length; i++) {
+      const line = toLine(rows[i]);
+      if (text.length + line.length + 1 > SHEET_CHAR_BUDGET) break;
+      text += line + "\n";
     }
   }
+  console.log(`[sheet] ${title} rows=${rows.length} hits=${hits.length} sentChars=${text.length}`);
   return text;
 }
 
@@ -267,6 +320,7 @@ async function analyzeWithClaude(clientName, period, sheetText) {
   const prompt =
 `あなたは広告運用の分析アシスタントです。以下は案件「${clientName}」の集計表(タブ抽出・タブ区切り)です。
 対象期間: ${period.start} 〜 ${period.end}（${GRAN}）。この期間の実績を集計表から読み取ってください。
+ヒント: 日付は「6/22」等の形式のことがあります。まず対象期間に該当する日次行を探し、${GRAN==="週次"?"その週(月〜日)の日次を合算":"その月の日次を合算/月次サマリー行を使用"}してKPIを出してください。日次が見つからない場合のみ、週次/月次の集計セクションから対象期間に該当する行を特定してください。
 
 出力は次のJSONだけを返してください（前後に文章やコードフェンスを付けない）:
 {
@@ -290,8 +344,9 @@ async function analyzeWithClaude(clientName, period, sheetText) {
 }
 
 注意:
+- 出力はJSONオブジェクトのみ。前置き・説明文・コードフェンスを一切付けない。必ず } で閉じる。
 - 数値は必ず集計表の実数を使い、推測しない。読めない値は null。
-- body_markdown は見出し(##)と箇条書き(-)のみ。表は使わない。
+- body_markdown は見出し(##)と箇条書き(-)のみ、全体で1000字以内に収める。表は使わない。
 - 媒体CVが0/空で実質CPAが出せない場合は実質CPA=null、主要課題タグに"計測ズレ"を含める。
 
 --- 集計表ここから ---
@@ -307,14 +362,20 @@ ${sheetText}
     },
     body: JSON.stringify({
       model: MODEL,
-      max_tokens: 2000,
+      max_tokens: 8000,
       messages: [{ role: "user", content: prompt }],
     }),
   });
   const j = await r.json();
   if (!r.ok) throw new Error(`Anthropic -> ${r.status} ${j.error?.message || ""}`);
   const text = j.content?.map((b) => b.text || "").join("") || "";
-  return parseJson(text);
+  const stop = j.stop_reason;
+  try {
+    return parseJson(text);
+  } catch (e) {
+    console.error(`[claude-raw] stop=${stop} len=${text.length} head=${JSON.stringify(text.slice(0, 300))}`);
+    throw e;
+  }
 }
 
 function parseJson(text) {
@@ -405,12 +466,13 @@ function todayISO() {
   return `${Y}-${pad(M + 1)}-${pad(D)}`;
 }
 function lastWeekJST() {
+  // WEEK_LAG 週前の月〜日を対象にする（既定=2=先々週。データ到着遅れ対策）
   const { Y, M, D, dow } = jstParts();
   const base = Date.UTC(Y, M, D);
   const sinceMon = (dow + 6) % 7; // 月曜からの経過日数
-  const lastMon = new Date(base - (sinceMon + 7) * 86400000);
-  const lastSun = new Date(base - (sinceMon + 1) * 86400000);
-  return { start: iso(lastMon), end: iso(lastSun), tag: `${String(lastMon.getUTCFullYear()).slice(2)}W${pad(isoWeek(lastMon))}` };
+  const mon = new Date(base - (sinceMon + 7 * WEEK_LAG) * 86400000);
+  const sun = new Date(mon.getTime() + 6 * 86400000);
+  return { start: iso(mon), end: iso(sun), tag: `${String(mon.getUTCFullYear()).slice(2)}W${pad(isoWeek(mon))}` };
 }
 function lastMonthJST() {
   const { Y, M } = jstParts();
