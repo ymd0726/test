@@ -19,7 +19,7 @@ const ANALYSIS_DB_ID = "75d963602bf24c4fbb6b4fbcd3ef02be"; // 広告分析ログ
 const NOTION_VERSION = "2022-06-28";
 const MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-5";
 const DRY_RUN = String(process.env.DRY_RUN || "").toLowerCase() === "true";
-const SHEET_CHAR_BUDGET = 45000; // Claude へ渡すシート本文の上限（トークン節約）
+const SHEET_CHAR_BUDGET = 60000; // Claude へ渡すシート本文の上限（トークン節約）
 
 // ---- 環境変数 ------------------------------------------------
 const NOTION_TOKEN = req("NOTION_TOKEN");
@@ -246,17 +246,25 @@ async function readSheet(spreadsheetId, gid, tabName) {
   const res = await sheetsApi.spreadsheets.values.get({
     spreadsheetId,
     range: `'${title}'`,
-    valueRenderOption: "UNFORMATTED_VALUE",
+    valueRenderOption: "FORMATTED_VALUE", // 日付を読める形式(例 6/22)で取得
+    dateTimeRenderOption: "FORMATTED_STRING",
   });
   const rows = res.data.values || [];
-  let text = `# tab: ${title}\n`;
-  for (const r of rows) {
-    text += r.map((c) => (c == null ? "" : String(c))).join("\t") + "\n";
-    if (text.length > SHEET_CHAR_BUDGET) {
-      text += "…(以下省略)";
-      break;
-    }
+  if (!rows.length) return "";
+  const toLine = (r) => r.map((c) => (c == null ? "" : String(c))).join("\t");
+  // 直近の実績は末尾にあることが多い。「先頭(見出し/サマリー)＋末尾(直近)」を渡す。
+  const headN = Math.min(20, rows.length);
+  let text = `# tab: ${title}（先頭=見出し/サマリー, 末尾=直近データ。対象期間の行は末尾側から探すこと）\n`;
+  text += `## 先頭 ${headN} 行\n` + rows.slice(0, headN).map(toLine).join("\n") + "\n## 末尾(直近)\n";
+  const tail = [];
+  let used = text.length;
+  for (let i = rows.length - 1; i >= headN; i--) {
+    const line = toLine(rows[i]);
+    if (used + line.length + 1 > SHEET_CHAR_BUDGET) break;
+    tail.push(line);
+    used += line.length + 1;
   }
+  text += tail.reverse().join("\n");
   return text;
 }
 
@@ -267,6 +275,7 @@ async function analyzeWithClaude(clientName, period, sheetText) {
   const prompt =
 `あなたは広告運用の分析アシスタントです。以下は案件「${clientName}」の集計表(タブ抽出・タブ区切り)です。
 対象期間: ${period.start} 〜 ${period.end}（${GRAN}）。この期間の実績を集計表から読み取ってください。
+ヒント: 日付は「6/22」等の形式のことがあります。対象期間の行は「末尾(直近)」側にあることが多いので、そこから探してください。${GRAN}の場合は日次行を対象期間で合算/該当行から算出してよいです。
 
 出力は次のJSONだけを返してください（前後に文章やコードフェンスを付けない）:
 {
