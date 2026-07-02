@@ -1,6 +1,12 @@
 # 既存Worker（jdem-stop-mcp）への結合手順
 
-既存 `src/index.ts` に以下を追記する（既存構造に合わせて調整。追記は3箇所＋レジストリ拡張のみ）。
+> **✅ 2026-07-02 結合済み**: 本体ソースの取り込み後、下記1〜5および7のコード側追記は
+> `src/index.ts` / `gas/stopCreative_common.gs` に適用済み。
+> 残るのは **(a) 未取り込みの設定ファイル（wrangler.jsonc / package.json / tsconfig.json 等）のアップロード、
+> (b) GASエディタへの `submitCreative_common.gs` 追加＋新バージョンデプロイ、
+> (c) Workerシークレット追加＋deploy、(d) Slackアプリに `/cr-in` 追加**（下記6・7・8参照）。
+
+以下は適用内容の記録（既存構造に合わせて調整。追記は3箇所＋レジストリ拡張のみ）。
 
 ## 1. import
 
@@ -90,7 +96,8 @@ npm run deploy
 
 ## 7. 共通GAS
 
-`gas/submitCreative_common.gs` をGASプロジェクトに追加し、既存doPostに追記:
+`apps/jdem-stop-mcp/gas/submitCreative_common.gs` を共通GASプロジェクトに**新規ファイルとして追加**（コピペ）。
+doPostへの分岐追記はリポジトリ内 `stopCreative_common.gs` に適用済みなので、GASエディタ側の `stopCreative_common.gs` にも同じ2分岐を反映する:
 
 ```js
 if (req.action === 'submitCreative') return jsonOut(handleSubmitCreative(req));

@@ -32,7 +32,7 @@
 | パス | 内容 |
 |---|---|
 | `apps/jdem-stop-mcp/src/submit/` | Worker追加モジュール（TypeScript）。既存index.tsへの結合は `integration.md` 参照 |
-| `gas/submitCreative_common.gs` | 共通GASへ追加する集計表展開（action=submitCreative / submitUndo） |
+| `apps/jdem-stop-mcp/gas/submitCreative_common.gs` | 共通GASへ追加する集計表展開（action=submitCreative / submitUndo） |
 | `scripts/cr-submit/inspect_sheet.mjs` | 集計表構造の読み取り専用ダンプ（Phase 0調査） |
 | `.github/workflows/inspect-sheet.yml` | 上記をGitHub Actionsで実行（既存 `GOOGLE_SERVICE_ACCOUNT_JSON` シークレット使用） |
 | `docs/cr-submit/integration.md` | 既存Worker index.ts への結合手順 |

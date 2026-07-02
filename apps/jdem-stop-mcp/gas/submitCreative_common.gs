@@ -1,11 +1,11 @@
 /**
  * cr入稿くん 集計表展開（共通GASへの追加分）
  * ------------------------------------------------------------
- * 既存 stopCreative_common.gs と同じスタンドアロンGASにこのファイルを追加し、
- * doPost のルーティングに以下を足す:
- *
- *   if (req.action === 'submitCreative') return jsonOut(handleSubmitCreative(req));
- *   if (req.action === 'submitUndo')     return jsonOut(handleSubmitUndo(req));
+ * 既存 stopCreative_common.gs と同じスタンドアロンGASプロジェクトに
+ * このファイルを新規ファイルとして追加する（コピペでOK）。
+ * doPost のルーティング分岐は stopCreative_common.gs 側に追記済み
+ * （action === 'submitCreative' / 'submitUndo'）。
+ * 反映は「デプロイを管理 → 新バージョン」（URLを変えないため）。
  *
  * 機能:
  *   CR00テンプレブロックを複製して「CR00の直右」に挿入する。

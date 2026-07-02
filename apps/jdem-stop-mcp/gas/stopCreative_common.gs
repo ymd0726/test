@@ -57,6 +57,10 @@ function doPost(e) {
       result = findCreative(ssId, sheetName, params.creativeName);
     } else if (action === 'budget_propagate') {
       result = budgetPropagate(ssId, sheetName, params);
+    } else if (action === 'submitCreative') {
+      result = handleSubmitCreative(params); // cr入稿くん: CR00ブロック展開（submitCreative_common.gs）
+    } else if (action === 'submitUndo') {
+      result = handleSubmitUndo(params);     // cr入稿くん: 展開の取り消し
     } else {
       result = { success: false, message: '不明なaction: ' + action };
     }

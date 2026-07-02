@@ -23,6 +23,11 @@ import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
+// ── cr入稿くん（/cr-in）──
+import { handleCrInCommand, handleCrInInteraction } from "./submit/command";
+import { handleContinue, CONTINUE_PATH } from "./submit/continuation";
+import type { SubmitEnv, SubmitProject } from "./submit/types";
+
 const GRAPH = "v21.0"; // Meta Graph API バージョン（古くなったらここを上げる）
 
 interface Env {
@@ -34,7 +39,14 @@ interface Env {
   META_TOKEN_LOCAL?: string; // Local Infomation BM 用トークン(grm等)
   NOTION_TOKEN?: string;     // Notionログ用 内部インテグレーショントークン（予算波及でも使用）
   BUDGET_TOKEN?: string;     // 予算確定→波及くん リンク用 共有シークレット
+  GOOGLE_SERVICE_ACCOUNT_JSON?: string; // cr入稿くん: Drive読み取り用SA（ads-reader@... を流用）
+  SELF_URL?: string;         // cr入稿くん: continuation self-fetch用（未設定時はリクエストのoriginを使用）
   [key: string]: any; // 案件別トークンを secret名で動的参照するため
+}
+
+// cr入稿くん用の環境ビュー（COMMON_GAS_URLは本ファイルの定数を注入）
+function submitEnvOf(env: Env, origin: string): SubmitEnv {
+  return { ...env, COMMON_GAS_URL, SELF_URL: env.SELF_URL || origin } as unknown as SubmitEnv;
 }
 
 // 共通GAS（スタンドアロン・openById）。全案件これ1つを spreadsheetId 付きで叩く。
@@ -53,6 +65,12 @@ interface Project {
   sheets: SheetTarget[];     // 1件＝複数の集計対象を持てる（cr名でどれか自動判定）
   metaAdAccountId?: string;  // 数字のみ。未設定はMeta実停止スキップ（集計表のみ）
   metaTokenSecret?: string;  // 別BMの案件のトークンsecret名。省略時は META_ACCESS_TOKEN
+  // ── cr入稿くん（/cr-in）用。設定した案件だけ入稿可能 ──
+  driveFolderId?: string;    // 完成動画フォルダのDrive ID（確実。名前検索より優先）
+  driveFolderName?: string;  // または名前検索（例 "cr_jde"。同名複数あるとエラー）
+  crdbDataSourceId?: string; // Notion CRDB（cr指示ページの検索先）
+  adNameStyle?: "full" | "short"; // Meta広告名: full=ファイル名そのまま / short=cr番号のみ
+  adsetAllowlist?: string[]; // 入稿先候補にする広告セットID（省略時はACTIVE全セット）
 }
 
 // 案件に対応するMetaトークンを返す（BMが違う案件は別secretを使う）
@@ -84,7 +102,13 @@ const PROJECTS: Project[] = [
   ] },
   { name: "jdekmak", channelId: "C09S1F9TXSP", metaAdAccountId: "1533513563939156", sheets: [ // #z-n22_jde_kk_mak（巻き肩）
       { spreadsheetId: "1oEK8JCJg2NcseWmnxLtfNFCe5A7XGJ_DJSj7c2EW1sg", sheetName: "kk_mak" },
-  ] },
+    ],
+    // ── cr入稿くん（初期スコープ案件）──
+    driveFolderName: "cr_jde",  // TODO: 確定したら driveFolderId 直指定に切替（同名フォルダ誤検出防止）
+    crdbDataSourceId: "2c155406-c36d-4d7d-9d2a-22aefd4f17cf", // CRDB（E2Eで database_id と一致するか要確認）
+    adNameStyle: "full", // jde系は広告名フル名称（jde_mak_cr84_… 実測済）
+    adsetAllowlist: ["120246843077960183"], // mak本体広告セット（cr81/82/84の直近入稿先）
+  },
   { name: "jdekkou", channelId: "C092NPS16P3", metaAdAccountId: "1533513563939156", sheets: [ // #z-n22_jde_kk_kou（甲剥がし）
       { spreadsheetId: "1oEK8JCJg2NcseWmnxLtfNFCe5A7XGJ_DJSj7c2EW1sg", sheetName: "kk_kou" },
   ] },
@@ -827,7 +851,7 @@ function undoLines(creative: string, memoMode: string, resumed: number, sheet: a
   return lines.join("\n");
 }
 
-function handleSlackCommand(env: Env, ctx: ExecutionContext, bodyText: string): Response {
+function handleSlackCommand(env: Env, ctx: ExecutionContext, bodyText: string, senv: SubmitEnv): Response {
   const params = new URLSearchParams(bodyText);
   const command = params.get("command");
   const text = params.get("text") || "";
@@ -836,6 +860,23 @@ function handleSlackCommand(env: Env, ctx: ExecutionContext, bodyText: string): 
   const project = projectByChannel(channelId);
   if (!project) {
     return slackJson({ response_type: "ephemeral", text: `このチャンネルは案件未登録です（channel_id=${channelId}）。Workerのレジストリに追加が必要です。` });
+  }
+
+  // ── cr入稿くん: /cr-in <cr名 or NotionページURL> ──
+  if (command === "/cr-in") {
+    if (!metaToken(env, project) || !project.metaAdAccountId) {
+      return slackJson({ response_type: "ephemeral", text: `この案件（${project.name}）はMeta未連携のため入稿できません。` });
+    }
+    if (!project.crdbDataSourceId && !/notion|^[0-9a-f-]{32,36}$/i.test(text.trim())) {
+      return slackJson({ response_type: "ephemeral", text: `この案件（${project.name}）は入稿未対応です（crdbDataSourceId未設定）。NotionページURLでの指定なら可能です。` });
+    }
+    return handleCrInCommand(
+      { text, channel_id: channelId, user_id: params.get("user_id") || "", response_url: responseUrl },
+      project as SubmitProject,
+      senv,
+      ctx,
+      (p) => metaToken(env, p as Project)!,
+    );
   }
   const { creative, date } = parseArgs(text);
   if (!creative) return slackJson({ response_type: "ephemeral", text: "使い方: `/cr-stop <cr名> [M/D]`（日付省略で今日）" });
@@ -870,13 +911,29 @@ async function postResponse(url: string, body: unknown): Promise<void> {
   await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 }
 
-function handleSlackInteract(env: Env, ctx: ExecutionContext, bodyText: string): Response {
+function handleSlackInteract(env: Env, ctx: ExecutionContext, bodyText: string, senv: SubmitEnv): Response {
   const params = new URLSearchParams(bodyText);
   let payload: any = {};
   try { payload = JSON.parse(params.get("payload") || "{}"); } catch {}
   const responseUrl: string = payload.response_url;
   const userId: string = payload.user?.id || "";
   const userName: string = payload.user?.username || payload.user?.name || userId;
+
+  // ── cr入稿くん: action_id が crin_ で始まるものは submit 側で処理 ──
+  const actionId: string = payload.actions?.[0]?.action_id || "";
+  if (actionId.startsWith("crin_")) {
+    const ch = payload.channel?.id || payload.container?.channel_id || "";
+    const p = projectByChannel(ch);
+    return handleCrInInteraction(
+      payload,
+      p as SubmitProject | undefined,
+      senv,
+      ctx,
+      (pr) => metaToken(env, pr as Project)!,
+      (pr) => pr.sheets,
+    );
+  }
+
   let v: any = {};
   try { v = JSON.parse(payload.actions?.[0]?.value || "{}"); } catch {}
 
@@ -948,7 +1005,20 @@ export default {
       if (!(await verifySlack(request, env.SLACK_SIGNING_SECRET, bodyText))) {
         return new Response("invalid signature", { status: 401 });
       }
-      return url.pathname === "/slack/command" ? handleSlackCommand(env, ctx, bodyText) : handleSlackInteract(env, ctx, bodyText);
+      const senv = submitEnvOf(env, url.origin);
+      return url.pathname === "/slack/command" ? handleSlackCommand(env, ctx, bodyText, senv) : handleSlackInteract(env, ctx, bodyText, senv);
+    }
+
+    // --- cr入稿くん: continuation（HMAC署名で自己検証。Slack署名不要）---
+    if (url.pathname === CONTINUE_PATH && request.method === "POST") {
+      return handleContinue(
+        request,
+        submitEnvOf(env, url.origin),
+        ctx,
+        (name) => metaToken(env, projectByName(name)!)!,
+        (name) => projectByName(name)!.sheets,
+        (name) => projectByName(name)!.metaAdAccountId!,
+      );
     }
 
     // --- 予算確定→波及くん（Notionボタン「リンクを開く」→ GET /budget）---
