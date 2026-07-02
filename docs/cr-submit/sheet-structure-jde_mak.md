@@ -18,6 +18,8 @@
 ## jde_mak 実測結果
 
 > **未実測**。以下の手順で実測し、この表を更新すること。
+> ※ workflow_dispatch はデフォルトブランチにマージされるまでActions画面に出ません。
+> 　本ブランチをマージ後（またはこのworkflowファイルだけ先にmainへ入れた後）に実行してください。
 > 1. Actions → 「集計表 構造ダンプ（cr入稿くん Phase 0）」→ Run workflow（sheet=上記ID、tab=空で自動検出）
 > 2. 出力の「cr00テンプレブロック」「マーカー列」「ID行」「ブロック幅」を下表に転記
 > 3. GAS `submitCreative` を `dryRun: true` で呼び、展開計画が実測と一致することを確認
