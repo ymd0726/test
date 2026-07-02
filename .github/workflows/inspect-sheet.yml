@@ -1,0 +1,37 @@
+name: 集計表 構造ダンプ（cr入稿くん Phase 0）
+
+# 手動実行専用。ad-analysis と同じ GOOGLE_SERVICE_ACCOUNT_JSON シークレットを使い、
+# 対象集計表タブの CR00 ブロック構造を読み取り専用でダンプする。
+on:
+  workflow_dispatch:
+    inputs:
+      sheet:
+        description: "スプレッドシートID または URL"
+        required: true
+        default: "1oEK8JCJg2NcseWmnxLtfNFCe5A7XGJ_DJSj7c2EW1sg"
+      tab:
+        description: "タブ名（空なら cr00 を含む全タブを自動検出）"
+        required: false
+        default: ""
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install deps
+        working-directory: scripts/cr-submit
+        run: npm install --no-audit --no-fund
+      - name: Inspect sheet structure
+        working-directory: scripts/cr-submit
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          if [ -n "${{ github.event.inputs.tab }}" ]; then
+            node inspect_sheet.mjs --sheet "${{ github.event.inputs.sheet }}" --tab "${{ github.event.inputs.tab }}" --json
+          else
+            node inspect_sheet.mjs --sheet "${{ github.event.inputs.sheet }}" --json
+          fi

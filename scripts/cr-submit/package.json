@@ -1,0 +1,9 @@
+{
+  "name": "cr-submit-scripts",
+  "private": true,
+  "type": "module",
+  "description": "cr入稿くん Phase 0 調査スクリプト（集計表構造ダンプ）",
+  "dependencies": {
+    "googleapis": "^140.0.0"
+  }
+}
