@@ -1,0 +1,988 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>🎮 当たりCRシューター</title>
+<style>
+  :root {
+    --bg: #0b1020;
+    --panel: #141b33;
+    --line: #2a3558;
+    --text: #e8ecff;
+    --sub: #9aa7d0;
+    --gold: #ffc93c;
+    --green: #7ed957;
+    --red: #ff5a5a;
+    --yellow: #ffd93b;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Hiragino Sans", "Noto Sans JP", "Yu Gothic", system-ui, sans-serif;
+    display: flex; align-items: center; justify-content: center;
+    overflow: hidden;
+  }
+  #wrap { position: relative; }
+  canvas {
+    display: block;
+    background: radial-gradient(1200px 700px at 50% -10%, #17204a 0%, #0b1020 60%);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    cursor: crosshair;
+    touch-action: none;
+  }
+  .ovl {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(8, 11, 26, .82);
+    backdrop-filter: blur(2px);
+    border-radius: 10px;
+    z-index: 5;
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 22px 26px;
+    width: min(560px, 92%);
+    max-height: 94%;
+    overflow-y: auto;
+    box-shadow: 0 18px 60px rgba(0,0,0,.55);
+    text-align: center;
+  }
+  h1 { font-size: 26px; margin-bottom: 4px; letter-spacing: .04em; }
+  h2 { font-size: 20px; margin-bottom: 10px; }
+  .sub { color: var(--sub); font-size: 12px; margin-bottom: 14px; }
+  table.rules {
+    width: 100%; border-collapse: collapse; font-size: 12px; margin: 10px 0 14px;
+  }
+  table.rules th, table.rules td {
+    border: 1px solid var(--line); padding: 6px 7px; text-align: left; vertical-align: middle;
+  }
+  table.rules th { background: #1b2447; color: var(--sub); font-weight: 600; white-space: nowrap; }
+  table.rules td.pts { color: var(--gold); font-weight: 700; white-space: nowrap; }
+  .note { font-size: 11.5px; color: var(--sub); line-height: 1.7; margin-bottom: 14px; }
+  .note b { color: var(--text); }
+  button {
+    font: inherit; cursor: pointer;
+    background: linear-gradient(180deg, #4d7cff, #3556d8);
+    color: #fff; border: 0; border-radius: 10px;
+    padding: 12px 26px; font-size: 16px; font-weight: 700;
+    margin: 4px 6px;
+    box-shadow: 0 6px 18px rgba(61, 98, 232, .35);
+  }
+  button.secondary { background: #232d55; box-shadow: none; }
+  button:disabled { opacity: .5; cursor: default; }
+  input[type=text] {
+    font: inherit; font-size: 16px; text-align: center;
+    background: #0d1330; color: var(--text);
+    border: 1px solid var(--line); border-radius: 10px;
+    padding: 10px 14px; width: 240px; margin: 6px 0 10px;
+  }
+  .stats { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin: 12px 0; }
+  .stat {
+    background: #0d1330; border: 1px solid var(--line); border-radius: 10px;
+    padding: 8px 12px; font-size: 12px; color: var(--sub); min-width: 96px;
+  }
+  .stat b { display: block; font-size: 18px; color: var(--text); margin-top: 2px; }
+  .bigscore { font-size: 40px; font-weight: 800; color: var(--gold); margin: 8px 0 2px; }
+  #save-msg { min-height: 22px; font-size: 13px; margin-bottom: 6px; color: var(--green); }
+  #save-msg.err { color: var(--red); }
+  .tabs { display: flex; justify-content: center; gap: 8px; margin-bottom: 12px; }
+  .tabs button { padding: 8px 20px; font-size: 14px; }
+  .tabs button.off { background: #232d55; box-shadow: none; opacity: .7; }
+  table.board { width: 100%; border-collapse: collapse; font-size: 14px; }
+  table.board th, table.board td { border-bottom: 1px solid var(--line); padding: 8px 6px; }
+  table.board th { color: var(--sub); font-size: 11px; font-weight: 600; }
+  table.board td.rank { width: 44px; font-weight: 800; }
+  table.board td.score { text-align: right; color: var(--gold); font-weight: 700; }
+  table.board td.wave, table.board td.date { text-align: right; color: var(--sub); font-size: 12px; }
+  #board-status { font-size: 12px; color: var(--sub); margin: 10px 0; line-height: 1.7; }
+  #banner {
+    position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
+    background: #4a3714; color: var(--yellow); border: 1px solid #7a5c1e;
+    font-size: 12px; padding: 6px 14px; border-radius: 999px;
+    z-index: 9; display: none; white-space: nowrap;
+  }
+  #hint {
+    position: absolute; bottom: -28px; left: 0; right: 0;
+    text-align: center; font-size: 11px; color: var(--sub);
+  }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="cv" width="800" height="600"></canvas>
+  <div id="banner">📴 オフラインモード(スコアはこの端末のみに保存されます)</div>
+  <div id="hint">🖱️ マウス移動=操縦 / 押しっぱなし=連射 ｜ ⌨️ 画面クリック後 ←→AD + Space ｜ P=一時停止</div>
+
+  <!-- タイトル -->
+  <div class="ovl" id="ovl-title">
+    <div class="panel">
+      <h1>🎮 当たりCRシューター</h1>
+      <div class="sub">当たりクリエイティブを撃って高スコアを狙え!<br>スコアの重み付けは「当たりCR判定基準グランドルール」の評価点に連動</div>
+      <table class="rules">
+        <tr><th>敵</th><th>実際の判定基準</th><th>ゲーム内</th></tr>
+        <tr><td>🐣 小当たりCR</td><td>消化5〜29%(評価点1〜2)</td><td class="pts">100・200点</td></tr>
+        <tr><td>🎉 当たりCR</td><td>消化30%以上(評価点3〜5)</td><td class="pts">300〜500点</td></tr>
+        <tr><td>👑 当たりCRの型</td><td>評価点9(タフ)</td><td class="pts">900点</td></tr>
+        <tr><td>💸 危険CR</td><td>CPA停止ルール</td><td class="pts">🟡+10%中に停止で+ボーナス<br>🔴+20%放置は減点&被弾!</td></tr>
+      </table>
+      <div class="note">
+        <b>WAVEが進むほど当たりCRの出現率と倍率がUP(最大×3)</b>。連続撃破コンボで最大×2。<br>
+        💸危険CRは 消化判定ライン(目標CPA×2)→ 🟡許容CPAライン(+10%)→ 🔴即停止ライン(+20%)と悪化していく。<br>
+        🟡のうちに「停止」(撃破)すると <b>停止判断ボーナス +500×WAVE倍率</b>!
+      </div>
+      <button id="btn-start">▶ ゲームスタート</button>
+      <button class="secondary" id="btn-board">🏆 ランキング</button>
+    </div>
+  </div>
+
+  <!-- ゲームオーバー -->
+  <div class="ovl hidden" id="ovl-over">
+    <div class="panel">
+      <h2>📊 集計結果</h2>
+      <div class="bigscore" id="over-score">0</div>
+      <div class="sub" id="over-wave">WAVE 1 まで到達</div>
+      <div class="stats">
+        <div class="stat">🐣 小当たり<b id="st-koatari">0</b></div>
+        <div class="stat">🎉 当たり<b id="st-atari">0</b></div>
+        <div class="stat">👑 型<b id="st-kata">0</b></div>
+        <div class="stat">🛑 停止ボーナス<b id="st-stop">0</b></div>
+      </div>
+      <div>
+        <input type="text" id="nickname" maxlength="20" placeholder="ニックネームを入力">
+      </div>
+      <div id="save-msg"></div>
+      <button id="btn-save">💾 スコアを保存</button>
+      <br>
+      <button class="secondary" id="btn-retry">🔁 もう一度</button>
+      <button class="secondary" id="btn-board2">🏆 ランキング</button>
+    </div>
+  </div>
+
+  <!-- ランキング -->
+  <div class="ovl hidden" id="ovl-board">
+    <div class="panel">
+      <h2>🏆 チームランキング</h2>
+      <div class="tabs">
+        <button id="tab-all">全期間</button>
+        <button id="tab-week" class="off">今週</button>
+      </div>
+      <div id="board-status"></div>
+      <table class="board" id="board-table"></table>
+      <div style="margin-top:14px">
+        <button class="secondary" id="btn-close-board">← 戻る</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+'use strict';
+/* =============================================================
+ * 🎮 当たりCRシューター
+ * スコア重み付け: 当たりCR判定基準グランドルール(評価点)連動
+ *   🐣 小当たりCR(評価点1〜2) = 100/200点
+ *   🎉 当たりCR  (評価点3〜5) = 300/400/500点
+ *   👑 当たりCRの型(評価点9)  = 900点
+ *   💸 危険CR: CPA停止ルールのミラー(消化判定→🟡+10%→🔴+20%)
+ * ============================================================= */
+
+// ------------------------------------------------- 定数・数式(判定基準連動)
+const W = 800, H = 600;
+const PLAYER_HP = 3;
+const COMBO_WINDOW = 2.5;      // 秒。無撃破でコンボ消滅
+const STOP_BONUS_BASE = 500;   // 停止判断ボーナス基礎点
+const RED_DRAIN_PER_SEC = 50;  // 🔴即停止ライン放置の予算ドレイン
+const DANGER_T = { judge: 4, yellow: 7, red: 10, timeout: 15 }; // 秒
+
+const TYPES = {
+  koatari: { emoji: '🐣', label: '小当たりCR', color: '#7ed957', bases: [100, 200],      hp: 1, r: 21, speed: 55 },
+  atari:   { emoji: '🎉', label: '当たりCR',   color: '#ffc93c', bases: [300, 400, 500], hp: 2, r: 25, speed: 48 },
+  kata:    { emoji: '👑', label: '当たりCRの型', color: '#d06bff', bases: [900],          hp: 5, r: 30, speed: 34 },
+  danger:  { emoji: '💸', label: '危険CR',     color: '#ff5a5a', bases: [300],           hp: 1, r: 23, speed: 10 },
+};
+
+function atariProb(wave)  { return Math.min(0.10 + 0.02 * wave, 0.30); }
+function kataProb(wave)   { return wave >= 3 ? Math.min(0.02 + 0.01 * (wave - 3), 0.08) : 0; }
+function waveMult(wave)   { return Math.min(1 + 0.1 * (wave - 1), 3); }
+function comboMult(combo) { return Math.min(1 + 0.05 * Math.min(combo, 20), 2); }
+function speedScale(wave) { return Math.min(Math.pow(1.06, wave - 1), 2.5); }
+function enemiesForWave(wave) { return Math.min(10 + 2 * wave, 40); }
+function dangerCount(wave) { return wave >= 2 ? 1 + Math.floor(Math.random() * 2) : 0; }
+function dangerState(age) {
+  if (age < DANGER_T.judge)  return 'burn';   // 消化中(判定前)
+  if (age < DANGER_T.yellow) return 'watch';  // 消化判定ライン到達
+  if (age < DANGER_T.red)    return 'yellow'; // 許容CPAライン(+10%)
+  return 'red';                               // 即停止ライン(+20%)
+}
+
+// -------------------------------------------------------------- API / 保存
+const API = '';
+const LS = { nickname: 'crshooter.nickname', scores: 'crshooter.scores', mute: 'crshooter.mute' };
+const params = new URLSearchParams(location.search);
+const DEBUG = params.get('debug') === '1';
+const TOOL = { matcher: '素材選定くん', naming: '自動命名くん' }[params.get('tool')] || 'その他';
+let offlineMode = location.protocol === 'file:';
+
+function setOffline(on) {
+  offlineMode = on;
+  document.getElementById('banner').style.display = on ? 'block' : 'none';
+}
+
+function localScores() {
+  try { return JSON.parse(localStorage.getItem(LS.scores) || '[]'); } catch (_) { return []; }
+}
+function saveLocalScore(entry) {
+  const list = localScores();
+  list.push(entry);
+  list.sort((a, b) => b.score - a.score);
+  localStorage.setItem(LS.scores, JSON.stringify(list.slice(0, 50)));
+  return list.findIndex((s) => s === entry) + 1;
+}
+
+async function apiGetScores(period) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 70000); // Renderコールドスタート対応
+  try {
+    const res = await fetch(`${API}/api/game/scores?limit=10&period=${period}`, { signal: ctrl.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  } finally { clearTimeout(timer); }
+}
+
+// ------------------------------------------------------------------- 入力
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const input = { x: W / 2, y: H - 70, firing: false, keys: {}, mouseActive: false };
+
+function toLogical(e) {
+  const rect = cv.getBoundingClientRect();
+  const cx = (e.clientX - rect.left) / rect.width * W;
+  const cy = (e.clientY - rect.top) / rect.height * H;
+  return { x: cx, y: cy };
+}
+cv.addEventListener('pointermove', (e) => {
+  const p = toLogical(e);
+  input.x = p.x; input.y = p.y; input.mouseActive = true;
+});
+cv.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  const p = toLogical(e);
+  input.x = p.x; input.y = p.y; input.mouseActive = true; input.firing = true;
+  unlockAudio();
+});
+window.addEventListener('pointerup', () => { input.firing = false; });
+window.addEventListener('keydown', (e) => {
+  if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', ' '].includes(e.key)) e.preventDefault();
+  input.keys[e.key.toLowerCase()] = true;
+  if (e.key.toLowerCase() === 'p' && (S.mode === 'playing' || S.mode === 'paused')) togglePause();
+  input.mouseActive = false;
+  unlockAudio();
+});
+window.addEventListener('keyup', (e) => { input.keys[e.key.toLowerCase()] = false; });
+window.addEventListener('blur', () => { if (S.mode === 'playing') togglePause(true); });
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && S.mode === 'playing') togglePause(true);
+});
+
+// -------------------------------------------------------------------- 音
+let audioCtx = null;
+let muted = localStorage.getItem(LS.mute) === '1';
+function unlockAudio() {
+  if (!audioCtx) {
+    try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (_) {}
+  }
+  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+}
+function beep(freq, dur, type, gain) {
+  if (muted || !audioCtx || audioCtx.state !== 'running') return;
+  const o = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  o.type = type || 'square';
+  o.frequency.value = freq;
+  g.gain.setValueAtTime(gain || 0.03, audioCtx.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + dur);
+  o.connect(g).connect(audioCtx.destination);
+  o.start();
+  o.stop(audioCtx.currentTime + dur);
+}
+const sfx = {
+  shoot: () => beep(880, 0.05, 'square', 0.015),
+  hit:   () => beep(300, 0.06, 'sawtooth', 0.03),
+  kill:  () => beep(520, 0.12, 'triangle', 0.05),
+  big:   () => { beep(660, 0.15, 'triangle', 0.06); setTimeout(() => beep(990, 0.2, 'triangle', 0.06), 90); },
+  dmg:   () => beep(120, 0.3, 'sawtooth', 0.07),
+  clear: () => { [523, 659, 784, 1046].forEach((f, i) => setTimeout(() => beep(f, 0.15, 'triangle', 0.05), i * 90)); },
+};
+
+// ------------------------------------------------------------------ 状態
+const S = {};
+function resetState() {
+  Object.assign(S, {
+    mode: 'title',            // title | playing | paused | over
+    wave: 1,
+    wavePhase: 'intro',       // intro | run | clear
+    phaseTimer: 1.4,
+    queue: [],
+    spawnTimer: 0.4,
+    score: 0,
+    combo: 0,
+    comboTimer: 0,
+    hp: PLAYER_HP,
+    invuln: 0,
+    fireCd: 0,
+    player: { x: W / 2, y: H - 70, r: 15 },
+    enemies: [],
+    bullets: [],
+    ebullets: [],
+    popups: [],
+    stars: S.stars || makeStars(),
+    stats: { koatari: 0, atari: 0, kata: 0, stopBonus: 0 },
+    shake: 0,
+    saved: false,
+  });
+}
+function makeStars() {
+  const a = [];
+  for (let i = 0; i < 70; i++) a.push({ x: Math.random() * W, y: Math.random() * H, s: 0.4 + Math.random() * 1.6 });
+  return a;
+}
+resetState();
+
+function buildWaveQueue(wave) {
+  const n = enemiesForWave(wave);
+  const q = [];
+  for (let i = 0; i < n; i++) {
+    const r = Math.random();
+    if (r < kataProb(wave)) q.push('kata');
+    else if (r < kataProb(wave) + atariProb(wave)) q.push('atari');
+    else q.push('koatari');
+  }
+  for (let i = 0; i < dangerCount(wave); i++) {
+    q.splice(Math.floor(Math.random() * (q.length * 0.7)), 0, 'danger');
+  }
+  return q;
+}
+
+function spawn(type) {
+  const t = TYPES[type];
+  S.enemies.push({
+    type,
+    x: 40 + Math.random() * (W - 80),
+    y: -t.r,
+    r: t.r,
+    hp: t.hp,
+    maxHp: t.hp,
+    base: t.bases[Math.floor(Math.random() * t.bases.length)],
+    age: 0,
+    sway: Math.random() * Math.PI * 2,
+    swayAmp: 20 + Math.random() * 35,
+    fireCd: 2 + Math.random() * 2.5,
+    flash: 0,
+    hoverY: type === 'danger' ? 100 + Math.random() * 160 : 0,
+  });
+}
+
+function calcPoints(base) {
+  return Math.round(base * waveMult(S.wave) * comboMult(S.combo));
+}
+
+function popup(x, y, text, color) {
+  S.popups.push({ x, y, text, color: color || '#fff', t: 1.1 });
+}
+
+function killEnemy(e) {
+  let pts;
+  if (e.type === 'danger') {
+    const st = dangerState(e.age);
+    if (st === 'red') {
+      pts = 100;
+      popup(e.x, e.y, '+100 (即停止ライン超過…)', '#ff9d9d');
+    } else if (st === 'yellow') {
+      const bonus = Math.round(STOP_BONUS_BASE * waveMult(S.wave));
+      pts = calcPoints(e.base) + bonus;
+      S.stats.stopBonus++;
+      popup(e.x, e.y, `+${pts} 停止判断ボーナス!`, '#ffd93b');
+      sfx.big();
+    } else {
+      pts = calcPoints(e.base);
+      popup(e.x, e.y, `+${pts} 早期停止`, '#9be7ff');
+    }
+  } else {
+    pts = calcPoints(e.base);
+    S.stats[e.type]++;
+    popup(e.x, e.y, `+${pts}`, TYPES[e.type].color);
+    if (e.type === 'kata') { sfx.big(); S.shake = 0.35; }
+    else sfx.kill();
+  }
+  S.score += pts;
+  S.combo++;
+  S.comboTimer = COMBO_WINDOW;
+}
+
+function damagePlayer() {
+  if (S.invuln > 0) return;
+  S.hp--;
+  S.combo = 0;
+  S.invuln = 1.5;
+  S.shake = 0.5;
+  sfx.dmg();
+  if (S.hp <= 0) gameOver();
+}
+
+function startGame() {
+  resetState();
+  S.mode = 'playing';
+  S.queue = buildWaveQueue(1);
+  show('ovl-title', false);
+  show('ovl-over', false);
+  show('ovl-board', false);
+}
+
+function gameOver() {
+  S.mode = 'over';
+  document.getElementById('over-score').textContent = S.score.toLocaleString('ja-JP');
+  document.getElementById('over-wave').textContent = `WAVE ${S.wave} まで到達 ｜ ツール: ${TOOL}`;
+  document.getElementById('st-koatari').textContent = S.stats.koatari;
+  document.getElementById('st-atari').textContent = S.stats.atari;
+  document.getElementById('st-kata').textContent = S.stats.kata;
+  document.getElementById('st-stop').textContent = S.stats.stopBonus;
+  document.getElementById('save-msg').textContent = '';
+  document.getElementById('save-msg').className = '';
+  const btn = document.getElementById('btn-save');
+  btn.disabled = false;
+  btn.textContent = '💾 スコアを保存';
+  document.getElementById('nickname').value = localStorage.getItem(LS.nickname) || '';
+  show('ovl-over', true);
+}
+
+function togglePause(force) {
+  if (S.mode === 'playing') S.mode = 'paused';
+  else if (S.mode === 'paused' && !force) S.mode = 'playing';
+}
+
+// ------------------------------------------------------------------ 更新
+function update(dt) {
+  const p = S.player;
+
+  // 移動
+  if (input.mouseActive) {
+    p.x += (input.x - p.x) * Math.min(1, dt * 14);
+    p.y += (Math.max(H * 0.55, Math.min(H - 30, input.y)) - p.y) * Math.min(1, dt * 14);
+  } else {
+    const spd = 340 * dt;
+    if (input.keys['arrowleft'] || input.keys['a']) p.x -= spd;
+    if (input.keys['arrowright'] || input.keys['d']) p.x += spd;
+    if (input.keys['arrowup'] || input.keys['w']) p.y -= spd;
+    if (input.keys['arrowdown'] || input.keys['s']) p.y += spd;
+  }
+  p.x = Math.max(20, Math.min(W - 20, p.x));
+  p.y = Math.max(H * 0.55, Math.min(H - 25, p.y));
+
+  // 発射
+  S.fireCd -= dt;
+  const firing = input.firing || input.keys[' '];
+  if (firing && S.fireCd <= 0) {
+    S.bullets.push({ x: p.x, y: p.y - 18, vy: -520 });
+    S.fireCd = 1 / 8;
+    sfx.shoot();
+  }
+
+  // ウェーブ進行
+  if (S.wavePhase === 'intro') {
+    S.phaseTimer -= dt;
+    if (S.phaseTimer <= 0) S.wavePhase = 'run';
+  } else if (S.wavePhase === 'run') {
+    S.spawnTimer -= dt;
+    if (S.queue.length && S.spawnTimer <= 0) {
+      spawn(S.queue.shift());
+      S.spawnTimer = 0.45 + Math.random() * 0.35;
+    }
+    if (!S.queue.length && !S.enemies.length) {
+      S.wavePhase = 'clear';
+      S.phaseTimer = 1.8;
+      const bonus = 500 * S.wave;
+      S.score += bonus;
+      popup(W / 2, H / 2 - 40, `WAVE CLEAR +${bonus}`, '#7ed957');
+      sfx.clear();
+    }
+  } else if (S.wavePhase === 'clear') {
+    S.phaseTimer -= dt;
+    if (S.phaseTimer <= 0) {
+      S.wave++;
+      S.wavePhase = 'intro';
+      S.phaseTimer = 1.4;
+      S.queue = buildWaveQueue(S.wave);
+      S.spawnTimer = 0.4;
+    }
+  }
+
+  // コンボ
+  if (S.combo > 0) {
+    S.comboTimer -= dt;
+    if (S.comboTimer <= 0) S.combo = 0;
+  }
+  S.invuln = Math.max(0, S.invuln - dt);
+  S.shake = Math.max(0, S.shake - dt);
+
+  // 敵
+  const sc = speedScale(S.wave);
+  let redDrain = false;
+  for (const e of S.enemies) {
+    e.age += dt;
+    e.flash = Math.max(0, e.flash - dt);
+    if (e.type === 'danger') {
+      const st = dangerState(e.age);
+      if (e.y < e.hoverY) e.y += 60 * dt;
+      else e.y += (st === 'red' ? 45 : 6) * dt;
+      e.x += Math.sin(e.age * 1.3 + e.sway) * 18 * dt;
+      if (st === 'red') {
+        redDrain = true;
+        if (e.age >= DANGER_T.timeout) {
+          e.dead = true;
+          popup(e.x, e.y, '予算が溶けた… HP-1', '#ff5a5a');
+          damagePlayer();
+        }
+      }
+    } else {
+      e.y += TYPES[e.type].speed * sc * dt;
+      e.x += Math.cos(e.age * 1.6 + e.sway) * e.swayAmp * dt;
+      // wave5以降、🎉/👑が低速弾
+      if (S.wave >= 5 && (e.type === 'atari' || e.type === 'kata') && e.y > 30) {
+        e.fireCd -= dt;
+        if (e.fireCd <= 0) {
+          e.fireCd = 2.6 + Math.random() * 2.2;
+          const dx = p.x - e.x, dy = p.y - e.y;
+          const d = Math.hypot(dx, dy) || 1;
+          S.ebullets.push({ x: e.x, y: e.y + e.r, vx: dx / d * 130, vy: dy / d * 130 });
+        }
+      }
+    }
+    e.x = Math.max(e.r, Math.min(W - e.r, e.x));
+    if (e.y > H + e.r) {
+      e.dead = true;
+      if (e.type === 'danger') {
+        popup(W / 2, H - 90, '危険CRを見逃した! HP-1', '#ff5a5a');
+        damagePlayer();
+      }
+    }
+  }
+  if (redDrain) {
+    const before = Math.floor(S.score);
+    S.score = Math.max(0, S.score - RED_DRAIN_PER_SEC * dt);
+    if (Math.floor(S.score / 25) !== Math.floor(before / 25)) sfx.hit();
+  }
+
+  // 自弾
+  for (const b of S.bullets) {
+    b.y += b.vy * dt;
+    if (b.y < -10) b.dead = true;
+  }
+  // 敵弾
+  for (const b of S.ebullets) {
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+    if (b.y > H + 10 || b.x < -10 || b.x > W + 10) b.dead = true;
+  }
+
+  // 衝突: 自弾 vs 敵
+  for (const b of S.bullets) {
+    if (b.dead) continue;
+    for (const e of S.enemies) {
+      if (e.dead) continue;
+      const dx = b.x - e.x, dy = b.y - e.y;
+      if (dx * dx + dy * dy < (e.r + 4) * (e.r + 4)) {
+        b.dead = true;
+        e.hp--;
+        e.flash = 0.12;
+        if (e.hp <= 0) { e.dead = true; killEnemy(e); }
+        else sfx.hit();
+        break;
+      }
+    }
+  }
+  // 衝突: 敵・敵弾 vs 自機
+  if (S.invuln <= 0) {
+    for (const e of S.enemies) {
+      if (e.dead) continue;
+      const dx = e.x - p.x, dy = e.y - p.y;
+      if (dx * dx + dy * dy < (e.r + p.r) * (e.r + p.r)) {
+        e.dead = true;
+        damagePlayer();
+        break;
+      }
+    }
+    for (const b of S.ebullets) {
+      if (b.dead) continue;
+      const dx = b.x - p.x, dy = b.y - p.y;
+      if (dx * dx + dy * dy < (p.r + 5) * (p.r + 5)) {
+        b.dead = true;
+        damagePlayer();
+        break;
+      }
+    }
+  }
+
+  // ポップアップ・掃除
+  for (const t of S.popups) { t.t -= dt; t.y -= 34 * dt; }
+  S.enemies = S.enemies.filter((e) => !e.dead);
+  S.bullets = S.bullets.filter((b) => !b.dead);
+  S.ebullets = S.ebullets.filter((b) => !b.dead);
+  S.popups = S.popups.filter((t) => t.t > 0);
+
+  // 星背景
+  for (const st of S.stars) {
+    st.y += st.s * 26 * dt;
+    if (st.y > H) { st.y = -2; st.x = Math.random() * W; }
+  }
+}
+
+// ------------------------------------------------------------------ 描画
+function drawEmojiBadge(e) {
+  const t = TYPES[e.type];
+  // OSで絵文字の見た目が違っても種別が分かるよう、背後に色付き円
+  ctx.beginPath();
+  ctx.arc(e.x, e.y, e.r, 0, Math.PI * 2);
+  ctx.fillStyle = e.flash > 0 ? '#ffffff' : t.color + '33';
+  ctx.fill();
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = t.color;
+  ctx.stroke();
+  ctx.font = `${e.r * 1.35}px "Apple Color Emoji","Segoe UI Emoji",serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(t.emoji, e.x, e.y + 1);
+
+  if (e.maxHp > 1) {
+    const w = e.r * 1.6;
+    ctx.fillStyle = '#00000088';
+    ctx.fillRect(e.x - w / 2, e.y - e.r - 9, w, 4);
+    ctx.fillStyle = t.color;
+    ctx.fillRect(e.x - w / 2, e.y - e.r - 9, w * (e.hp / e.maxHp), 4);
+  }
+
+  if (e.type === 'danger') {
+    const st = dangerState(e.age);
+    let ring = null, label = '';
+    if (st === 'burn') {
+      // 消化ゲージ(目標CPA×2 まで)
+      ctx.beginPath();
+      ctx.arc(e.x, e.y, e.r + 6, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * (e.age / DANGER_T.judge));
+      ctx.strokeStyle = '#8a93b8';
+      ctx.lineWidth = 3;
+      ctx.stroke();
+      label = '消化中';
+    } else if (st === 'watch') {
+      ring = '#c3cbe8'; label = '判定開始';
+    } else if (st === 'yellow') {
+      ring = '#ffd93b'; label = '🟡 CPA+10%';
+    } else {
+      ring = (Math.floor(e.age * 6) % 2) ? '#ff5a5a' : '#ff9d9d';
+      label = '🔴 CPA+20%!';
+    }
+    if (ring) {
+      ctx.beginPath();
+      ctx.arc(e.x, e.y, e.r + 6, 0, Math.PI * 2);
+      ctx.strokeStyle = ring;
+      ctx.lineWidth = 3;
+      ctx.stroke();
+    }
+    ctx.font = 'bold 10px sans-serif';
+    ctx.fillStyle = ring || '#8a93b8';
+    ctx.fillText(label, e.x, e.y + e.r + 14);
+  }
+}
+
+function render() {
+  ctx.save();
+  ctx.clearRect(0, 0, W, H);
+  if (S.shake > 0) {
+    ctx.translate((Math.random() - 0.5) * 8 * S.shake, (Math.random() - 0.5) * 8 * S.shake);
+  }
+
+  // 星
+  ctx.fillStyle = '#3b4877';
+  for (const st of S.stars) ctx.fillRect(st.x, st.y, st.s, st.s * 2);
+
+  if (S.mode === 'playing' || S.mode === 'paused' || S.mode === 'over') {
+    // 弾
+    ctx.fillStyle = '#9be7ff';
+    for (const b of S.bullets) ctx.fillRect(b.x - 2, b.y - 8, 4, 12);
+    for (const b of S.ebullets) {
+      ctx.beginPath();
+      ctx.arc(b.x, b.y, 5, 0, Math.PI * 2);
+      ctx.fillStyle = '#ff8484';
+      ctx.fill();
+    }
+
+    // 敵
+    for (const e of S.enemies) drawEmojiBadge(e);
+
+    // 自機(🚀を上向きに)
+    const p = S.player;
+    if (S.invuln <= 0 || Math.floor(S.invuln * 10) % 2 === 0) {
+      ctx.save();
+      ctx.translate(p.x, p.y);
+      ctx.rotate(-Math.PI / 4); // 🚀は斜め向きの絵文字なので上向きへ補正
+      ctx.font = '34px "Apple Color Emoji","Segoe UI Emoji",serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('🚀', 0, 0);
+      ctx.restore();
+    }
+
+    // ポップアップ
+    ctx.textAlign = 'center';
+    for (const t of S.popups) {
+      ctx.globalAlpha = Math.min(1, t.t * 2);
+      ctx.font = 'bold 15px sans-serif';
+      ctx.fillStyle = t.color;
+      ctx.fillText(t.text, t.x, t.y);
+      ctx.globalAlpha = 1;
+    }
+
+    // HUD
+    ctx.textAlign = 'left';
+    ctx.font = 'bold 20px sans-serif';
+    ctx.fillStyle = '#ffc93c';
+    ctx.fillText(`SCORE ${Math.floor(S.score).toLocaleString('ja-JP')}`, 14, 28);
+    ctx.font = 'bold 14px sans-serif';
+    ctx.fillStyle = '#9aa7d0';
+    ctx.fillText(`WAVE ${S.wave}  ×${waveMult(S.wave).toFixed(1)}`, 14, 50);
+    ctx.textAlign = 'right';
+    ctx.fillText('❤'.repeat(Math.max(0, S.hp)) + '♡'.repeat(Math.max(0, PLAYER_HP - S.hp)), W - 14, 28);
+    if (S.combo >= 2) {
+      ctx.fillStyle = '#7ed957';
+      ctx.fillText(`${S.combo} COMBO ×${comboMult(S.combo).toFixed(2)}`, W - 14, 50);
+    }
+
+    // ウェーブバナー
+    ctx.textAlign = 'center';
+    if (S.wavePhase === 'intro' && S.mode === 'playing') {
+      ctx.font = 'bold 36px sans-serif';
+      ctx.fillStyle = '#e8ecff';
+      ctx.fillText(`WAVE ${S.wave}`, W / 2, H / 2 - 20);
+      ctx.font = '14px sans-serif';
+      ctx.fillStyle = '#9aa7d0';
+      ctx.fillText(`当たりCR出現率 ${(atariProb(S.wave) * 100).toFixed(0)}% ｜ 倍率 ×${waveMult(S.wave).toFixed(1)}`, W / 2, H / 2 + 10);
+    }
+    if (S.mode === 'paused') {
+      ctx.fillStyle = '#000000aa';
+      ctx.fillRect(0, 0, W, H);
+      ctx.font = 'bold 30px sans-serif';
+      ctx.fillStyle = '#e8ecff';
+      ctx.fillText('⏸ PAUSE (Pで再開)', W / 2, H / 2);
+    }
+  }
+  ctx.restore();
+}
+
+// -------------------------------------------------------------- メインループ
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  if (S.mode === 'playing') update(dt);
+  render();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// 表示サイズ調整(アスペクト比4:3維持 + devicePixelRatio)
+function fit() {
+  const availW = Math.min(window.innerWidth - 16, 900);
+  const availH = window.innerHeight - 60;
+  const scale = Math.min(availW / W, availH / H, 1.2);
+  cv.style.width = `${Math.floor(W * scale)}px`;
+  cv.style.height = `${Math.floor(H * scale)}px`;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  cv.width = Math.floor(W * dpr);
+  cv.height = Math.floor(H * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', fit);
+fit();
+
+// ---------------------------------------------------------------- 画面制御
+function show(id, on) {
+  document.getElementById(id).classList.toggle('hidden', !on);
+}
+
+document.getElementById('btn-start').addEventListener('click', startGame);
+document.getElementById('btn-retry').addEventListener('click', startGame);
+document.getElementById('btn-board').addEventListener('click', () => openBoard('title'));
+document.getElementById('btn-board2').addEventListener('click', () => openBoard('over'));
+
+// --- スコア保存
+document.getElementById('btn-save').addEventListener('click', async () => {
+  const btn = document.getElementById('btn-save');
+  const msg = document.getElementById('save-msg');
+  const nickname = document.getElementById('nickname').value.trim();
+  if (!nickname) {
+    msg.textContent = 'ニックネームを入力してください';
+    msg.className = 'err';
+    return;
+  }
+  localStorage.setItem(LS.nickname, nickname);
+  const entry = {
+    nickname,
+    score: Math.floor(S.score),
+    wave: S.wave,
+    atari: S.stats.atari,
+    koatari: S.stats.koatari,
+    kata: S.stats.kata,
+    stopBonus: S.stats.stopBonus,
+    tool: TOOL,
+    date: new Date().toISOString().slice(0, 10),
+  };
+  btn.disabled = true;
+  btn.textContent = '保存中…';
+  const slow = setTimeout(() => {
+    msg.textContent = 'サーバー起動中かも… 最大1分ほどお待ちください';
+    msg.className = '';
+  }, 3000);
+
+  const fallbackLocal = (reason) => {
+    const rank = saveLocalScore(entry);
+    setOffline(true);
+    msg.textContent = `📴 ${reason} → この端末に保存しました(ローカル${rank}位)`;
+    msg.className = '';
+    btn.textContent = '保存済み(ローカル)';
+    S.saved = true;
+  };
+
+  if (offlineMode) { clearTimeout(slow); fallbackLocal('オフラインモード'); return; }
+  try {
+    const res = await fetch(`${API}/api/game/scores`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(entry),
+    });
+    clearTimeout(slow);
+    if (res.status === 201) {
+      const data = await res.json();
+      msg.textContent = data.rank ? `🏆 保存しました! 現在 全体${data.rank}位!` : '🏆 保存しました!';
+      msg.className = '';
+      btn.textContent = '保存済み';
+      S.saved = true;
+    } else if (res.status === 429) {
+      msg.textContent = '保存が多すぎます。少し時間を置いてください(10分に5回まで)';
+      msg.className = 'err';
+      btn.disabled = false;
+      btn.textContent = '💾 スコアを保存';
+    } else if (res.status === 503) {
+      fallbackLocal('スコアDB未設定');
+    } else {
+      const data = await res.json().catch(() => ({}));
+      msg.textContent = `保存に失敗しました (${data.error || res.status})`;
+      msg.className = 'err';
+      btn.disabled = false;
+      btn.textContent = '💾 スコアを保存';
+    }
+  } catch (_) {
+    clearTimeout(slow);
+    fallbackLocal('サーバーに接続できません');
+  }
+});
+
+// --- ランキング
+let boardReturn = 'title';
+let boardPeriod = 'all';
+function openBoard(from) {
+  boardReturn = from;
+  show('ovl-title', false);
+  show('ovl-over', false);
+  show('ovl-board', true);
+  loadBoard(boardPeriod);
+}
+document.getElementById('btn-close-board').addEventListener('click', () => {
+  show('ovl-board', false);
+  show(boardReturn === 'over' ? 'ovl-over' : 'ovl-title', true);
+});
+document.getElementById('tab-all').addEventListener('click', () => switchTab('all'));
+document.getElementById('tab-week').addEventListener('click', () => switchTab('week'));
+function switchTab(period) {
+  boardPeriod = period;
+  document.getElementById('tab-all').className = period === 'all' ? '' : 'off';
+  document.getElementById('tab-week').className = period === 'week' ? '' : 'off';
+  loadBoard(period);
+}
+
+function renderBoard(scores, sourceLabel) {
+  const table = document.getElementById('board-table');
+  const status = document.getElementById('board-status');
+  if (!scores.length) {
+    table.innerHTML = '';
+    status.textContent = `まだスコアがありません。1位を取るチャンス!${sourceLabel}`;
+    return;
+  }
+  const medals = ['🥇', '🥈', '🥉'];
+  table.innerHTML =
+    '<tr><th></th><th style="text-align:left">ニックネーム</th><th style="text-align:right">スコア</th><th style="text-align:right">WAVE</th><th style="text-align:right">日付</th></tr>' +
+    scores.map((s, i) => {
+      const nick = String(s.nickname || '???').replace(/[<>&"]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[c]));
+      return `<tr><td class="rank">${medals[i] || i + 1}</td><td>${nick}</td>` +
+        `<td class="score">${Number(s.score).toLocaleString('ja-JP')}</td>` +
+        `<td class="wave">${s.wave || '-'}</td><td class="date">${(s.date || '').slice(5)}</td></tr>`;
+    }).join('');
+  status.textContent = sourceLabel;
+}
+
+function weekStartLocal() {
+  const d = new Date();
+  d.setDate(d.getDate() - ((d.getDay() + 6) % 7));
+  return d.toISOString().slice(0, 10);
+}
+
+async function loadBoard(period) {
+  const status = document.getElementById('board-status');
+  if (offlineMode) {
+    const ws = weekStartLocal();
+    const list = localScores().filter((s) => period === 'all' || (s.date || '') >= ws).slice(0, 10);
+    renderBoard(list, ' 📴 この端末のローカル記録');
+    return;
+  }
+  status.textContent = '読み込み中…(サーバー起動中は最大1分かかります)';
+  document.getElementById('board-table').innerHTML = '';
+  try {
+    const data = await apiGetScores(period);
+    if (data.offline) {
+      setOffline(true);
+      loadBoard(period);
+      return;
+    }
+    renderBoard(data.scores || [], period === 'week' ? '今週(月曜リセット)のランキング' : '全期間ランキング');
+  } catch (_) {
+    setOffline(true);
+    loadBoard(period);
+  }
+}
+
+// 起動時にサーバー疎通確認(ウォームアップ兼オフライン判定)
+if (!offlineMode) {
+  apiGetScores('all').then((d) => { if (d.offline) setOffline(true); }).catch(() => setOffline(true));
+} else {
+  setOffline(true);
+}
+
+// ---------------------------------------------------------------- デバッグ
+if (DEBUG) {
+  window.__game = {
+    S,
+    TYPES,
+    DANGER_T,
+    atariProb, kataProb, waveMult, comboMult, speedScale, enemiesForWave,
+    dangerState, calcPoints, buildWaveQueue,
+    startGame, gameOver, spawn, killEnemy, damagePlayer,
+    saveLocalScore, localScores,
+  };
+}
+</script>
+</body>
+</html>
