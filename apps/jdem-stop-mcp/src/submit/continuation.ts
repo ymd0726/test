@@ -153,7 +153,7 @@ async function runHop(
         const childIds = plan.hasChildren ? plan.videos.map((v) => v.sheetId) : [];
         const results: string[] = [];
         for (const t of gasTargets) {
-          const r = await callSheetSubmit(env.COMMON_GAS_URL, {
+          const r = await callSheetSubmit(env.SUBMIT_GAS_URL || env.COMMON_GAS_URL, {
             action: "submitCreative",
             spreadsheetId: t.spreadsheetId,
             sheetName: t.sheetName,

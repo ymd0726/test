@@ -101,6 +101,8 @@ export interface SubmitEnv {
   META_TOKEN_LOCAL?: string;
   NOTION_TOKEN: string;
   COMMON_GAS_URL: string;
+  /** 入稿専用GAS（独立プロジェクト）。未設定時はCOMMON_GAS_URLにフォールバック */
+  SUBMIT_GAS_URL?: string;
   // 入稿用に追加するシークレット
   GOOGLE_SERVICE_ACCOUNT_JSON: string; // Drive読み取り（ads-reader@... を流用可）
   /** continuation の署名・self-fetch 用（SHARED_SECRETを流用してもよい） */

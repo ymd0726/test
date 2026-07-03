@@ -1,10 +1,9 @@
 /**
- * cr入稿くん 集計表展開（共通GASへの追加分）
+ * cr入稿くん 集計表展開（独立GASプロジェクト版）
  * ------------------------------------------------------------
- * 既存 stopCreative_common.gs と同じスタンドアロンGASプロジェクトに
- * このファイルを新規ファイルとして追加する（コピペでOK）。
- * doPost のルーティング分岐は stopCreative_common.gs 側に追記済み
- * （action === 'submitCreative' / 'submitUndo'）。
+ * 停止くんの共通GASとは別の、専用GASプロジェクト（submitCreative_common）として
+ * デプロイする。このファイル1本で完結（doPost同梱）。
+ * Workerは SUBMIT_GAS_URL でこちらを叩く（stop/undo/find は従来どおり共通GAS）。
  * 反映は「デプロイを管理 → 新バージョン」（URLを変えないため）。
  *
  * 機能:
@@ -23,6 +22,25 @@
  *
  * ※実行アカウントが対象集計表に編集権限を持つこと（既存stop/undoと同じ）
  */
+
+// ── Web App エンドポイント（このプロジェクト単体で完結）──
+function doPost(e) {
+  try {
+    var params = JSON.parse(e.postData.contents);
+    var action = params.action || '';
+    if (!params.spreadsheetId) return jsonOut({ ok: false, error: 'spreadsheetId がありません' });
+    if (action === 'submitCreative') return jsonOut(handleSubmitCreative(params));
+    if (action === 'submitUndo') return jsonOut(handleSubmitUndo(params));
+    return jsonOut({ ok: false, error: '不明なaction: ' + action });
+  } catch (err) {
+    return jsonOut({ ok: false, error: 'エラー: ' + err });
+  }
+}
+
+function jsonOut(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj))
+                       .setMimeType(ContentService.MimeType.JSON);
+}
 
 var SUBMIT_MARKER = '集計外CR→';
 var SUBMIT_TEMPLATE_ID = 'cr00';

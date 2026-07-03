@@ -44,14 +44,18 @@ interface Env {
   [key: string]: any; // 案件別トークンを secret名で動的参照するため
 }
 
-// cr入稿くん用の環境ビュー（COMMON_GAS_URLは本ファイルの定数を注入）
+// cr入稿くん用の環境ビュー（GAS URLは本ファイルの定数を注入）
 function submitEnvOf(env: Env, origin: string): SubmitEnv {
-  return { ...env, COMMON_GAS_URL, SELF_URL: env.SELF_URL || origin } as unknown as SubmitEnv;
+  return { ...env, COMMON_GAS_URL, SUBMIT_GAS_URL, SELF_URL: env.SELF_URL || origin } as unknown as SubmitEnv;
 }
 
 // 共通GAS（スタンドアロン・openById）。全案件これ1つを spreadsheetId 付きで叩く。
 // 2026-06-21: budget_propagate アクション追加に伴い新デプロイへ更新（stop/undo/find も含むフルセット）。
 const COMMON_GAS_URL = "https://script.google.com/macros/s/AKfycbzQhKd3V7EGnspdrZUSLqYRW0Ruquw-SXEM-8X_Bj-YVK-2e4otn7enf9NcVrQNxLU/exec";
+
+// cr入稿くん専用GAS（独立プロジェクト submitCreative_common / 2026-07-03 山田デプロイ）。
+// 集計表のCR00ブロック展開(action=submitCreative/submitUndo)はこちらを叩く。
+const SUBMIT_GAS_URL = "https://script.google.com/macros/s/AKfycbzUq6Sa_4-TLsmtCfgKwT_WK9FvmJfEUm_DkMSgd7J7s0WXtAjzNziaAIxqu87DLjCW/exec";
 
 // Notion 実行ログDB（誰が何回停止したかの記録）
 const NOTION_LOG_DB_ID = "095cdb118eb34379ae8c5fc372d9e4b1";
