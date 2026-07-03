@@ -1,0 +1,30 @@
+{
+  // Cloudflare Worker 設定。詳細: https://developers.cloudflare.com/workers/wrangler/configuration/
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "jdem-stop-mcp",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-03-10",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // McpAgent は Durable Object を1つ使う（無料プランで利用可能）
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "MCP_OBJECT",
+        "class_name": "CreativeStopMCP"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["CreativeStopMCP"]
+    }
+  ],
+
+  // GAS_WEBAPP_URL と SHARED_SECRET は wrangler secret で設定する（README参照）。
+  // ここには秘密情報を書かない。
+  "observability": {
+    "enabled": true
+  }
+}
