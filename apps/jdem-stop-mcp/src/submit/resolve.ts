@@ -7,7 +7,7 @@
 
 import { SubmitProject, SubmitPlan, PlannedVideo, SubmitEnv } from "./types";
 import { driveAccessToken, resolveFolderId, listCreativeFiles, DriveFile } from "./drive";
-import { fetchCrPage, findCrPageByName, CrPageInfo } from "./notion";
+import { fetchCrPage, findCrPageByName, fetchCldbCrFolderId, CrPageInfo } from "./notion";
 import { listAdsetCandidates, findAdsByExactName, AdsetCandidate } from "./meta";
 
 export interface ResolveInput {
@@ -63,9 +63,24 @@ export async function resolveSubmit(
   if (!crKey) throw new Error(`CRページ名からcr番号を特定できません: ${parentName}`);
 
   // 2. Drive ファイル
+  // crフォルダは CLDB「cr倉庫_(GoogleDrive) #納品先」を最優先で実行時解決（フォルダ移動にデプロイ不要）。
+  // CLDB未設定・未共有・プロパティ空のときはWorker設定値にフォールバック。
+  let configuredFolderId = project.driveFolderId;
+  if (project.cldbPageId) {
+    try {
+      const cldbFolderId = await fetchCldbCrFolderId(env.NOTION_TOKEN, project.cldbPageId);
+      if (cldbFolderId) {
+        configuredFolderId = cldbFolderId;
+      } else {
+        warnings.push("ℹ️ CLDBのcr倉庫プロパティが未設定のため、Worker設定のフォルダを使用");
+      }
+    } catch (e: any) {
+      warnings.push(`ℹ️ CLDB参照失敗（${e.message}）。Worker設定のフォルダを使用`);
+    }
+  }
   const driveToken = await driveAccessToken(env.GOOGLE_SERVICE_ACCOUNT_JSON);
   const folderId = await resolveFolderId(driveToken, {
-    folderId: project.driveFolderId,
+    folderId: configuredFolderId,
     folderName: project.driveFolderName,
   });
   // 親名の先頭部分（説明を除いた {案件}_{crKey}）でも拾えるように2段で検索

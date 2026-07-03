@@ -93,6 +93,23 @@ export async function writeSubmitLog(
   });
 }
 
+/**
+ * CLDB案件ページの「cr倉庫_(GoogleDrive) #納品先」プロパティからDriveフォルダIDを取得。
+ * プロパティ名は前方一致「cr倉庫」で探す（末尾のタグ表記ゆれに耐える）。未設定ならnull。
+ */
+export async function fetchCldbCrFolderId(token: string, cldbPageId: string): Promise<string | null> {
+  const page = await notionApi(token, `pages/${extractPageId(cldbPageId)}`, "GET");
+  const props = page.properties || {};
+  for (const key of Object.keys(props)) {
+    if (!key.startsWith("cr倉庫")) continue;
+    const url: string = props[key]?.url || "";
+    if (!url) return null;
+    const m = url.match(/[?&]id=([\w-]{20,})/) || url.match(/folders\/([\w-]{20,})/);
+    return m ? m[1] : null;
+  }
+  return null;
+}
+
 export function extractPageId(s: string): string {
   const m = String(s).match(/([0-9a-f]{32})|([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
   if (!m) throw new Error(`NotionページID/URLとして解釈できません: ${s}`);

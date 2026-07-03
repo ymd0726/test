@@ -21,7 +21,9 @@ export interface SubmitProject {
   metaTokenSecret?: string;
 
   // ---- 入稿用の追加フィールド ----
-  /** Google Drive のcrフォルダID（例: cr_jde 配下の案件フォルダ）。未設定なら名前検索 */
+  /** CLDB案件ページID。設定時は「cr倉庫_(GoogleDrive) #納品先」プロパティからcrフォルダを実行時解決（最優先） */
+  cldbPageId?: string;
+  /** Google Drive のcrフォルダID（CLDB未設定/読取失敗時のフォールバック） */
   driveFolderId?: string;
   /** Drive フォルダを名前検索する場合のフォルダ名（例: "cr_grm"） */
   driveFolderName?: string;
