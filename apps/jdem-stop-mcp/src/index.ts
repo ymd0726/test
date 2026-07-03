@@ -108,7 +108,7 @@ const PROJECTS: Project[] = [
       { spreadsheetId: "1oEK8JCJg2NcseWmnxLtfNFCe5A7XGJ_DJSj7c2EW1sg", sheetName: "kk_mak" },
     ],
     // ── cr入稿くん（初期スコープ案件）──
-    driveFolderName: "cr_jde",  // TODO: 確定したら driveFolderId 直指定に切替（同名フォルダ誤検出防止）
+    driveFolderId: "1M0Cc9_R_S-h_dm4SoZJ_Tigr8gWVrMck", // 運用代行業/n22_jde_kk/cr_jde_mak_巻き肩（完成動画置き場）
     crdbDataSourceId: "3adda07df1cd407fac365e81c6da2582", // CRDB #クリエイティブdb（database_id。要: cr-stop-workerインテグレーションへの共有）
     adNameStyle: "full", // jde系は広告名フル名称（jde_mak_cr84_… 実測済）
     adsetAllowlist: ["120246843077960183"], // mak本体広告セット（cr81/82/84の直近入稿先）
