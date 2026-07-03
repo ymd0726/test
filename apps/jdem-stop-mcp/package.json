@@ -1,0 +1,22 @@
+{
+  "name": "jdem-stop-mcp",
+  "version": "1.0.0",
+  "description": "Remote MCP server (Cloudflare Worker) that proxies stop/undo creative actions to the jdem GAS Web App",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "agents": "^0.0.80",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250410.0",
+    "typescript": "^5.8.0",
+    "wrangler": "^4.10.0"
+  }
+}

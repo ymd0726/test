@@ -1,0 +1,39 @@
+name: Worker デプロイ（jdem-stop-mcp）
+
+# 手動実行専用。ブラウザだけで Cloudflare Worker をデプロイできるようにする
+# （ローカルの wrangler / ターミナル不要）。
+#
+# 事前準備（初回のみ）:
+# 1. apps/jdem-stop-mcp に wrangler.jsonc / package.json が入っていること
+# 2. Cloudflare APIトークンを作成:
+#    dash.cloudflare.com → 右上アイコン → My Profile → API Tokens →
+#    Create Token → テンプレート「Edit Cloudflare Workers」→ 作成 → トークンをコピー
+# 3. GitHub → Settings → Secrets and variables → Actions →
+#    New repository secret → 名前 CLOUDFLARE_API_TOKEN、値にトークンを貼る
+#
+# シークレット（GOOGLE_SERVICE_ACCOUNT_JSON 等）はデプロイでは消えない。
+# 追加・変更は Cloudflare ダッシュボード（Workers → jdem-stop-mcp →
+# Settings → Variables and Secrets）から行える。
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-worker
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install deps
+        working-directory: apps/jdem-stop-mcp
+        run: npm ci || npm install
+      - name: Deploy to Cloudflare
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          workingDirectory: apps/jdem-stop-mcp

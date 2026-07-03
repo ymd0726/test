@@ -1,0 +1,1044 @@
+/**
+ * クリエイティブ停止 実行ハブ (Cloudflare Worker)
+ * ------------------------------------------------------------------
+ * 2つの入口から同じ実行ロジックを叩く:
+ *   (1) claude.ai / モバイル … MCP (/mcp, /sse)  ← Claude が判断して呼ぶ
+ *   (2) Slack スラッシュコマンド … /slack/command, /slack/interact  ← Claude を挟まない
+ *
+ * 「停止」が行う2つの実体:
+ *   A. Meta実停止 … 案件のMeta広告アカウント内で cr名にマッチする広告を全件 status=PAUSED
+ *   B. 集計表記録 … GAS Web App(doPost stop) でチェック/グレー/メモ記載
+ * undo は A=ACTIVE復帰（集計表undoが成功した時のみ）/ B=GAS undo。
+ *
+ * ルーティング:
+ *   - Slack: channel_id → 案件（cr名は案件をまたいで重複するためチャンネルで確定）
+ *   - MCP  : project 引数があればそれ、無ければ find で全案件を探索（1件のみ採用）
+ *
+ * 認証:
+ *   - MCP : URLパス先頭の共有シークレット(SHARED_SECRET)。非該当パスは404（OAuth誤認回避）
+ *   - Slack: 署名検証(SLACK_SIGNING_SECRET)
+ */
+
+import { McpAgent } from "agents/mcp";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+
+// ── cr入稿くん（/cr-in）──
+import { handleCrInCommand, handleCrInInteraction } from "./submit/command";
+import { handleContinue, CONTINUE_PATH } from "./submit/continuation";
+import type { SubmitEnv, SubmitProject } from "./submit/types";
+
+const GRAPH = "v21.0"; // Meta Graph API バージョン（古くなったらここを上げる）
+
+interface Env {
+  MCP_OBJECT: DurableObjectNamespace;
+  SHARED_SECRET: string;
+  SLACK_SIGNING_SECRET: string;
+  SLACK_BOT_TOKEN: string;
+  META_ACCESS_TOKEN: string; // 既定のMetaトークン(株式会社リードBM, ads_management)
+  META_TOKEN_LOCAL?: string; // Local Infomation BM 用トークン(grm等)
+  NOTION_TOKEN?: string;     // Notionログ用 内部インテグレーショントークン（予算波及でも使用）
+  BUDGET_TOKEN?: string;     // 予算確定→波及くん リンク用 共有シークレット
+  GOOGLE_SERVICE_ACCOUNT_JSON?: string; // cr入稿くん: Drive読み取り用SA（ads-reader@... を流用）
+  SELF_URL?: string;         // cr入稿くん: continuation self-fetch用（未設定時はリクエストのoriginを使用）
+  [key: string]: any; // 案件別トークンを secret名で動的参照するため
+}
+
+// cr入稿くん用の環境ビュー（GAS URLは本ファイルの定数を注入）
+function submitEnvOf(env: Env, origin: string): SubmitEnv {
+  return { ...env, COMMON_GAS_URL, SUBMIT_GAS_URL, SELF_URL: env.SELF_URL || origin } as unknown as SubmitEnv;
+}
+
+// 共通GAS（スタンドアロン・openById）。全案件これ1つを spreadsheetId 付きで叩く。
+// 2026-06-21: budget_propagate アクション追加に伴い新デプロイへ更新（stop/undo/find も含むフルセット）。
+const COMMON_GAS_URL = "https://script.google.com/macros/s/AKfycbzQhKd3V7EGnspdrZUSLqYRW0Ruquw-SXEM-8X_Bj-YVK-2e4otn7enf9NcVrQNxLU/exec";
+
+// cr入稿くん専用GAS（独立プロジェクト submitCreative_common / 2026-07-03 山田デプロイ）。
+// 集計表のCR00ブロック展開(action=submitCreative/submitUndo)はこちらを叩く。
+const SUBMIT_GAS_URL = "https://script.google.com/macros/s/AKfycbzUq6Sa_4-TLsmtCfgKwT_WK9FvmJfEUm_DkMSgd7J7s0WXtAjzNziaAIxqu87DLjCW/exec";
+
+// Notion 実行ログDB（誰が何回停止したかの記録）
+const NOTION_LOG_DB_ID = "095cdb118eb34379ae8c5fc372d9e4b1";
+
+// ── 案件レジストリ ──
+// sheets: 集計表の対象（複数タブ/複数スプレッドシート対応）。sheetName省略時は meta_total/自動検出。
+interface SheetTarget { spreadsheetId: string; sheetName?: string }
+interface Project {
+  name: string;
+  channelId: string;
+  sheets: SheetTarget[];     // 1件＝複数の集計対象を持てる（cr名でどれか自動判定）
+  metaAdAccountId?: string;  // 数字のみ。未設定はMeta実停止スキップ（集計表のみ）
+  metaTokenSecret?: string;  // 別BMの案件のトークンsecret名。省略時は META_ACCESS_TOKEN
+  // ── cr入稿くん（/cr-in）用。設定した案件だけ入稿可能 ──
+  driveFolderId?: string;    // 完成動画フォルダのDrive ID（確実。名前検索より優先）
+  driveFolderName?: string;  // または名前検索（例 "cr_jde"。同名複数あるとエラー）
+  crdbDataSourceId?: string; // Notion CRDB（cr指示ページの検索先）
+  adNameStyle?: "full" | "short"; // Meta広告名: full=ファイル名そのまま / short=cr番号のみ
+  adsetAllowlist?: string[]; // 入稿先候補にする広告セットID（省略時はACTIVE全セット）
+}
+
+// 案件に対応するMetaトークンを返す（BMが違う案件は別secretを使う）
+function metaToken(env: Env, p: Project): string | undefined {
+  return env[p.metaTokenSecret || "META_ACCESS_TOKEN"];
+}
+
+const PROJECTS: Project[] = [
+  // ── 株式会社リードBM（既定トークン）・Meta連携あり ──
+  { name: "jdem", channelId: "C06K15R5PLM", sheets: [{ spreadsheetId: "11ZkSchmHPDeaDLo6h3EfyNYW9pHisxw6ErH5KlU7-EI" }], metaAdAccountId: "376611118470846" },
+  { name: "hyd",  channelId: "C05K6A1AYAX", sheets: [{ spreadsheetId: "1SkCSTuegQoZhNd3keYFOEZw2YIWOnbiRAe0rY-g22bY" }], metaAdAccountId: "240479525112751" },
+  { name: "blr",  channelId: "C08DWV6TNVD", sheets: [{ spreadsheetId: "1sml0bP7vPwkADT820q4Vw9hwmY1vS1VKeYx4HJrmCs4" }], metaAdAccountId: "1478950736840563" },
+  { name: "rcl",  channelId: "C0ASMD3EV5W", sheets: [{ spreadsheetId: "1J1BxvhD7EdfK6iDErRSmwBBXGq56QESnLIAhgfROCB4" }], metaAdAccountId: "961684439806754" },
+  { name: "nrn",  channelId: "C090XM34R8C", sheets: [{ spreadsheetId: "1Q7iph8TxZ5C5ouBb3vjvyNMNgLUmP-Uj1stCO9TewFA" }], metaAdAccountId: "1193318218072212" },
+  { name: "ssh",  channelId: "C089212DETU", sheets: [{ spreadsheetId: "1FkJIJOyYykyHV66I4VLpxHXbkVf_bswK5Y9NojDpOeI" }], metaAdAccountId: "3751573135086293" },
+  { name: "brm",  channelId: "C07KJES7LHW", sheets: [{ spreadsheetId: "1MSJ6sLNWIbZnYy1CbDUNg86KUWq9fX_MlFENKGdGKH8" }], metaAdAccountId: "825363383075510" },
+  // ── 複数集計対象の案件 ──
+  { name: "una",  channelId: "C08DV6STNER", metaAdAccountId: "1063670028480764", sheets: [
+      { spreadsheetId: "1J_T8FurvLgRd6IhxjqE0AqGS8NfQPRanXp55dy9o5gI", sheetName: "meta_total" },        // 本店
+      { spreadsheetId: "1icFYUtazAwq8yDGx6ySC04KvLw8Q3WQ6i_HvIhqE20k", sheetName: "meta_total_銀座店" }, // 銀座店（別スプレッド）
+  ] },
+  { name: "bla",  channelId: "C09FYGDAFEX", metaAdAccountId: "1612534536164262", sheets: [
+      { spreadsheetId: "1s7wI_d9CFRv0pGeNJXVoSg1Ux6VwKznpkf10qTjVgRw", sheetName: "meta_face" },
+      { spreadsheetId: "1s7wI_d9CFRv0pGeNJXVoSg1Ux6VwKznpkf10qTjVgRw", sheetName: "meta_body" },
+  ] },
+  { name: "jdek", channelId: "C092WQSSPUL", metaAdAccountId: "1533513563939156", sheets: [ // #z-n22_jde_all（両訴求 自動判定）
+      { spreadsheetId: "1oEK8JCJg2NcseWmnxLtfNFCe5A7XGJ_DJSj7c2EW1sg", sheetName: "kk_mak" },
+      { spreadsheetId: "1oEK8JCJg2NcseWmnxLtfNFCe5A7XGJ_DJSj7c2EW1sg", sheetName: "kk_kou" },
+  ] },
+  { name: "jdekmak", channelId: "C09S1F9TXSP", metaAdAccountId: "1533513563939156", sheets: [ // #z-n22_jde_kk_mak（巻き肩）
+      { spreadsheetId: "1oEK8JCJg2NcseWmnxLtfNFCe5A7XGJ_DJSj7c2EW1sg", sheetName: "kk_mak" },
+    ],
+    // ── cr入稿くん（初期スコープ案件）──
+    driveFolderName: "cr_jde",  // TODO: 確定したら driveFolderId 直指定に切替（同名フォルダ誤検出防止）
+    crdbDataSourceId: "2c155406-c36d-4d7d-9d2a-22aefd4f17cf", // CRDB（E2Eで database_id と一致するか要確認）
+    adNameStyle: "full", // jde系は広告名フル名称（jde_mak_cr84_… 実測済）
+    adsetAllowlist: ["120246843077960183"], // mak本体広告セット（cr81/82/84の直近入稿先）
+  },
+  { name: "jdekkou", channelId: "C092NPS16P3", metaAdAccountId: "1533513563939156", sheets: [ // #z-n22_jde_kk_kou（甲剥がし）
+      { spreadsheetId: "1oEK8JCJg2NcseWmnxLtfNFCe5A7XGJ_DJSj7c2EW1sg", sheetName: "kk_kou" },
+  ] },
+  // ── 株式会社リードBM・集計表のみ（Meta広告アカウントID未登録 → 後付け可）──
+  { name: "bbt",  channelId: "C0B3J7U8Q5N", sheets: [{ spreadsheetId: "1IoFvL9ZmbhoNRlFl_rvza8VwC0_bA1mJAT5z98-gGf8" }] },
+  { name: "lcl",  channelId: "C08SNLK4CMP", sheets: [{ spreadsheetId: "12WYKgq0i53_ZZXlO7rLZ5zWGLzN7fbPZrGGfeB9kIT0" }] },
+  { name: "aty",  channelId: "C07MTDU23A9", sheets: [{ spreadsheetId: "1Z3OIaJQgr2Nd8ElN0dB_lJ2a8Cls_J9756zaeGoJu9U" }] },
+  { name: "pom",  channelId: "C07K1AQ15T5", sheets: [{ spreadsheetId: "1WmFGDm4vJxJrB_wi4fH27Dq1Xyzj9BTiZv0D9boU6KA", sheetName: "meta_total_02" }] },
+  { name: "rof",  channelId: "C060E2R6AMR", sheets: [{ spreadsheetId: "1SeLfRmBE5wxabOkgWTIFRskbRk9H756E9Zz_trqiMzk", sheetName: "meta_全店共通CR別_face" }] },
+  { name: "rob",  channelId: "C05BQ9GPF9C", sheets: [{ spreadsheetId: "1Ww2jaG_0lsQ4-lq8SS3WCSGpcVuIaoqshR2RzztrbDk", sheetName: "meta_全店共通CR別" }] },
+  // ── Local Infomation BM（META_TOKEN_LOCAL）──
+  { name: "grm",  channelId: "C09GWM75YV6", sheets: [{ spreadsheetId: "1Ug7qBDUUhLutvDLlBbQNiKvIhVbwOhxlOOYm-zPpwG0" }], metaAdAccountId: "1252444372845762", metaTokenSecret: "META_TOKEN_LOCAL" },
+  { name: "fpl",  channelId: "C09NP3CE316", sheets: [{ spreadsheetId: "1fPuoBFCp4LoC8GVr84M9JWMoWwgr6tDzAGZEPEhz-VU" }], metaTokenSecret: "META_TOKEN_LOCAL" },
+];
+
+// cr名がどの集計対象(タブ/スプレッド)にあるかを判定して返す（複数対象案件のルーティング）
+async function pickSheet(p: Project, creative: string): Promise<SheetTarget | null> {
+  if (p.sheets.length === 1) return p.sheets[0];
+  const checks = await Promise.all(
+    p.sheets.map(async (t) => {
+      try { const r = await callGas(t, { action: "find", creativeName: creative }); return r && r.found ? t : null; }
+      catch { return null; }
+    }),
+  );
+  const matches = checks.filter((t): t is SheetTarget => !!t);
+  return matches.length === 1 ? matches[0] : null; // 0件 or 複数一致は null（曖昧）
+}
+
+const projectByName = (n: string) =>
+  PROJECTS.find((p) => p.name.toLowerCase() === String(n).toLowerCase());
+const projectByChannel = (c: string) => PROJECTS.find((p) => p.channelId === c);
+
+// ============================================================
+// GAS 呼び出し（302→Location→GET）
+// ============================================================
+type GasPayload =
+  | { action: "stop"; creativeName: string; stopDate: string }
+  | { action: "undo"; creativeName: string; memoMode: "full" | "tag" }
+  | { action: "find"; creativeName: string }
+  | { action: "budget_propagate"; targetYear: number; targetMonth: number; requestBudget: number; memoText: string; prevBudget: number | null; dryRun: boolean };
+
+async function callGas(target: SheetTarget, payload: GasPayload): Promise<any> {
+  // ハング防止: 各fetchに25秒タイムアウト（GASが重い/固まっても無限に待たない）
+  const withTimeout = async (url: string, init?: RequestInit) => {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 25000);
+    try { return await fetch(url, { ...init, signal: ctl.signal }); } finally { clearTimeout(t); }
+  };
+  const res = await withTimeout(COMMON_GAS_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...payload, spreadsheetId: target.spreadsheetId, sheetName: target.sheetName }),
+    redirect: "manual",
+  });
+  let bodyText: string;
+  if (res.status >= 300 && res.status < 400) {
+    const loc = res.headers.get("location");
+    if (!loc) return { success: false, message: "リダイレクト先(Location)なし", status: res.status };
+    const echo = await withTimeout(loc);
+    bodyText = await echo.text();
+  } else {
+    bodyText = await res.text();
+  }
+  try {
+    return JSON.parse(bodyText);
+  } catch {
+    return { success: false, message: "GASからJSON以外（権限=全員 を確認）", rawPreview: bodyText.slice(0, 200) };
+  }
+}
+
+// project未指定時に find で案件を探索（MCP用）
+async function findProjects(creativeName: string): Promise<Project[]> {
+  const checks = await Promise.all(
+    PROJECTS.map(async (p) => {
+      try {
+        for (const t of p.sheets) {
+          const r = await callGas(t, { action: "find", creativeName });
+          if (r && r.found) return p;
+        }
+        return null;
+      } catch {
+        return null;
+      }
+    }),
+  );
+  return checks.filter((p): p is Project => !!p);
+}
+
+// ============================================================
+// Meta Graph API（広告の検索 / 状態変更）
+// ============================================================
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+// cr名が区切り(先頭/末尾/英数字以外)で独立しているか厳密判定（cr45 が cr450 を誤マッチしない）
+function adNameMatches(adName: string, creative: string): boolean {
+  const re = new RegExp(`(^|[^a-z0-9])${escapeRegex(creative.toLowerCase())}([^a-z0-9]|$)`);
+  return re.test(String(adName).toLowerCase());
+}
+
+interface MetaAd { id: string; name: string; effective_status: string; adsetName?: string; campaignName?: string }
+
+// タイムアウト付き fetch→json（ハング防止）
+async function fetchJsonTimeout(url: string, ms: number): Promise<any> {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), ms);
+  try {
+    const res = await fetch(url, { signal: ctl.signal });
+    return await res.json();
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function metaFindAds(token: string, adAccountId: string, creative: string): Promise<MetaAd[]> {
+  // ① cr番号だけ(例 cr60_11_01→cr60)で軽く検索（id/name/statusのみ＝速い・重くならない）。
+  //    MetaのCONTAINは下線複数の長い文字列で0件を返す癖があるため番号で広く取る。
+  const broad = String(creative).split("_")[0] || creative;
+  const filtering = encodeURIComponent(JSON.stringify([{ field: "name", operator: "CONTAIN", value: broad }]));
+  const url = `https://graph.facebook.com/${GRAPH}/act_${adAccountId}/ads?fields=id,name,effective_status&filtering=${filtering}&limit=300&access_token=${encodeURIComponent(token)}`;
+  const data = await fetchJsonTimeout(url, 12000);
+  if (data.error) throw new Error(`Meta検索失敗: ${data.error.message}`);
+
+  // ② 手元で厳密一致（cr60 が cr600 を、cr60_11_01 が cr60_11_010 を誤マッチしない）
+  let matched: MetaAd[] = (data.data || [])
+    .filter((a: any) => adNameMatches(a.name, creative))
+    .map((a: any) => ({ id: a.id, name: a.name, effective_status: a.effective_status }));
+
+  // ③ 一致した広告だけ CP名/AS名 を取得（軽量・表示用）
+  if (matched.length) {
+    try {
+      const ids = matched.map((m) => m.id).join(",");
+      const u2 = `https://graph.facebook.com/${GRAPH}/?ids=${encodeURIComponent(ids)}&fields=adset{name},campaign{name}&access_token=${encodeURIComponent(token)}`;
+      const d2 = await fetchJsonTimeout(u2, 8000);
+      matched = matched.map((m) => ({ ...m, adsetName: d2?.[m.id]?.adset?.name, campaignName: d2?.[m.id]?.campaign?.name }));
+    } catch {
+      /* CP/AS名は表示用なので取れなくても続行 */
+    }
+  }
+  return matched;
+}
+
+async function metaSetStatus(token: string, adId: string, status: "PAUSED" | "ACTIVE"): Promise<void> {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), 12000); // 1広告12秒でタイムアウト（ハング防止）
+  try {
+    const res = await fetch(`https://graph.facebook.com/${GRAPH}/${adId}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ status, access_token: token }),
+      signal: ctl.signal,
+    });
+    const data: any = await res.json();
+    if (data.error) throw new Error(`Meta更新失敗(${adId}): ${data.error.message}`);
+  } finally {
+    clearTimeout(t);
+  }
+}
+// 複数広告を並列で更新（直列だと多数で固まる）。成功件数を返す。
+async function setAdsStatus(token: string, ids: string[], status: "PAUSED" | "ACTIVE"): Promise<number> {
+  const r = await Promise.allSettled(ids.map((id) => metaSetStatus(token, id, status)));
+  return r.filter((x) => x.status === "fulfilled").length;
+}
+const pauseAds = (token: string, ids: string[]) => setAdsStatus(token, ids, "PAUSED");
+const resumeAds = (token: string, ids: string[]) => setAdsStatus(token, ids, "ACTIVE");
+
+// ============================================================
+// 実行ロジック（停止 / 取消）— MCP・Slack 共通
+// ============================================================
+interface StopResult {
+  alreadyStopped?: boolean;
+  meta?: { configured: boolean; found: number; paused?: number; adNames?: string[] };
+  sheet?: any;
+}
+
+async function doStop(env: Env, p: Project, creative: string, date: string): Promise<StopResult> {
+  const out: StopResult = {};
+  const token = metaToken(env, p);
+
+  // A. Meta実停止
+  if (token && p.metaAdAccountId) {
+    const ads = await metaFindAds(token, p.metaAdAccountId, creative);
+    if (ads.length === 0) {
+      out.meta = { configured: true, found: 0 };
+    } else {
+      const active = ads.filter((a) => a.effective_status !== "PAUSED");
+      if (active.length === 0) {
+        // 全広告が既にPAUSE済 → 二重処理せずアラート（集計表も触らない）
+        out.alreadyStopped = true;
+        out.meta = { configured: true, found: ads.length, paused: 0, adNames: ads.map((a) => a.name) };
+        return out;
+      }
+      for (const a of active) await metaSetStatus(token, a.id, "PAUSED");
+      out.meta = { configured: true, found: ads.length, paused: active.length, adNames: active.map((a) => a.name) };
+    }
+  } else {
+    out.meta = { configured: false, found: 0 };
+  }
+
+  // B. 集計表記録（複数集計対象の案件は cr名で対象タブを判定）
+  const target = await pickSheet(p, creative);
+  out.sheet = target
+    ? await callGas(target, { action: "stop", creativeName: creative, stopDate: date })
+    : { success: false, message: "集計表に該当crが見つかりません(複数対象)" };
+  return out;
+}
+
+async function doUndo(env: Env, p: Project, creative: string, memoMode: "full" | "tag") {
+  const out: any = { meta: null, sheet: null };
+  // B. 集計表undo（先に実行。これが成功＝我々が停止した証拠）
+  const target = await pickSheet(p, creative);
+  out.sheet = target
+    ? await callGas(target, { action: "undo", creativeName: creative, memoMode })
+    : { success: false, message: "集計表に該当crが見つかりません(複数対象)" };
+  // A. 集計表undoが成功した時のみMeta広告をACTIVEに戻す（無関係なPAUSE広告を誤って動かさない）
+  const token = metaToken(env, p);
+  if (out.sheet?.success && token && p.metaAdAccountId) {
+    const ads = await metaFindAds(token, p.metaAdAccountId, creative);
+    const paused = ads.filter((a) => a.effective_status === "PAUSED");
+    for (const a of paused) await metaSetStatus(token, a.id, "ACTIVE");
+    out.meta = { resumed: paused.length, adNames: paused.map((a) => a.name) };
+  }
+  return out;
+}
+
+// 結果を1行メッセージへ
+function fmtStop(out: StopResult, creative: string, date: string): string {
+  if (out.alreadyStopped) {
+    return `⚠️ ${creative} は既に停止済みです（Meta広告は全てPAUSE済）`;
+  }
+  const parts: string[] = [];
+  if (out.meta?.configured) {
+    parts.push(out.meta.found === 0 ? "⚠️Meta広告が見つかりません" : `Meta ${out.meta.paused}件停止`);
+  } else {
+    parts.push("Meta未連携");
+  }
+  parts.push(out.sheet?.success ? `集計表 記録(${date})` : `集計表 失敗:${out.sheet?.message || "?"}`);
+  return `✅ ${creative} を停止しました｜${parts.join(" / ")}`;
+}
+function fmtUndo(out: any, creative: string, memoMode: string): string {
+  if (!out.sheet?.success) return `⚠️ ${creative}: ${out.sheet?.message || "取消情報なし"}`;
+  const parts: string[] = [];
+  if (out.meta) parts.push(`Meta ${out.meta.resumed}件再開`);
+  parts.push(`集計表 復元(${memoMode})`);
+  return `✅ ${creative} の停止を取り消しました｜${parts.join(" / ")}`;
+}
+
+// 全員表示用の詳細通知（チャンネルへ chat.postMessage）
+function fmtPublicStop(out: StopResult, creative: string, date: string, by: string): string {
+  const lines = [`🛑 *${creative}* を停止しました　${by}`];
+  if (out.meta?.configured) {
+    lines.push(out.meta.found === 0 ? "⚠️ Meta広告: 該当広告なし" : `✅ Meta広告: ${out.meta.paused}件 停止（PAUSE）`);
+  } else {
+    lines.push("・Meta: 未連携");
+  }
+  lines.push(out.sheet?.success ? `✅ 集計表: 記録・グレー化（${date}）` : `❌ 集計表: ${out.sheet?.message || "失敗"}`);
+  return lines.join("\n");
+}
+function fmtPublicUndo(out: any, creative: string, memoMode: string, by: string): string {
+  const lines = [`↩️ *${creative}* の停止を取り消しました　${by}`];
+  if (out.meta) lines.push(`✅ Meta広告: ${out.meta.resumed}件 再開（ACTIVE）`);
+  lines.push(`✅ 集計表: 復元（${memoMode}）`);
+  return lines.join("\n");
+}
+
+// Slackへ通知（全員表示）。成功可否を返す（失敗は操作者に警告表示するため）
+async function notifySlack(env: Env, channelId: string, text: string): Promise<{ ok: boolean; error?: string }> {
+  if (!env.SLACK_BOT_TOKEN || !channelId) return { ok: false, error: "no token/channel" };
+  try {
+    const res = await fetch("https://slack.com/api/chat.postMessage", {
+      method: "POST",
+      headers: { "Content-Type": "application/json; charset=utf-8", Authorization: `Bearer ${env.SLACK_BOT_TOKEN}` },
+      body: JSON.stringify({ channel: channelId, text }),
+    });
+    const data: any = await res.json();
+    return data.ok ? { ok: true } : { ok: false, error: data.error };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+function todayJST(): string {
+  const jst = new Date(Date.now() + 9 * 60 * 60 * 1000);
+  return `${jst.getUTCMonth() + 1}/${jst.getUTCDate()}`;
+}
+
+// Notion 実行ログDBへ1行追加（誰が何回停止したかの記録）。失敗は本処理を止めない。
+interface LogEntry { creative: string; user: string; userId: string; action: "停止" | "取消"; project: string; route: "Slack" | "Claude"; metaCount: number; sheetResult: "成功" | "失敗" | "対象なし" }
+async function logToNotion(env: Env, e: LogEntry): Promise<void> {
+  if (!env.NOTION_TOKEN) return;
+  try {
+    await fetch("https://api.notion.com/v1/pages", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${env.NOTION_TOKEN}`, "Notion-Version": "2022-06-28", "Content-Type": "application/json" },
+      body: JSON.stringify({
+        parent: { database_id: NOTION_LOG_DB_ID },
+        properties: {
+          "クリエイティブ": { title: [{ text: { content: e.creative } }] },
+          "実行者": { rich_text: [{ text: { content: e.user } }] },
+          "実行者ID": { rich_text: [{ text: { content: e.userId } }] },
+          "アクション": { select: { name: e.action } },
+          "案件": { select: { name: e.project } },
+          "経路": { select: { name: e.route } },
+          "Meta件数": { number: e.metaCount },
+          "集計表結果": { select: { name: e.sheetResult } },
+        },
+      }),
+    });
+  } catch {
+    /* ログ失敗は本処理を止めない */
+  }
+}
+function sheetResultLabel(sheet: any): "成功" | "失敗" | "対象なし" {
+  if (sheet?.success) return "成功";
+  if (/該当cr/.test(String(sheet?.message || ""))) return "対象なし";
+  return "失敗";
+}
+
+// ============================================================
+// 予算確定→波及くん（Notionボタン「リンクを開く」→ /budget）
+//   Notion予算変更DBレコード → 集計表(monthly)へ予算波及 + Slack通知
+//   桁数ミス警戒の運用文化に合わせ「人が確定確認 → 結果ページで確認」する安全設計。
+// ============================================================
+
+// 案件名(正式な)/別名 → Worker PROJECTS の短縮名 に寄せるための別名表。
+// propagate_budget.yaml と思想は同じ（将来はCLDB rollupへ寄せる）。?case= で明示も可。
+const BUDGET_CASE_ALIASES: Record<string, string> = {
+  "グルーミング": "grm", "grm_集計": "grm", "n33_grm": "grm",
+  "n11_jdem": "jdem",
+  // jde（じぶんdeエステ）。集計表は kk_mak/kk_kou で「リクエスト予算」列は別セッションで追加予定。
+  "じぶんdeエステ": "jdekmak",
+};
+const BUDGET_TAG_LABEL: Record<string, string> = {
+  "予算UP": "予算UP", "予算DOWN": "予算DOWN", "停止": "停止", "再開": "再開",
+  "一部cp(adset)の予算修正": "一部cp(adset)の予算修正",
+};
+
+// 円→万表記（末尾.0除去）。例 250000→"25", 125000→"12.5"
+function manText(yen: number | null): string {
+  if (yen == null || isNaN(yen)) return "?";
+  const v = yen / 10000;
+  return (Math.round(v * 10) / 10).toString();
+}
+
+// 桁数ミス警戒チェック。極端な乖離/桁外れを理由付きで返す。
+function budgetAnomaly(before: number | null, after: number): string[] {
+  const reasons: string[] = [];
+  if (!(after > 0)) reasons.push("変更後予算が0以下");
+  if (after > 0 && after < 10000) reasons.push(`変更後予算が1万円未満（${after.toLocaleString()}円）— 万→円の換算漏れの可能性`);
+  if (after > 100_000_000) reasons.push(`変更後予算が1億円超（${after.toLocaleString()}円）— 桁過剰の可能性`);
+  if (before && before > 0) {
+    const r = after / before;
+    if (r >= 5) reasons.push(`前比 ${r.toFixed(1)}倍（急増）`);
+    else if (r <= 0.2) reasons.push(`前比 ${r.toFixed(2)}倍（急減）`);
+  }
+  return reasons;
+}
+
+// Notion レコード取得（予算変更DB）。必要プロパティを素直に抽出。
+interface BudgetRecord {
+  caseName: string; name: string; before: number | null; after: number; tag: string;
+  changeDate: Date | null; messageText: string;
+}
+async function notionGetBudgetRecord(env: Env, pageId: string): Promise<BudgetRecord> {
+  const res = await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
+    headers: { Authorization: `Bearer ${env.NOTION_TOKEN}`, "Notion-Version": "2022-06-28" },
+  });
+  const data: any = await res.json();
+  if (data.object === "error") throw new Error(`Notion取得失敗: ${data.message}`);
+  const props = data.properties || {};
+  const numberOf = (p: any): number | null => (p && typeof p.number === "number" ? p.number : null);
+  const textOf = (p: any): string => {
+    const arr = p?.rich_text || p?.title || [];
+    return Array.isArray(arr) ? arr.map((t: any) => t.plain_text || "").join("") : "";
+  };
+  const formulaText = (p: any): string => (p?.formula?.string || "");
+  const tags: string[] = (props["Tags"]?.multi_select || []).map((o: any) => o.name);
+  const dateStr: string = props["変更日"]?.date?.start || "";
+  return {
+    caseName: textOf(props["案件名(正式な)"]) || "",
+    name: textOf(props["Name"]) || "",
+    before: numberOf(props["変更前予算_月"]),
+    after: numberOf(props["変更後予算_月"]) ?? NaN,
+    tag: tags[0] || "予算変更",
+    changeDate: dateStr ? new Date(dateStr) : null,
+    messageText: formulaText(props["メッセージ(コピペ用)"]),
+  };
+}
+
+// 案件名→Project解決。誤案件への書込を防ぐため、曖昧一致(startsWith等)は使わず
+// 「?case= → 別名表 → レコード名先頭コードの“完全一致” → 案件名に短縮名包含」の順で安全側に倒す。
+function resolveBudgetProject(caseName: string, caseParam: string, recordName: string): Project | undefined {
+  if (caseParam) { const p = projectByName(caseParam); if (p) return p; }
+  for (const [k, v] of Object.entries(BUDGET_CASE_ALIASES)) {
+    if (caseName.includes(k) || recordName.includes(k)) { const p = projectByName(v); if (p) return p; }
+  }
+  // レコード名の先頭トークン（"una_銀座_予算ダウン"→"una"）が案件短縮名と“完全一致”した時だけ採用
+  const token = (recordName.toLowerCase().match(/^[a-z0-9]+/) || [""])[0];
+  if (token) { const p = projectByName(token); if (p) return p; }
+  return PROJECTS.find((p) => caseName.toLowerCase().includes(p.name.toLowerCase()));
+}
+
+function budgetMemoLine(applyMD: string, tagLabel: string, before: number | null, after: number): string {
+  return `${applyMD}_${tagLabel}${manText(before)}万→${manText(after)}万`;
+}
+
+// 結果HTML（人が確認する安全設計の結果ページ）
+function budgetHtml(title: string, rows: [string, string][], note: string): Response {
+  const trs = rows.map(([k, v]) => `<tr><th style="text-align:left;padding:6px 12px;color:#555">${k}</th><td style="padding:6px 12px;font-weight:600">${v}</td></tr>`).join("");
+  const html = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<div style="font-family:-apple-system,sans-serif;max-width:560px;margin:32px auto;padding:0 16px">
+<h2 style="margin:0 0 4px">${title}</h2>
+<table style="border-collapse:collapse;width:100%;background:#fafafa;border:1px solid #eee;border-radius:8px">${trs}</table>
+<p style="color:#666;margin-top:16px;white-space:pre-wrap">${note}</p>
+<p style="color:#999;font-size:12px">予算確定→波及くん / このタブは閉じて構いません。</p></div>`;
+  return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+}
+
+function handleBudget(env: Env, ctx: ExecutionContext, url: URL): Response | Promise<Response> {
+  const token = url.searchParams.get("token") || "";
+  if (!env.BUDGET_TOKEN || token !== env.BUDGET_TOKEN) {
+    return budgetHtml("⛔ 認証エラー", [["理由", "token不一致"]], "リンクのtokenを確認してください。");
+  }
+  const recordId = url.searchParams.get("recordId") || "";
+  if (!recordId) return budgetHtml("⛔ パラメータ不足", [["recordId", "なし"]], "");
+  if (!env.NOTION_TOKEN) return budgetHtml("⛔ 設定不足", [["NOTION_TOKEN", "未設定"]], "wrangler secret put NOTION_TOKEN が必要です。");
+
+  const dry = url.searchParams.get("dry") === "1";
+  const caseParam = url.searchParams.get("case") || "";
+  const monthParam = url.searchParams.get("month") || ""; // YYYY-MM 明示時
+
+  return (async () => {
+    try {
+      const rec = await notionGetBudgetRecord(env, recordId);
+      const project = resolveBudgetProject(rec.caseName, caseParam, rec.name);
+      if (!project) return budgetHtml("⚠️ 案件解決できず", [["案件名", rec.caseName || "(空)"], ["レコード名", rec.name || "(空)"]],
+        "?case=<短縮名> を付けるか、BUDGET_CASE_ALIASES に追加してください。");
+
+      // 対象月：?month= 明示 → 変更日の月 → 当月
+      const base = rec.changeDate || new Date(Date.now() + 9 * 3600 * 1000);
+      let year = base.getFullYear(), month = base.getMonth() + 1;
+      const mm = monthParam.match(/^(\d{4})-(\d{2})$/);
+      if (mm) { year = +mm[1]; month = +mm[2]; }
+      const applyMD = `${base.getMonth() + 1}/${base.getDate()}`;
+      const tagLabel = BUDGET_TAG_LABEL[rec.tag] || rec.tag;
+      const memoLine = budgetMemoLine(applyMD, tagLabel, rec.before, rec.after);
+      const reasons = budgetAnomaly(rec.before, rec.after);
+      const target = project.sheets[0]; // MVP: 先頭タブ（複数集計対象は次フェーズ）
+
+      const slackText = rec.messageText
+        ? rec.messageText
+        : `💰 *${project.name}* 予算変更（${applyMD}）\n${manText(rec.before)}万 → *${manText(rec.after)}万*（${tagLabel}）\n対象月: ${year}年${("0" + month).slice(-2)}月`;
+
+      // 桁数異常 or dry → 書込まずプレビュー
+      if (dry || reasons.length) {
+        const gas = await callGas(target, { action: "budget_propagate", targetYear: year, targetMonth: month, requestBudget: rec.after, memoText: memoLine, prevBudget: rec.before, dryRun: true });
+        // GAS側で検出に失敗（例: 集計表に「リクエスト予算」列が無い案件）→ 理由を明示
+        if (gas.success === false) {
+          return budgetHtml("⚠️ 集計表の準備が未完了（書込していません）", [
+            ["案件", project.name], ["対象月", `${year}年${("0" + month).slice(-2)}月`],
+            ["理由", gas.message || "集計表の対象セルを特定できません"],
+          ], `この案件の集計表は本ツールの想定（meta_total に「リクエスト予算」列・monthly月次行）と異なります。\n` +
+             `「リクエスト予算」列の整備後に再実行してください。\n\nSlack下書き（参考）:\n${slackText}`);
+        }
+        return budgetHtml(reasons.length ? "⚠️ 確認が必要です（書込していません）" : "👀 プレビュー（DRY-RUN）", [
+          ["案件", project.name], ["対象月", `${year}年${("0" + month).slice(-2)}月`],
+          ["リクエスト予算", `${gas.currentBudget ?? "?"} → ${rec.after.toLocaleString()}（${manText(rec.before)}万→${manText(rec.after)}万）`],
+          ["書込先セル", `${gas.budgetCell || "?"} / メモ ${gas.memoCell || "?"}`],
+          ["メモ追記", memoLine],
+        ], (reasons.length ? `⛔ 桁数/乖離アラート:\n・${reasons.join("\n・")}\n\n` : "") +
+          `Slack下書き:\n${slackText}\n\nこの内容で問題なければ、ボタンのURLから dry=1 を外して（または通常ボタンで）再実行してください。`);
+      }
+
+      // 本実行：集計表書込 → Slack通知 → Notionチェック更新
+      const gas = await callGas(target, { action: "budget_propagate", targetYear: year, targetMonth: month, requestBudget: rec.after, memoText: memoLine, prevBudget: rec.before, dryRun: false });
+      if (!gas.success) return budgetHtml("❌ 集計表書込に失敗", [["メッセージ", gas.message || "?"]], JSON.stringify(gas));
+
+      const slack = await notifySlack(env, project.channelId, slackText);
+      ctx.waitUntil(notionMarkBudgetDone(env, recordId)); // チェックボックス更新（失敗は止めない）
+
+      return budgetHtml("✅ 波及しました", [
+        ["案件", project.name], ["対象月", gas.targetMonth],
+        ["リクエスト予算", `${gas.budgetCell} = ${rec.after.toLocaleString()}（${manText(rec.after)}万）`],
+        ["メモ", `${gas.memoCell} に「${memoLine}」`],
+        ["Slack通知", slack.ok ? "✅ 送信済" : `⚠️ 失敗（${slack.error}）`],
+      ], `集計表（${project.name}）の${gas.targetMonth} リクエスト予算欄とメモを更新しました。`);
+    } catch (e) {
+      return budgetHtml("❌ エラー", [["内容", String(e)]], "");
+    }
+  })();
+}
+
+// 波及完了後、レコードの確認チェックボックスをON（集計表記載した?）。失敗は無視。
+async function notionMarkBudgetDone(env: Env, pageId: string): Promise<void> {
+  if (!env.NOTION_TOKEN) return;
+  try {
+    await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
+      method: "PATCH",
+      headers: { Authorization: `Bearer ${env.NOTION_TOKEN}`, "Notion-Version": "2022-06-28", "Content-Type": "application/json" },
+      body: JSON.stringify({ properties: { "集計表記載した？": { checkbox: true } } }),
+    });
+  } catch { /* ログ同様、本処理を止めない */ }
+}
+
+// ============================================================
+// MCP サーバー（claude.ai / モバイル用）
+// ============================================================
+export class CreativeStopMCP extends McpAgent<Env> {
+  server = new McpServer({ name: "creative-stop-hub", version: "3.0.0" });
+
+  async init() {
+    const env = this.env;
+    const asText = (o: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(o, null, 2) }] });
+    const resolve = async (creativeName: string, project?: string): Promise<Project[]> =>
+      project ? ([projectByName(project)].filter(Boolean) as Project[]) : await findProjects(creativeName);
+
+    this.server.tool(
+      "stop_creative",
+      "クリエイティブを停止（Meta広告を実PAUSE＋集計表に記録）。project省略時はfindで案件自動判定（複数一致はエラー）。stopDate省略時は今日(JST)。",
+      {
+        creativeName: z.string().describe("クリエイティブ名。例: cr45"),
+        project: z.string().optional().describe("案件名 jdem/hyd/grm。省略可"),
+        stopDate: z.string().optional().describe('"M/D"。省略時は今日'),
+      },
+      async ({ creativeName, project, stopDate }) => {
+        const date = stopDate || todayJST();
+        const targets = await resolve(creativeName, project);
+        if (targets.length === 0) return asText({ success: false, message: `該当案件なし: ${creativeName}` });
+        if (targets.length > 1) return asText({ success: false, message: `複数案件に存在(${targets.map((t) => t.name).join(",")})。projectを指定してください` });
+        const p = targets[0];
+        const out = await doStop(env, p, creativeName, date);
+        if (!out.alreadyStopped && out.sheet?.success) await notifySlack(env, p.channelId, fmtPublicStop(out, creativeName, date, "via Claude"));
+        await logToNotion(env, { creative: creativeName, user: "claude.ai", userId: "", action: "停止", project: p.name, route: "Claude", metaCount: out.meta?.paused || 0, sheetResult: out.alreadyStopped ? "対象なし" : sheetResultLabel(out.sheet) });
+        return asText({ project: p.name, message: fmtStop(out, creativeName, date), ...out });
+      },
+    );
+
+    this.server.tool(
+      "undo_creative",
+      "クリエイティブ停止を取り消す（Meta広告をACTIVE復帰＋集計表undo）。memoMode: full=セルごと復元 / tag=停止タグのみ削除。",
+      {
+        creativeName: z.string(),
+        project: z.string().optional(),
+        memoMode: z.enum(["full", "tag"]).default("full"),
+      },
+      async ({ creativeName, project, memoMode }) => {
+        const targets = await resolve(creativeName, project);
+        if (targets.length === 0) return asText({ success: false, message: `該当案件なし: ${creativeName}` });
+        if (targets.length > 1) return asText({ success: false, message: `複数案件に存在(${targets.map((t) => t.name).join(",")})。projectを指定してください` });
+        const p = targets[0];
+        const out = await doUndo(env, p, creativeName, memoMode);
+        if (out.sheet?.success) await notifySlack(env, p.channelId, fmtPublicUndo(out, creativeName, memoMode, "via Claude"));
+        await logToNotion(env, { creative: creativeName, user: "claude.ai", userId: "", action: "取消", project: p.name, route: "Claude", metaCount: out.meta?.resumed || 0, sheetResult: sheetResultLabel(out.sheet) });
+        return asText({ project: p.name, message: fmtUndo(out, creativeName, memoMode), ...out });
+      },
+    );
+
+    this.server.tool("list_projects", "登録済み案件の一覧", {}, async () =>
+      asText(PROJECTS.map((p) => ({ name: p.name, channelId: p.channelId, metaConnected: !!p.metaAdAccountId }))),
+    );
+  }
+}
+
+// ============================================================
+// Slack 署名検証
+// ============================================================
+const enc = new TextEncoder();
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+async function verifySlack(request: Request, signingSecret: string, bodyText: string): Promise<boolean> {
+  const ts = request.headers.get("x-slack-request-timestamp");
+  const sig = request.headers.get("x-slack-signature");
+  if (!ts || !sig || !signingSecret) return false;
+  if (Math.abs(Date.now() / 1000 - Number(ts)) > 300) return false;
+  const key = await crypto.subtle.importKey("raw", enc.encode(signingSecret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const mac = await crypto.subtle.sign("HMAC", key, enc.encode(`v0:${ts}:${bodyText}`));
+  const hex = [...new Uint8Array(mac)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return timingSafeEqual(`v0=${hex}`, sig);
+}
+
+// ============================================================
+// Slack ハンドラ
+// ============================================================
+function slackJson(obj: unknown): Response {
+  return new Response(JSON.stringify(obj), { headers: { "Content-Type": "application/json" } });
+}
+function parseArgs(text: string): { creative: string; date: string } {
+  const toks = String(text || "").trim().split(/[\s,]+/).filter(Boolean);
+  return { creative: toks[0] ? toks[0].toLowerCase() : "", date: toks[1] || "" };
+}
+function adLine(a: MetaAd): string {
+  const tag = a.effective_status === "PAUSED" ? "（既に停止済）" : a.effective_status === "ACTIVE" ? "（配信中）" : `（${a.effective_status}）`;
+  return `*${a.name}* ${tag}\n　CP: ${a.campaignName || "?"} ／ AS: ${a.adsetName || "?"}`;
+}
+
+// Meta連携あり: 検索結果から停止確認ブロックを組む（2件以上は広告ごと個別選択）
+function buildStopBlocks(project: string, creative: string, date: string, ads: MetaAd[]) {
+  // 集計表だけ記録（Metaは触らない）ボタン共通
+  const sheetOnlyBtn = { type: "button", text: { type: "plain_text", text: "集計表だけ記録" }, action_id: "do_stop_sheet", value: JSON.stringify({ a: "stop", p: project, c: creative, d: date, ad: [] }) };
+  const cancelBtn = { type: "button", text: { type: "plain_text", text: "キャンセル" }, action_id: "cancel", value: JSON.stringify({ a: "cancel" }) };
+
+  if (ads.length === 0) {
+    // Metaに該当広告なし（命名違い/削除済/集計表のみ運用 等）→ 集計表だけ記録できる
+    return {
+      response_type: "ephemeral",
+      blocks: [
+        { type: "section", text: { type: "mrkdwn", text: `⚠️ *${creative}* に一致するMeta広告が見つかりません。\n（Metaの広告名が違う/削除済 等の可能性）。集計表にだけ記録しますか？` } },
+        { type: "actions", elements: [sheetOnlyBtn, cancelBtn] },
+      ],
+    };
+  }
+  const active = ads.filter((a) => a.effective_status !== "PAUSED");
+
+  if (active.length === 0) {
+    // Meta は既に全て停止済み → Metaは触らず集計表だけ記録できる
+    return {
+      response_type: "ephemeral",
+      blocks: [
+        { type: "section", text: { type: "mrkdwn", text: `⚠️ *${creative}* は Meta広告が既に全て停止済みです（${ads.length}件）。\n集計表にだけ記録しますか？` } },
+        { type: "actions", elements: [sheetOnlyBtn, cancelBtn] },
+      ],
+    };
+  }
+
+  if (ads.length === 1) {
+    const a = ads[0];
+    return {
+      response_type: "ephemeral",
+      blocks: [
+        { type: "section", text: { type: "mrkdwn", text: `*${project}* で以下を停止します（${date}）。よろしいですか？\n${adLine(a)}` } },
+        { type: "actions", elements: [
+          { type: "button", style: "danger", text: { type: "plain_text", text: "停止する" }, action_id: "do_stop", value: JSON.stringify({ a: "stop", p: project, c: creative, d: date, ad: [a.id] }) },
+          sheetOnlyBtn,
+          cancelBtn,
+        ] },
+      ],
+    };
+  }
+
+  // 2件以上 → 広告ごとに個別選択（別キャンペーンの巻き込み事故を防ぐ）
+  const blocks: any[] = [
+    { type: "section", text: { type: "mrkdwn", text: `⚠️ *${project}* で *${creative}* に一致する広告が *${ads.length}件* あります（${date}）。\n止めたい広告を選んでください。` } },
+    { type: "divider" },
+  ];
+  for (const a of ads) {
+    const sec: any = { type: "section", text: { type: "mrkdwn", text: adLine(a) } };
+    if (a.effective_status !== "PAUSED") {
+      sec.accessory = { type: "button", style: "danger", text: { type: "plain_text", text: "この広告を停止" }, action_id: `do_stop_${a.id}`, value: JSON.stringify({ a: "stop", p: project, c: creative, d: date, ad: [a.id] }) };
+    }
+    blocks.push(sec);
+  }
+  blocks.push({ type: "divider" });
+  blocks.push({ type: "actions", elements: [
+    { type: "button", style: "danger", text: { type: "plain_text", text: `配信中をすべて停止 (${active.length}件)` }, action_id: "do_stop_all", value: JSON.stringify({ a: "stop", p: project, c: creative, d: date, ad: active.map((x) => x.id) }) },
+    sheetOnlyBtn,
+    cancelBtn,
+  ] });
+  return { response_type: "ephemeral", blocks };
+}
+
+// Meta連携あり: 取消確認（PAUSED広告を個別/全件でACTIVE復帰、集計表はtagで取消）
+function buildUndoBlocks(project: string, creative: string, ads: MetaAd[]) {
+  const paused = ads.filter((a) => a.effective_status === "PAUSED");
+  if (paused.length === 0) {
+    return {
+      response_type: "ephemeral",
+      blocks: [
+        { type: "section", text: { type: "mrkdwn", text: `再開対象(PAUSED)のMeta広告がありません。集計表のメモだけ取り消しますか？` } },
+        { type: "actions", elements: [
+          { type: "button", text: { type: "plain_text", text: "集計表のみ取消(tag)" }, action_id: "do_undo", value: JSON.stringify({ a: "undo", p: project, c: creative, m: "tag", ad: [] }) },
+          { type: "button", text: { type: "plain_text", text: "キャンセル" }, action_id: "cancel", value: JSON.stringify({ a: "cancel" }) },
+        ] },
+      ],
+    };
+  }
+  if (paused.length === 1) {
+    const a = paused[0];
+    return {
+      response_type: "ephemeral",
+      blocks: [
+        { type: "section", text: { type: "mrkdwn", text: `*${project}* で以下を再開します。よろしいですか？\n${adLine(a)}` } },
+        { type: "actions", elements: [
+          { type: "button", style: "primary", text: { type: "plain_text", text: "再開する" }, action_id: "do_undo", value: JSON.stringify({ a: "undo", p: project, c: creative, m: "tag", ad: [a.id] }) },
+          { type: "button", text: { type: "plain_text", text: "キャンセル" }, action_id: "cancel", value: JSON.stringify({ a: "cancel" }) },
+        ] },
+      ],
+    };
+  }
+  const blocks: any[] = [
+    { type: "section", text: { type: "mrkdwn", text: `*${project}* で *${creative}* の停止中広告が *${paused.length}件* あります。\n再開したい広告を選んでください。` } },
+    { type: "divider" },
+  ];
+  for (const a of paused) {
+    blocks.push({ type: "section", text: { type: "mrkdwn", text: adLine(a) }, accessory: { type: "button", style: "primary", text: { type: "plain_text", text: "この広告を再開" }, action_id: `do_undo_${a.id}`, value: JSON.stringify({ a: "undo", p: project, c: creative, m: "tag", ad: [a.id] }) } });
+  }
+  blocks.push({ type: "divider" });
+  blocks.push({ type: "actions", elements: [
+    { type: "button", style: "primary", text: { type: "plain_text", text: `すべて再開 (${paused.length}件)` }, action_id: "do_undo_all", value: JSON.stringify({ a: "undo", p: project, c: creative, m: "tag", ad: paused.map((x) => x.id) }) },
+    { type: "button", text: { type: "plain_text", text: "キャンセル" }, action_id: "cancel", value: JSON.stringify({ a: "cancel" }) },
+  ] });
+  return { response_type: "ephemeral", blocks };
+}
+
+// Meta未連携(grm等): 集計表のみの確認
+function simpleStopConfirm(project: string, creative: string, date: string) {
+  return { response_type: "ephemeral", blocks: [
+    { type: "section", text: { type: "mrkdwn", text: `*${project}* の *${creative}* を *${date}* で停止しますか？（Meta未連携＝集計表のみ）` } },
+    { type: "actions", elements: [
+      { type: "button", style: "danger", text: { type: "plain_text", text: "停止する" }, action_id: "do_stop", value: JSON.stringify({ a: "stop", p: project, c: creative, d: date, ad: [] }) },
+      { type: "button", text: { type: "plain_text", text: "キャンセル" }, action_id: "cancel", value: JSON.stringify({ a: "cancel" }) },
+    ] },
+  ] };
+}
+function simpleUndoConfirm(project: string, creative: string) {
+  return { response_type: "ephemeral", blocks: [
+    { type: "section", text: { type: "mrkdwn", text: `*${project}* の *${creative}* の停止を取り消します（Meta未連携＝集計表のみ）。どちらで？` } },
+    { type: "actions", elements: [
+      { type: "button", text: { type: "plain_text", text: "タグのみ削除" }, action_id: "do_undo_tag", value: JSON.stringify({ a: "undo", p: project, c: creative, m: "tag", ad: [] }) },
+      { type: "button", style: "danger", text: { type: "plain_text", text: "丸ごと復元" }, action_id: "do_undo_full", value: JSON.stringify({ a: "undo", p: project, c: creative, m: "full", ad: [] }) },
+      { type: "button", text: { type: "plain_text", text: "キャンセル" }, action_id: "cancel", value: JSON.stringify({ a: "cancel" }) },
+    ] },
+  ] };
+}
+
+// 実行結果メッセージ（Slack専用・明示ID版）
+function stopLines(creative: string, date: string, paused: number, sheet: any, metaOn: boolean, by: string): string {
+  const lines = [`🛑 *${creative}* を停止しました${by ? `　${by}` : ""}`];
+  lines.push(!metaOn ? "・Meta: 未連携" : paused > 0 ? `✅ Meta広告: ${paused}件 停止（PAUSE）` : "・Meta広告: 変更なし（集計表のみ）");
+  lines.push(sheet?.success ? `✅ 集計表: 記録・グレー化（${date}）` : `❌ 集計表: ${sheet?.message || "失敗"}`);
+  return lines.join("\n");
+}
+function undoLines(creative: string, memoMode: string, resumed: number, sheet: any, metaOn: boolean, by: string): string {
+  const lines = [`↩️ *${creative}* の停止を取り消しました${by ? `　${by}` : ""}`];
+  if (metaOn) lines.push(`✅ Meta広告: ${resumed}件 再開（ACTIVE）`);
+  lines.push(sheet?.success ? `✅ 集計表: 復元（${memoMode}）` : `⚠️ 集計表: ${sheet?.message || "取消情報なし"}`);
+  return lines.join("\n");
+}
+
+function handleSlackCommand(env: Env, ctx: ExecutionContext, bodyText: string, senv: SubmitEnv): Response {
+  const params = new URLSearchParams(bodyText);
+  const command = params.get("command");
+  const text = params.get("text") || "";
+  const channelId = params.get("channel_id") || "";
+  const responseUrl = params.get("response_url") || "";
+  const project = projectByChannel(channelId);
+  if (!project) {
+    return slackJson({ response_type: "ephemeral", text: `このチャンネルは案件未登録です（channel_id=${channelId}）。Workerのレジストリに追加が必要です。` });
+  }
+
+  // ── cr入稿くん: /cr-in <cr名 or NotionページURL> ──
+  if (command === "/cr-in") {
+    if (!metaToken(env, project) || !project.metaAdAccountId) {
+      return slackJson({ response_type: "ephemeral", text: `この案件（${project.name}）はMeta未連携のため入稿できません。` });
+    }
+    if (!project.crdbDataSourceId && !/notion|^[0-9a-f-]{32,36}$/i.test(text.trim())) {
+      return slackJson({ response_type: "ephemeral", text: `この案件（${project.name}）は入稿未対応です（crdbDataSourceId未設定）。NotionページURLでの指定なら可能です。` });
+    }
+    return handleCrInCommand(
+      { text, channel_id: channelId, user_id: params.get("user_id") || "", response_url: responseUrl },
+      project as SubmitProject,
+      senv,
+      ctx,
+      (p) => metaToken(env, p as Project)!,
+    );
+  }
+  const { creative, date } = parseArgs(text);
+  if (!creative) return slackJson({ response_type: "ephemeral", text: "使い方: `/cr-stop <cr名> [M/D]`（日付省略で今日）" });
+  const stopDate = date || todayJST();
+  const token = metaToken(env, project);
+
+  // Meta未連携(grm等) → 集計表のみの確認（同期応答）
+  if (!token || !project.metaAdAccountId) {
+    if (command === "/cr-stop") return slackJson(simpleStopConfirm(project.name, creative, stopDate));
+    if (command === "/cr-undo") return slackJson(simpleUndoConfirm(project.name, creative));
+    return slackJson({ response_type: "ephemeral", text: `未知のコマンド: ${command}` });
+  }
+
+  // Meta連携あり → 広告を検索してから一覧確認（重いのでdeferred）
+  ctx.waitUntil(
+    (async () => {
+      try {
+        await postResponse(responseUrl, { response_type: "ephemeral", text: `🔎 *${creative}* のMeta広告を検索中…` });
+        const ads = await metaFindAds(token, project.metaAdAccountId!, creative);
+        const blocks = command === "/cr-undo" ? buildUndoBlocks(project.name, creative, ads) : buildStopBlocks(project.name, creative, stopDate, ads);
+        await postResponse(responseUrl, blocks);
+      } catch (e) {
+        await postResponse(responseUrl, { response_type: "ephemeral", text: `❌ Meta検索エラー: ${e}` });
+      }
+    })(),
+  );
+  return new Response("", { status: 200 });
+}
+
+async function postResponse(url: string, body: unknown): Promise<void> {
+  if (!url) return;
+  await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+}
+
+function handleSlackInteract(env: Env, ctx: ExecutionContext, bodyText: string, senv: SubmitEnv): Response {
+  const params = new URLSearchParams(bodyText);
+  let payload: any = {};
+  try { payload = JSON.parse(params.get("payload") || "{}"); } catch {}
+  const responseUrl: string = payload.response_url;
+  const userId: string = payload.user?.id || "";
+  const userName: string = payload.user?.username || payload.user?.name || userId;
+
+  // ── cr入稿くん: action_id が crin_ で始まるものは submit 側で処理 ──
+  const actionId: string = payload.actions?.[0]?.action_id || "";
+  if (actionId.startsWith("crin_")) {
+    const ch = payload.channel?.id || payload.container?.channel_id || "";
+    const p = projectByChannel(ch);
+    return handleCrInInteraction(
+      payload,
+      p as SubmitProject | undefined,
+      senv,
+      ctx,
+      (pr) => metaToken(env, pr as Project)!,
+      (pr) => pr.sheets,
+    );
+  }
+
+  let v: any = {};
+  try { v = JSON.parse(payload.actions?.[0]?.value || "{}"); } catch {}
+
+  // キャンセルも cold-start 耐性のため即200ACK＋response_url で確実に更新（同期応答だと押下無反応になることがある）
+  if (v.a === "cancel") {
+    ctx.waitUntil(postResponse(responseUrl, { replace_original: true, text: "✖️ キャンセルしました（停止・取消は実行していません）。もう一度操作する場合は再度コマンドを入力してください。" }));
+    return new Response("", { status: 200 });
+  }
+
+  const project = projectByName(v.p);
+  if (!project) return slackJson({ replace_original: true, text: `案件不明: ${v.p}` });
+  const token = metaToken(env, project);
+  const metaOn = !!(token && project.metaAdAccountId);
+  const ids: string[] = Array.isArray(v.ad) ? v.ad : [];
+
+  // 即ACK（cold-start耐性）。進捗・結果は response_url 経由。
+  ctx.waitUntil(
+    (async () => {
+      try {
+        await postResponse(responseUrl, { replace_original: true, text: `⏳ *${v.c}* を${v.a === "undo" ? "取消" : "停止"}実行中…` });
+        const inviteNote = (err?: string) => `\n⚠️ チャンネルへの全員通知に失敗（${err}）。このチャンネルで \`/invite @cr停止\` を実行してください。`;
+        // Meta失敗は集計表を止めない（権限不足等でも集計表記録は実行し、Metaエラーは併記）
+        let metaErr = "";
+        const target = await pickSheet(project, v.c); // 複数集計対象の案件は cr名で対象タブを判定
+        if (v.a === "stop") {
+          let paused = 0;
+          if (metaOn && ids.length) { try { paused = await pauseAds(token!, ids); if (paused < ids.length) metaErr = `${ids.length - paused}件の停止に失敗`; } catch (e) { metaErr = String(e); } }
+          const sheet = target ? await callGas(target, { action: "stop", creativeName: v.c, stopDate: v.d }) : { success: false, message: "集計表に該当crなし(複数対象)" };
+          const extra = (metaErr ? `\n⚠️ Meta停止に失敗（${metaErr}）。Metaトークン/権限を確認してください。` : "");
+          let note = extra;
+          if (paused || sheet?.success) {
+            const r = await notifySlack(env, project.channelId, stopLines(v.c, v.d, paused, sheet, metaOn, `by <@${userId}>`) + extra);
+            if (!r.ok) note += inviteNote(r.error);
+          }
+          await postResponse(responseUrl, { replace_original: true, text: stopLines(v.c, v.d, paused, sheet, metaOn, "") + note });
+          await logToNotion(env, { creative: v.c, user: userName, userId, action: "停止", project: project.name, route: "Slack", metaCount: paused, sheetResult: sheetResultLabel(sheet) });
+        } else {
+          let resumed = 0;
+          if (metaOn && ids.length) { try { resumed = await resumeAds(token!, ids); if (resumed < ids.length) metaErr = `${ids.length - resumed}件の再開に失敗`; } catch (e) { metaErr = String(e); } }
+          const sheet = target ? await callGas(target, { action: "undo", creativeName: v.c, memoMode: v.m || "tag" }) : { success: false, message: "集計表に該当crなし(複数対象)" };
+          const extra = (metaErr ? `\n⚠️ Meta再開に失敗（${metaErr}）。Metaトークン/権限を確認してください。` : "");
+          let note = extra;
+          if (resumed || sheet?.success) {
+            const r = await notifySlack(env, project.channelId, undoLines(v.c, v.m || "tag", resumed, sheet, metaOn, `by <@${userId}>`) + extra);
+            if (!r.ok) note += inviteNote(r.error);
+          }
+          await postResponse(responseUrl, { replace_original: true, text: undoLines(v.c, v.m || "tag", resumed, sheet, metaOn, "") + note });
+          await logToNotion(env, { creative: v.c, user: userName, userId, action: "取消", project: project.name, route: "Slack", metaCount: resumed, sheetResult: sheetResultLabel(sheet) });
+        }
+      } catch (e) {
+        await postResponse(responseUrl, { replace_original: true, text: `❌ エラー: ${e}` });
+      }
+    })(),
+  );
+
+  return new Response("", { status: 200 });
+}
+
+// ============================================================
+// ルーター
+// ============================================================
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
+
+    // --- Slack（署名検証で保護。秘密パス不要）---
+    if (url.pathname === "/slack/command" || url.pathname === "/slack/interact") {
+      const bodyText = await request.text();
+      if (!(await verifySlack(request, env.SLACK_SIGNING_SECRET, bodyText))) {
+        return new Response("invalid signature", { status: 401 });
+      }
+      const senv = submitEnvOf(env, url.origin);
+      return url.pathname === "/slack/command" ? handleSlackCommand(env, ctx, bodyText, senv) : handleSlackInteract(env, ctx, bodyText, senv);
+    }
+
+    // --- cr入稿くん: continuation（HMAC署名で自己検証。Slack署名不要）---
+    if (url.pathname === CONTINUE_PATH && request.method === "POST") {
+      return handleContinue(
+        request,
+        submitEnvOf(env, url.origin),
+        ctx,
+        (name) => metaToken(env, projectByName(name)!)!,
+        (name) => projectByName(name)!.sheets,
+        (name) => projectByName(name)!.metaAdAccountId!,
+      );
+    }
+
+    // --- 予算確定→波及くん（Notionボタン「リンクを開く」→ GET /budget）---
+    if (url.pathname === "/budget") {
+      return handleBudget(env, ctx, url);
+    }
+
+    // --- MCP（共有シークレットをフルパスで保持）---
+    const base = `/${env.SHARED_SECRET}`;
+    if (url.pathname === `${base}/sse` || url.pathname === `${base}/sse/message`) {
+      return CreativeStopMCP.serveSSE(`${base}/sse`).fetch(request, env, ctx);
+    }
+    if (url.pathname === `${base}/mcp`) {
+      return CreativeStopMCP.serve(`${base}/mcp`).fetch(request, env, ctx);
+    }
+
+    return new Response("Not found", { status: 404 });
+  },
+};
