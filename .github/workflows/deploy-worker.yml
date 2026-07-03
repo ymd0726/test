@@ -28,7 +28,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22" # wrangler 4.x は Node 22+ 必須
       - name: Install deps
         working-directory: apps/jdem-stop-mcp
         run: npm ci || npm install
