@@ -40,8 +40,8 @@
 
 | DB | 行ページ（作成済み） | data source ID |
 |---|---|---|
-| 💡 山田アイデアDB（note集客ネタ） | `https://app.notion.com/p/39235c2adb5681ca9566dbae7b09d31a` | （セットアップ後に確定） |
-| 📝 noteネタDB（エステサロン集客） | `https://app.notion.com/p/39235c2adb5681d99d4cfd00d18d998e` | （セットアップ後に確定） |
+| 💡 山田アイデアDB（note集客ネタ） | `https://app.notion.com/p/39235c2adb5681ca9566dbae7b09d31a` | `collection://61a8eb0b-f3ce-447c-9d1c-24349a7d3ec8`（DB URL: `https://app.notion.com/p/1c2a9c0518724c2d8b483d5a0ad4de92`） |
+| 📝 noteネタDB（エステサロン集客） | `https://app.notion.com/p/39235c2adb5681d99d4cfd00d18d998e` | `collection://49549996-144c-485e-a652-b9f428c2b7bc`（DB URL: `https://app.notion.com/p/793c7ce1ef084a4680d3b8424f707059`） |
 
 ### 💡 山田アイデアDB（1レコード＝1質問）
 
