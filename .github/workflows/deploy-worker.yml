@@ -28,12 +28,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22" # wrangler 4.x は Node 22+ 必須
       - name: Install deps
         working-directory: apps/jdem-stop-mcp
         run: npm ci || npm install
+      # wrangler-action は古いwrangler(3.x)を入れて wrangler.jsonc を読めないため、
+      # プロジェクト同梱の wrangler 4.x を直接使う
       - name: Deploy to Cloudflare
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          workingDirectory: apps/jdem-stop-mcp
+        working-directory: apps/jdem-stop-mcp
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: npx wrangler deploy

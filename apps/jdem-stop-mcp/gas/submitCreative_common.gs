@@ -67,9 +67,12 @@ function handleSubmitCreative(req) {
     // テンプレブロック（各ゾーンで最もCR00に近い＝ゾーン内の左端のcr00ブロック）
     var tplLeft = submitPickTemplate_(layout, 'left');
     var tplRight = childIds.length ? submitPickTemplate_(layout, 'right') : null;
-    if (!tplLeft) return { ok: false, error: '集計内ゾーンに cr00 テンプレブロックが見つかりません' };
+    if (!tplLeft) return { ok: false, error: '親用の cr00 テンプレブロックが見つかりません' };
     if (childIds.length && !tplRight) {
-      return { ok: false, error: '集計外ゾーンに cr00 テンプレブロックが見つかりません' };
+      return { ok: false, error: '子用の cr00 テンプレブロックが見つかりません' };
+    }
+    if (childIds.length && tplRight.startCol === tplLeft.startCol) {
+      return { ok: false, error: 'cr00テンプレブロックが1つしか無く、親と子の展開先を区別できません（このタブに子用cr00を用意してください）' };
     }
 
     var hasChildren = childIds.length > 0;
@@ -159,14 +162,18 @@ function submitResolveSheet_(ss, sheetName) {
     if (!s) throw new Error('タブが見つかりません: ' + sheetName);
     return s;
   }
+  // sheetName省略時: cr00テンプレを含むタブを自動検出（マーカーはjdem等一部シートにしか無い）
   var hits = [];
   ss.getSheets().forEach(function (s) {
     var lastCol = s.getLastColumn();
     if (lastCol < 5) return;
-    var row1 = s.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
-    if (row1.indexOf(SUBMIT_MARKER) >= 0) hits.push(s);
+    var rows = s.getRange(1, 1, Math.min(SUBMIT_ID_ROW_SEARCH_MAX, s.getMaxRows()), lastCol).getDisplayValues();
+    var found = rows.some(function (r) {
+      return r.some(function (v) { return submitNormId_(v) === SUBMIT_TEMPLATE_ID; });
+    });
+    if (found) hits.push(s);
   });
-  if (hits.length === 0) throw new Error('「' + SUBMIT_MARKER + '」マーカーを含むタブが見つかりません（sheetNameを指定してください）');
+  if (hits.length === 0) throw new Error('cr00テンプレを含むタブが見つかりません（sheetNameを指定してください）');
   if (hits.length > 1) {
     throw new Error('対象候補タブが複数あります: ' + hits.map(function (s) { return s.getName(); }).join(', ') + '（sheetNameを指定してください）');
   }
@@ -223,13 +230,28 @@ function submitAnalyzeLayout_(sheet) {
   return { sheet: sheet, markerCol: markerCol, idRow: idRow, blocks: blocks, lastCol: lastCol };
 }
 
-function submitPickTemplate_(layout, zone) {
-  var candidates = layout.blocks.filter(function (b) {
-    return b.zone === zone && b.ids.some(function (id) { return submitNormId_(id) === SUBMIT_TEMPLATE_ID; });
-  });
-  if (!candidates.length) return null;
-  candidates.sort(function (a, b) { return a.startCol - b.startCol; });
-  return candidates[0]; // ゾーン内で最も左のcr00
+/**
+ * テンプレブロックの選定。
+ * - マーカー（集計外CR→）があるシート(jdem等): ゾーンで絞って
+ *   left=集計内ゾーンの左端cr00 / right=集計外ゾーンの右端cr00
+ * - マーカーが無いシート(jde kk_mak/kk_kou等・実測でマーカー無し):
+ *   左端のcr00=親テンプレ / 右端のcr00=子テンプレ とみなす
+ */
+function submitPickTemplate_(layout, which) {
+  var all = layout.blocks
+    .filter(function (b) {
+      return b.ids.some(function (id) { return submitNormId_(id) === SUBMIT_TEMPLATE_ID; });
+    })
+    .sort(function (a, b) { return a.startCol - b.startCol; });
+  if (!all.length) return null;
+
+  if (layout.markerCol >= 0) {
+    var zone = which === 'left' ? 'left' : 'right';
+    var inZone = all.filter(function (b) { return b.zone === zone; });
+    if (!inZone.length) return null;
+    return which === 'left' ? inZone[0] : inZone[inZone.length - 1];
+  }
+  return which === 'left' ? all[0] : all[all.length - 1];
 }
 
 function submitExistingIds_(layout) {
