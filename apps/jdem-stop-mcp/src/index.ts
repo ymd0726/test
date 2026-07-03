@@ -109,7 +109,7 @@ const PROJECTS: Project[] = [
     ],
     // ── cr入稿くん（初期スコープ案件）──
     driveFolderName: "cr_jde",  // TODO: 確定したら driveFolderId 直指定に切替（同名フォルダ誤検出防止）
-    crdbDataSourceId: "2c155406-c36d-4d7d-9d2a-22aefd4f17cf", // CRDB（E2Eで database_id と一致するか要確認）
+    crdbDataSourceId: "3adda07df1cd407fac365e81c6da2582", // CRDB #クリエイティブdb（database_id。要: cr-stop-workerインテグレーションへの共有）
     adNameStyle: "full", // jde系は広告名フル名称（jde_mak_cr84_… 実測済）
     adsetAllowlist: ["120246843077960183"], // mak本体広告セット（cr81/82/84の直近入稿先）
   },
