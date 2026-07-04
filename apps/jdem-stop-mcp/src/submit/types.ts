@@ -111,6 +111,8 @@ export interface SubmitEnv {
   SHARED_SECRET: string;
   /** 自分自身のURL（continuation self-fetch用）例: https://jdem-stop-mcp.lead1504.workers.dev */
   SELF_URL: string;
+  /** 自分自身へのService Binding（wrangler.jsonc services）。公開URL経由の自己fetchはCloudflareが404にするため必須 */
+  SELF_WORKER?: { fetch: (input: Request | string, init?: RequestInit) => Promise<Response> };
 }
 
 export const GRAPH = "https://graph.facebook.com/v21.0";

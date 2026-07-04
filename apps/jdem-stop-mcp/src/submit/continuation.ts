@@ -103,8 +103,21 @@ async function runHop(
       }
 
       case "wait_ready": {
+        // 1ホップで最大4回チェック（5秒間隔）。連鎖ホップ数を抑える（Service Bindingのネスト上限対策）
         const v = plan.videos[state.index];
-        const status = await videoStatus(v.videoId!, metaToken);
+        let status = "";
+        for (let i = 0; i < 4; i++) {
+          status = await videoStatus(v.videoId!, metaToken);
+          state.attempts += 1;
+          if (status === "ready" || status === "error") break;
+          if (state.attempts > MAX_READY_ATTEMPTS) {
+            throw new Error(`動画 ${v.adName} の処理待ちがタイムアウトしました (video_id=${v.videoId})`);
+          }
+          await sleep(5000);
+        }
+        if (status === "error") {
+          throw new Error(`動画 ${v.adName} の処理がMeta側でエラーになりました (video_id=${v.videoId})`);
+        }
         if (status === "ready") {
           if (state.index + 1 < plan.videos.length) {
             state.index += 1;
@@ -112,14 +125,6 @@ async function runHop(
           } else {
             state.step = "create_ads";
           }
-        } else if (status === "error") {
-          throw new Error(`動画 ${v.adName} の処理がMeta側でエラーになりました (video_id=${v.videoId})`);
-        } else {
-          state.attempts += 1;
-          if (state.attempts > MAX_READY_ATTEMPTS) {
-            throw new Error(`動画 ${v.adName} の処理待ちがタイムアウトしました (video_id=${v.videoId})`);
-          }
-          await sleep(5000);
         }
         break;
       }
@@ -206,15 +211,22 @@ async function runHop(
   }
 }
 
-/** 次のホップを自分自身へPOST（署名付き） */
+/**
+ * 次のホップを自分自身へPOST（署名付き）。
+ * Workerは自分の公開URLをfetchできない（edgeが404を返す）ため、
+ * Service Binding（SELF_WORKER）経由で内部直結する。バインディング未設定時のみ公開URLを試す。
+ */
 async function chainNext(state: ContinuationState, env: SubmitEnv): Promise<void> {
   const body = JSON.stringify(state);
   const sig = await signHmac(env.SHARED_SECRET, body);
-  const res = await fetch(`${env.SELF_URL}${CONTINUE_PATH}`, {
+  const init: RequestInit = {
     method: "POST",
     headers: { "content-type": "application/json", "x-continuation-signature": sig },
     body,
-  });
+  };
+  const res = env.SELF_WORKER
+    ? await env.SELF_WORKER.fetch(`https://self${CONTINUE_PATH}`, init)
+    : await fetch(`${env.SELF_URL}${CONTINUE_PATH}`, init);
   if (!res.ok) throw new Error(`continuation連鎖失敗: ${res.status}`);
 }
 
