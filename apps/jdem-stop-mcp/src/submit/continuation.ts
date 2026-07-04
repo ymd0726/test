@@ -21,6 +21,7 @@ import {
   transferVideoChunk,
   finishVideoUpload,
   videoStatus,
+  getVideoThumbnailUrl,
   getSourceCreativeSpec,
   buildCreativeParams,
   createCreative,
@@ -134,10 +135,15 @@ async function runHop(
         const source = await getSourceCreativeSpec(plan.sourceAdId, metaToken);
         for (const v of plan.videos) {
           if (v.adId) continue; // 再実行時のスキップ
+          const thumbnailUrl = await getVideoThumbnailUrl(v.videoId!, metaToken);
+          if (!thumbnailUrl) {
+            throw new Error(`動画 ${v.adName} のサムネイルがまだ生成されていません（video_id=${v.videoId}）。少し待って同じ /cr-in を再実行してください`);
+          }
           const crParam = v.sheetId.match(/cr\d+(?:_\d{2})?/i)?.[0] || plan.crKey;
           const params = buildCreativeParams(source, {
             adName: v.adName,
             videoId: v.videoId!,
+            thumbnailUrl,
             crParam,
             overrides: plan.overrides,
           });

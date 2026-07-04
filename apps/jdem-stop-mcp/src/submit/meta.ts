@@ -87,6 +87,24 @@ export async function videoStatus(videoId: string, token: string): Promise<strin
   return res.status?.video_status || "unknown";
 }
 
+/**
+ * 動画のサムネイルURL（Meta自動生成）を取得。
+ * 動画広告のcreativeには image_url/image_hash の指定が必須（error_subcode 1443226）のため、
+ * ready後に自動生成されたサムネイルを使う。生成直後は空のことがあるので数回リトライ。
+ */
+export async function getVideoThumbnailUrl(videoId: string, token: string): Promise<string | null> {
+  for (let i = 0; i < 5; i++) {
+    const res = await graphGet(`${videoId}/thumbnails?fields=uri,is_preferred`, token);
+    const list: any[] = res.data || [];
+    if (list.length) {
+      const pref = list.find((t) => t.is_preferred) || list[0];
+      if (pref?.uri) return pref.uri;
+    }
+    await new Promise((r) => setTimeout(r, 3000));
+  }
+  return null;
+}
+
 // ---------- creative spec コピー ----------
 
 /** コピー元広告の creative から、新規作成に使える spec を取得 */
@@ -109,6 +127,8 @@ export function buildCreativeParams(
   opts: {
     adName: string;
     videoId: string;
+    /** 新動画のサムネイルURL（必須。Metaは動画creativeにimage_url/image_hash必須） */
+    thumbnailUrl: string;
     crParam: string; // URLパラメータに入れるcr名（例: cr79_01）
     overrides: CreativeTextOverrides;
   }
@@ -122,9 +142,9 @@ export function buildCreativeParams(
   }
 
   video.video_id = opts.videoId;
-  // サムネイルは新動画から自動生成させる（旧動画のimage_url/image_hashを引き継ぐと不整合になるため削除）
-  delete video.image_url;
+  // サムネイルは新動画の自動生成サムネイルに差し替え（旧動画のものを引き継ぐと不整合）
   delete video.image_hash;
+  video.image_url = opts.thumbnailUrl;
 
   if (opts.overrides.message) video.message = opts.overrides.message;
   if (opts.overrides.title && video.title !== undefined) video.title = opts.overrides.title;
