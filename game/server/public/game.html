@@ -213,7 +213,7 @@ function kataProb(wave)   { return wave >= 3 ? Math.min(0.02 + 0.01 * (wave - 3)
 function waveMult(wave)   { return Math.min(1 + 0.1 * (wave - 1), 3); }
 function comboMult(combo) { return Math.min(1 + 0.05 * Math.min(combo, 20), 2); }
 function speedScale(wave) { return Math.min(Math.pow(1.09, wave - 1), 3.2); }
-function enemiesForWave(wave) { return Math.min(14 + 3 * wave, 45); }
+function enemiesForWave(wave) { return Math.min(18 + 4 * wave, 60); }
 function dangerCount(wave) {
   if (wave >= 4) return 2 + Math.floor(Math.random() * 2);
   return wave >= 2 ? 1 + Math.floor(Math.random() * 2) : 0;
@@ -344,6 +344,7 @@ function resetState() {
     enemies: [],
     bullets: [],
     ebullets: [],
+    particles: [],
     popups: [],
     stars: S.stars || makeStars(),
     stats: { koatari: 0, atari: 0, kata: 0, stopBonus: 0 },
@@ -400,6 +401,25 @@ function popup(x, y, text, color) {
   S.popups.push({ x, y, text, color: color || '#fff', t: 1.1 });
 }
 
+// パーティクル爆発(撃破・被弾・発射光に共用)
+function burst(x, y, color, count, spread) {
+  const n = Math.min(count, 40);
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const sp = (spread || 220) * (0.3 + Math.random() * 0.7);
+    S.particles.push({
+      x, y,
+      vx: Math.cos(a) * sp,
+      vy: Math.sin(a) * sp,
+      life: 0.4 + Math.random() * 0.4,
+      t: 0.4 + Math.random() * 0.4,
+      r: 1.5 + Math.random() * 2.5,
+      color,
+    });
+  }
+  if (S.particles.length > 400) S.particles.splice(0, S.particles.length - 400);
+}
+
 function killEnemy(e) {
   let pts;
   if (e.type === 'danger') {
@@ -424,6 +444,11 @@ function killEnemy(e) {
     if (e.type === 'kata') { sfx.big(); S.shake = 0.35; }
     else sfx.kill();
   }
+  // 撃破エフェクト: 敵の色で爆発。大物ほど派手に
+  const power = e.type === 'kata' ? 30 : e.type === 'atari' ? 20 : e.type === 'danger' ? 22 : 12;
+  burst(e.x, e.y, TYPES[e.type].color, power, e.type === 'kata' ? 320 : 240);
+  burst(e.x, e.y, '#ffffff', Math.round(power / 2), 300);
+  S.shake = Math.max(S.shake, e.type === 'kata' ? 0.4 : 0.15);
   S.score += pts;
   S.combo++;
   S.comboTimer = COMBO_WINDOW;
@@ -488,12 +513,15 @@ function update(dt) {
   p.x = Math.max(20, Math.min(W - 20, p.x));
   p.y = Math.max(H * 0.55, Math.min(H - 25, p.y));
 
-  // 発射
+  // 発射(3方向スプレッドショット)
   S.fireCd -= dt;
   const firing = input.firing || input.keys[' '];
   if (firing && S.fireCd <= 0) {
-    S.bullets.push({ x: p.x, y: p.y - 18, vy: -520 });
-    S.fireCd = 1 / 8;
+    S.bullets.push({ x: p.x, y: p.y - 18, vx: 0, vy: -640, big: true });
+    S.bullets.push({ x: p.x - 10, y: p.y - 12, vx: -150, vy: -600 });
+    S.bullets.push({ x: p.x + 10, y: p.y - 12, vx: 150, vy: -600 });
+    burst(p.x, p.y - 18, '#9be7ff', 4, 90); // マズルフラッシュ
+    S.fireCd = 1 / 10;
     sfx.shoot();
   }
 
@@ -584,8 +612,9 @@ function update(dt) {
 
   // 自弾
   for (const b of S.bullets) {
+    b.x += (b.vx || 0) * dt;
     b.y += b.vy * dt;
-    if (b.y < -10) b.dead = true;
+    if (b.y < -10 || b.x < -10 || b.x > W + 10) b.dead = true;
   }
   // 敵弾
   for (const b of S.ebullets) {
@@ -632,11 +661,21 @@ function update(dt) {
     }
   }
 
+  // パーティクル
+  for (const pt of S.particles) {
+    pt.x += pt.vx * dt;
+    pt.y += pt.vy * dt;
+    pt.vx *= 0.9;
+    pt.vy = pt.vy * 0.9 + 60 * dt; // わずかに重力
+    pt.t -= dt;
+  }
+
   // ポップアップ・掃除
   for (const t of S.popups) { t.t -= dt; t.y -= 34 * dt; }
   S.enemies = S.enemies.filter((e) => !e.dead);
   S.bullets = S.bullets.filter((b) => !b.dead);
   S.ebullets = S.ebullets.filter((b) => !b.dead);
+  S.particles = S.particles.filter((pt) => pt.t > 0);
   S.popups = S.popups.filter((t) => t.t > 0);
 
   // 星背景
@@ -714,9 +753,31 @@ function render() {
   for (const st of S.stars) ctx.fillRect(st.x, st.y, st.s, st.s * 2);
 
   if (S.mode === 'playing' || S.mode === 'paused' || S.mode === 'over') {
-    // 弾
-    ctx.fillStyle = '#9be7ff';
-    for (const b of S.bullets) ctx.fillRect(b.x - 2, b.y - 8, 4, 12);
+    // パーティクル(加算合成で発光)
+    ctx.globalCompositeOperation = 'lighter';
+    for (const pt of S.particles) {
+      ctx.globalAlpha = Math.max(0, pt.t / pt.life);
+      ctx.fillStyle = pt.color;
+      ctx.beginPath();
+      ctx.arc(pt.x, pt.y, pt.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
+
+    // 自弾(発光する大きめの弾+芯)
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    for (const b of S.bullets) {
+      const w = b.big ? 5 : 3;
+      const h = b.big ? 16 : 12;
+      ctx.fillStyle = 'rgba(120,200,255,0.5)';
+      ctx.fillRect(b.x - w, b.y - h / 2, w * 2, h);
+      ctx.fillStyle = '#eaf6ff';
+      ctx.fillRect(b.x - w / 2, b.y - h / 2, w, h);
+    }
+    ctx.restore();
+    // 敵弾
     for (const b of S.ebullets) {
       ctx.beginPath();
       ctx.arc(b.x, b.y, 5, 0, Math.PI * 2);
