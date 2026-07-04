@@ -131,6 +131,8 @@ export function buildCreativeParams(
     thumbnailUrl: string;
     crParam: string; // URLパラメータに入れるcr名（例: cr79_01）
     overrides: CreativeTextOverrides;
+    /** IGアカウントの明示指定（PBIAのID等）。1815199対策のリトライで使用 */
+    instagramActorId?: string;
   }
 ): Record<string, string> {
   const story = JSON.parse(JSON.stringify(source.object_story_spec || {}));
@@ -147,6 +149,7 @@ export function buildCreativeParams(
   // システムユーザーが権限を持たず 1815199 になるため除去する。
   delete story.instagram_actor_id;
   delete story.instagram_user_id;
+  if (opts.instagramActorId) story.instagram_actor_id = opts.instagramActorId;
 
   video.video_id = opts.videoId;
   // サムネイルは新動画の自動生成サムネイルに差し替え（旧動画のものを引き継ぐと不整合）
@@ -184,6 +187,18 @@ export function buildCreativeParams(
     params.url_tags = replaceCrParam(source.url_tags, opts.crParam);
   }
   return params;
+}
+
+/**
+ * ページ由来のInstagramアカウント（PBIA）のIDを取得（無ければ作成）。
+ * use_page_actor_override だけで通らないアカウント向けに、PBIAを明示指定するために使う。
+ */
+export async function getOrCreatePageBackedIg(pageId: string, token: string): Promise<string> {
+  const r = await graphGet(`${pageId}/page_backed_instagram_accounts?fields=id`, token);
+  if (r.data?.length && r.data[0].id) return r.data[0].id;
+  const c = await graphPost(`${pageId}/page_backed_instagram_accounts`, token, {});
+  if (!c.id) throw new Error(`PBIA作成に失敗（page_id=${pageId}）`);
+  return c.id;
 }
 
 export function replaceCrParam(s: string, crName: string): string {

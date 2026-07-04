@@ -23,6 +23,7 @@ import {
   videoStatus,
   getVideoThumbnailUrl,
   getSourceCreativeSpec,
+  getOrCreatePageBackedIg,
   buildCreativeParams,
   createCreative,
   createAd,
@@ -133,6 +134,7 @@ async function runHop(
       case "create_ads": {
         await postProgress(plan.responseUrl, `🛠️ 広告を作成中…（コピー元: ${plan.sourceAdName}）`);
         const source = await getSourceCreativeSpec(plan.sourceAdId, metaToken);
+        let igActorId: string | undefined; // 1815199リトライで解決したPBIAを2本目以降にも使い回す
         for (const v of plan.videos) {
           if (v.adId) continue; // 再実行時のスキップ
           const thumbnailUrl = await getVideoThumbnailUrl(v.videoId!, metaToken);
@@ -140,14 +142,27 @@ async function runHop(
             throw new Error(`動画 ${v.adName} のサムネイルがまだ生成されていません（video_id=${v.videoId}）。少し待って同じ /cr-in を再実行してください`);
           }
           const crParam = v.sheetId.match(/cr\d+(?:_\d{2})?/i)?.[0] || plan.crKey;
-          const params = buildCreativeParams(source, {
-            adName: v.adName,
-            videoId: v.videoId!,
-            thumbnailUrl,
-            crParam,
-            overrides: plan.overrides,
-          });
-          v.creativeId = await createCreative(accountId, metaToken, params);
+          const buildParams = (ig?: string) =>
+            buildCreativeParams(source, {
+              adName: v.adName,
+              videoId: v.videoId!,
+              thumbnailUrl,
+              crParam,
+              overrides: plan.overrides,
+              instagramActorId: ig,
+            });
+          try {
+            v.creativeId = await createCreative(accountId, metaToken, buildParams(igActorId));
+          } catch (e: any) {
+            // IGアクセス権エラー(1815199) → ページ由来IG(PBIA)のIDを取得して明示指定でリトライ
+            if (!/1815199/.test(String(e.message)) ) throw e;
+            const pageId = source.object_story_spec?.page_id;
+            if (!pageId) throw e;
+            await postProgress(plan.responseUrl, `ℹ️ IG権限エラーのため、ページ由来IG（PBIA）を取得して再試行します…（page_id=${pageId}）`);
+            igActorId = await getOrCreatePageBackedIg(String(pageId), metaToken);
+            await postProgress(plan.responseUrl, `ℹ️ PBIA取得: ${igActorId}。再試行中…`);
+            v.creativeId = await createCreative(accountId, metaToken, buildParams(igActorId));
+          }
           v.adId = await createAd(accountId, metaToken, {
             name: v.adName,
             adsetId: plan.adsetId,
