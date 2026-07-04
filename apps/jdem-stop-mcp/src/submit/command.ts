@@ -180,7 +180,15 @@ async function confirmAndRun(
     if (!project.metaAdAccountId) throw new Error("metaAdAccountId未設定");
     await startExecution(plan, env, ctx, metaToken, project.metaAdAccountId, gasTargets);
   } catch (e: any) {
-    await postProgress(responseUrl, `❌ 実行開始に失敗しました: ${e.message}`);
+    await postProgress(
+      env,
+      {
+        channelId: interaction.channel?.id || interaction.container?.channel_id,
+        userId: interaction.user?.id,
+        responseUrl,
+      },
+      `❌ 実行開始に失敗しました: ${e.message}`
+    );
   }
 }
 

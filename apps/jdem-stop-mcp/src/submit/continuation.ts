@@ -43,7 +43,7 @@ export async function startExecution(
   gasTargets: { spreadsheetId: string; sheetName?: string }[]
 ): Promise<void> {
   const state: ContinuationState = { step: "upload", index: 0, attempts: 0, plan, startedAt: Date.now() };
-  await postProgress(plan.responseUrl, `🚀 入稿を開始します: *${plan.parentName}*（動画 ${plan.videos.length} 本）`);
+  await postProgress(env, plan, `🚀 入稿を開始します: *${plan.parentName}*（動画 ${plan.videos.length} 本）`);
   ctx.waitUntil(runHop(state, env, metaToken, projectAccountId, gasTargets));
 }
 
@@ -88,10 +88,7 @@ async function runHop(
     switch (state.step) {
       case "upload": {
         const v = plan.videos[state.index];
-        await postProgress(
-          plan.responseUrl,
-          `⏳ ${v.adName} をアップロード中… (${state.index + 1}/${plan.videos.length})`
-        );
+        await postProgress(env, plan, `⏳ ${v.adName} をアップロード中… (${state.index + 1}/${plan.videos.length})`);
         const driveToken = await driveAccessToken(env.GOOGLE_SERVICE_ACCOUNT_JSON);
         let session = await startVideoUpload(accountId, metaToken, v.fileSizeBytes);
         while (session.startOffset < v.fileSizeBytes) {
@@ -132,7 +129,7 @@ async function runHop(
       }
 
       case "create_ads": {
-        await postProgress(plan.responseUrl, `🛠️ 広告を作成中…（コピー元: ${plan.sourceAdName}）`);
+        await postProgress(env, plan, `🛠️ 広告を作成中…（コピー元: ${plan.sourceAdName}）`);
         const source = await getSourceCreativeSpec(plan.sourceAdId, metaToken);
         let igActorId: string | undefined; // 1815199リトライで解決したPBIAを2本目以降にも使い回す
         for (const v of plan.videos) {
@@ -158,9 +155,9 @@ async function runHop(
             if (!/1815199/.test(String(e.message)) ) throw e;
             const pageId = source.object_story_spec?.page_id;
             if (!pageId) throw e;
-            await postProgress(plan.responseUrl, `ℹ️ IG権限エラーのため、ページ由来IG（PBIA）を取得して再試行します…（page_id=${pageId}）`);
+            await postProgress(env, plan, `ℹ️ IG権限エラーのため、ページ由来IG（PBIA）を取得して再試行します…（page_id=${pageId}）`);
             igActorId = await getOrCreatePageBackedIg(String(pageId), metaToken);
-            await postProgress(plan.responseUrl, `ℹ️ PBIA取得: ${igActorId}。再試行中…`);
+            await postProgress(env, plan, `ℹ️ PBIA取得: ${igActorId}。再試行中…`);
             v.creativeId = await createCreative(accountId, metaToken, buildParams(igActorId));
           }
           v.adId = await createAd(accountId, metaToken, {
@@ -174,7 +171,7 @@ async function runHop(
       }
 
       case "sheet": {
-        await postProgress(plan.responseUrl, "📊 集計表にCR00ブロックを展開中…");
+        await postProgress(env, plan, "📊 集計表にCR00ブロックを展開中…");
         const parentSheetId = sheetParentId(plan);
         const childIds = plan.hasChildren ? plan.videos.map((v) => v.sheetId) : [];
         const results: string[] = [];
@@ -215,14 +212,16 @@ async function runHop(
           "",
           "👉 最終確認のうえ、広告マネージャで広告をONにしてください。",
         ];
-        await postProgress(plan.responseUrl, lines.join("\n"));
+        await postProgress(env, plan, lines.join("\n"));
+        await postPublic(env, plan.channelId, lines.join("\n")); // チームにも完了を共有
         return; // 連鎖終了
       }
     }
     await chainNext(state, env);
   } catch (e: any) {
     await postProgress(
-      plan.responseUrl,
+      env,
+      plan,
       `❌ 入稿処理でエラーが発生しました（step=${state.step}）: ${e.message}\n` +
         `ここまでの作成物: ${plan.videos
           .filter((v) => v.videoId)
@@ -257,15 +256,51 @@ function sheetParentId(plan: SubmitPlan): string {
   return i >= 0 ? plan.parentName.slice(i) : plan.parentName;
 }
 
-export async function postProgress(responseUrl: string, text: string): Promise<void> {
+/**
+ * 進捗表示。Slackのresponse_urlは「30分以内・5回まで」の制限があり、
+ * 進捗が多いと途中から黙って捨てられる（実際に発生）。
+ * そのためBotトークンでのephemeral投稿を優先し、失敗時のみresponse_urlに落とす。
+ */
+export async function postProgress(
+  env: { SLACK_BOT_TOKEN?: string },
+  to: { channelId?: string; userId?: string; responseUrl: string },
+  text: string
+): Promise<void> {
+  if (env.SLACK_BOT_TOKEN && to.channelId && to.userId) {
+    try {
+      const res = await fetch("https://slack.com/api/chat.postEphemeral", {
+        method: "POST",
+        headers: { "content-type": "application/json; charset=utf-8", authorization: `Bearer ${env.SLACK_BOT_TOKEN}` },
+        body: JSON.stringify({ channel: to.channelId, user: to.userId, text }),
+      });
+      const data: any = await res.json();
+      if (data.ok) return;
+    } catch {
+      /* fallthrough */
+    }
+  }
   try {
-    await fetch(responseUrl, {
+    await fetch(to.responseUrl, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ text, response_type: "in_channel", replace_original: false }),
+      body: JSON.stringify({ text, response_type: "ephemeral", replace_original: false }),
     });
   } catch {
     // 進捗表示の失敗は本処理を止めない
+  }
+}
+
+/** チャンネル全員向けの通知（完了サマリー用。停止くんのnotifySlackと同挙動） */
+async function postPublic(env: { SLACK_BOT_TOKEN?: string }, channelId: string, text: string): Promise<void> {
+  if (!env.SLACK_BOT_TOKEN || !channelId) return;
+  try {
+    await fetch("https://slack.com/api/chat.postMessage", {
+      method: "POST",
+      headers: { "content-type": "application/json; charset=utf-8", authorization: `Bearer ${env.SLACK_BOT_TOKEN}` },
+      body: JSON.stringify({ channel: channelId, text }),
+    });
+  } catch {
+    /* 通知失敗は本処理を止めない */
   }
 }
 
