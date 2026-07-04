@@ -141,9 +141,12 @@ export function buildCreativeParams(
     );
   }
 
-  // IGアカウントはコピー元の明示指定をそのまま引き継ぐ（クイック複製と同じ挙動）。
-  // ※要: Business ManagerでシステムユーザーにIGアカウントのアセット割り当て。
-  //   未割り当てだと Permissions error 1815199（明示でも自動解決でも同じ）。
+  // IG名義はFacebookページ由来（PBIA）を使う。この運用では手動入稿分も
+  // ページ名義（例: hotbeauty）で配信されており（2026-07-04 山田確認）、
+  // use_page_actor_override=true が手動と同一挙動。IGの明示指定は
+  // システムユーザーが権限を持たず 1815199 になるため除去する。
+  delete story.instagram_actor_id;
+  delete story.instagram_user_id;
 
   video.video_id = opts.videoId;
   // サムネイルは新動画の自動生成サムネイルに差し替え（旧動画のものを引き継ぐと不整合）
@@ -168,6 +171,8 @@ export function buildCreativeParams(
   const params: Record<string, string> = {
     name: opts.adName,
     object_story_spec: JSON.stringify(story),
+    // Instagram面もFacebookページ名義で配信（ページ由来IG/PBIA。手動入稿と同じ）
+    use_page_actor_override: "true",
     // エンハンス系を明示OFF（手動運用の「エンハンス0件」を再現）
     degrees_of_freedom_spec: JSON.stringify({
       creative_features_spec: { standard_enhancements: { enroll_status: "OPT_OUT" } },
