@@ -141,11 +141,9 @@ export function buildCreativeParams(
     );
   }
 
-  // IGアカウントの明示指定は外す（システムユーザートークンがIGアセット権限を持たず
-  // Permissions error 1815199 になるため）。省略時はFacebookページに連携された
-  // Instagramアカウントが自動で使われる＝手動入稿時と同じ配信アイデンティティ。
-  delete story.instagram_actor_id;
-  delete story.instagram_user_id;
+  // IGアカウントはコピー元の明示指定をそのまま引き継ぐ（クイック複製と同じ挙動）。
+  // ※要: Business ManagerでシステムユーザーにIGアカウントのアセット割り当て。
+  //   未割り当てだと Permissions error 1815199（明示でも自動解決でも同じ）。
 
   video.video_id = opts.videoId;
   // サムネイルは新動画の自動生成サムネイルに差し替え（旧動画のものを引き継ぐと不整合）
