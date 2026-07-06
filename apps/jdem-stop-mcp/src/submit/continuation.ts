@@ -184,7 +184,7 @@ async function runHop(
             childIds,
             dryRun: false,
           });
-          results.push(r.ok ? `${t.sheetName || t.spreadsheetId}: ✅` : `${t.sheetName || t.spreadsheetId}: ❌ ${r.error}`);
+          results.push(r.ok ? `${t.sheetName || t.spreadsheetId}` : `${t.sheetName || t.spreadsheetId} ❌ ${r.error}`);
         }
         (plan as any)._sheetResults = results;
         state.step = "notion";
@@ -202,18 +202,20 @@ async function runHop(
       }
 
       case "done": {
+        const sheetNames = ((plan as any)._sheetResults || []).join(" / ") || "対象なし";
+        const notionLine = (plan as any)._notionWarn
+          ? `:warning: Notion： ${(plan as any)._notionWarn}`
+          : ":white_check_mark: Notion： 入稿済み";
         const lines = [
-          `✅ *入稿が完了しました: ${plan.parentName}*`,
+          `:mega: 入稿が完了しました: ${plan.parentName}`,
           "",
-          `📣 入稿先キャンペーン: *${plan.campaignName || "(不明)"}*`,
-          `🎯 入稿先広告セット: *${plan.adsetName || "(不明)"}*`,
+          `:white_check_mark: cp　：${plan.campaignName || "(不明)"}`,
+          `:white_check_mark: adset：${plan.adsetName || "(不明)"}`,
+          ...plan.videos.map((v) => `:white_check_mark: cr　：${v.adName}（*PAUSED*）`),
+          `:white_check_mark: 集計表： ${sheetNames}`,
+          notionLine,
           "",
-          ...plan.videos.map((v) => `・${v.adName}（*PAUSED*）`),
-          "",
-          `📊 集計表: ${((plan as any)._sheetResults || []).join(" / ") || "対象なし"}`,
-          (plan as any)._notionWarn ? `⚠️ ${(plan as any)._notionWarn}` : "📝 Notionステータス: 入稿済み",
-          "",
-          "👉 最終確認のうえ、広告マネージャで広告をONにしてください。",
+          ":point_right: 最終確認のうえ、広告マネージャで広告をONにしてください。",
         ];
         await postProgress(env, plan, lines.join("\n"));
         await postPublic(env, plan.channelId, lines.join("\n")); // チームにも完了を共有
