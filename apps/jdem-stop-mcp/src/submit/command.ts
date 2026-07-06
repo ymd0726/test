@@ -29,6 +29,9 @@ export function handleCrInCommand(
   if (!project) {
     return slackEphemeral("このチャンネルは案件レジストリに未登録です（PROJECTSに追加してください）");
   }
+  if (project.submitBlocked) {
+    return slackEphemeral(`⚠️ この案件は cr入稿くん が未対応です: ${project.submitBlocked}`);
+  }
   ctx.waitUntil(resolveAndAsk(payload, project, env, metaTokenFor(project)));
   return slackEphemeral(`🔎 \`${payload.text.trim()}\` の入稿プランを組み立て中…`);
 }
@@ -158,6 +161,7 @@ async function confirmAndRun(
 ): Promise<void> {
   const responseUrl = interaction.response_url;
   try {
+    if (project.submitBlocked) throw new Error(`この案件は cr入稿くん が未対応です: ${project.submitBlocked}`);
     await respond(responseUrl, { text: "🔎 最新状態を確認して実行します…", replace_original: true });
     // 承認時に再解決（ボタン表示中に状況が変わっていても最新で実行）
     const outcome = await resolveSubmit(project, env, metaToken, {

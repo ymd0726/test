@@ -33,6 +33,12 @@ export interface SubmitProject {
   adNameStyle?: "full" | "short";
   /** 入稿先として提示する広告セットを限定したい場合のID配列（省略時はアカウント内のACTIVEな広告セットを列挙） */
   adsetAllowlist?: string[];
+  /**
+   * 設定時は /cr-in をこの理由で即エラー終了させる（既知の未解決事項がある案件用）。
+   * 例: 集計表タブ名がCLDB記載と不一致・ID行未特定・複数Driveフォルダで1件に決め打てない等。
+   * 解決したら削除してcr入稿くんを有効化する。
+   */
+  submitBlocked?: string;
 }
 
 /** /cr-in 解決フェーズの結果（確認ボタンに埋め込む実行プラン） */
