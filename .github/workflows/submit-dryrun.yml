@@ -1,0 +1,67 @@
+name: 入稿展開テスト（cr入稿くん submit dryRun）
+
+# 手動実行専用。共通GAS(submitCreative)へ dryRun POST し、
+# 集計表のブロック複製計画（集計内=親／集計外=子）を検証する。
+# dryRun=true（既定）なら集計表は一切変更しない。
+on:
+  workflow_dispatch:
+    inputs:
+      gasUrl:
+        description: "submit用 GAS Web App URL（/exec）"
+        required: true
+        default: "https://script.google.com/macros/s/AKfycbzUq6Sa_4-TLsmtCfgKwT_WK9FvmJfEUm_DkMSgd7J7s0WXtAjzNziaAIxqu87DLjCW/exec"
+      spreadsheetId:
+        description: "スプレッドシートID"
+        required: true
+        default: "1oEK8JCJg2NcseWmnxLtfNFCe5A7XGJ_DJSj7c2EW1sg"
+      sheetName:
+        description: "タブ名"
+        required: true
+        default: "kk_mak"
+      parentId:
+        description: "親CR名（例: cr999。既存と重複しない名前に）"
+        required: true
+        default: "cr999"
+      childIds:
+        description: "子CR名カンマ区切り（例: cr999_01,cr999_02,cr999_03）。空なら親のみ"
+        required: false
+        default: "cr999_01,cr999_02,cr999_03"
+      dryRun:
+        description: "true=計画のみ（集計表を変更しない） / false=実挿入"
+        required: true
+        default: "true"
+
+jobs:
+  dryrun:
+    runs-on: ubuntu-latest
+    steps:
+      - name: POST submitCreative to GAS
+        run: |
+          set -euo pipefail
+          # childIds カンマ区切り → JSON配列
+          CHILDREN_JSON="[]"
+          if [ -n "${{ github.event.inputs.childIds }}" ]; then
+            CHILDREN_JSON=$(printf '%s' "${{ github.event.inputs.childIds }}" \
+              | python3 -c 'import sys,json; print(json.dumps([s.strip() for s in sys.stdin.read().split(",") if s.strip()]))')
+          fi
+          PAYLOAD=$(python3 - <<PY
+          import json
+          print(json.dumps({
+            "action": "submitCreative",
+            "spreadsheetId": "${{ github.event.inputs.spreadsheetId }}",
+            "sheetName": "${{ github.event.inputs.sheetName }}",
+            "parentId": "${{ github.event.inputs.parentId }}",
+            "childIds": json.loads('''$CHILDREN_JSON'''),
+            "dryRun": "${{ github.event.inputs.dryRun }}" == "true",
+          }))
+          PY
+          )
+          echo "--- リクエスト ---"
+          echo "$PAYLOAD"
+          echo "--- レスポンス ---"
+          curl -sSL -X POST "${{ github.event.inputs.gasUrl }}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" | tee /tmp/resp.json
+          echo
+          echo "--- 整形 ---"
+          python3 -m json.tool /tmp/resp.json || true
