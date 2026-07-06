@@ -1,0 +1,10 @@
+{
+  "name": "match-sort",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "BUG-14: マッチング結果をカット番号順(カット1→N)で並べるヘルパー",
+  "scripts": {
+    "test": "node --test"
+  }
+}
