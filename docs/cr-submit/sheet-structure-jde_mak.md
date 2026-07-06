@@ -1,5 +1,9 @@
 # jde_mak 集計表 構造実測（Phase 0）
 
+> 📌 集計表構造仕様の**正本はNotion**「🛠️開発ツール・仕様マスターDB＞集計表 構造仕様（全ツール共通リファレンス）」
+> https://app.notion.com/p/39535c2adb568196a433dae934418ea1
+> このファイルは実測時の作業ログ。仕様の更新・案件追加は正本側へ。
+
 - スプレッドシート: `jde集計`（ID: `1oEK8JCJg2NcseWmnxLtfNFCe5A7XGJ_DJSj7c2EW1sg`）
 - 実測方法: GitHub Actions「集計表 構造ダンプ（cr入稿くん Phase 0）」を Run workflow
   （`scripts/cr-submit/inspect_sheet.mjs` / 読み取り専用 / 既存 `GOOGLE_SERVICE_ACCOUNT_JSON` シークレット使用）
