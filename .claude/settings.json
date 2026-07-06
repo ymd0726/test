@@ -1,0 +1,41 @@
+{
+  "env": {
+    "TOOL_USAGE_DB_ID": "fbbd34c1-5274-476d-bf00-4e15a073d50b"
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR/scripts/tool-usage/logToolUse.mjs\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR/scripts/tool-usage/syncToNotion.mjs\"",
+            "timeout": 20
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR/scripts/tool-usage/syncToNotion.mjs\" --force",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "name": "tool-usage",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Claude Codeのツール使用を人別・ツール別にカウントしNotionに貯める(フック連携)",
+  "scripts": {
+    "test": "node --test"
+  }
+}
