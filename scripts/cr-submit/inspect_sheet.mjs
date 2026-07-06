@@ -76,6 +76,19 @@ for (const sheet of targets) {
   if (!args.tab && info.cr00Blocks.length === 0) continue; // 全タブモードではcr00があるタブだけ報告
   report.tabs.push(info);
   printTab(info);
+
+  // --dump: 対象タブの1〜ID行の非空セルを A1:値 で全出力（実構造の目視確認用）
+  if (args.tab && args.dump) {
+    console.log(`\n--- ${p.title} 非空セルダンプ（1〜${rows.length}行 / A1:値）---`);
+    for (let r = 0; r < rows.length; r++) {
+      const cells = [];
+      for (let c = 0; c < (rows[r] || []).length; c++) {
+        const v = String(rows[r][c] ?? "").trim();
+        if (v) cells.push(`${colToA1(c)}${r + 1}=${v.slice(0, 30)}`);
+      }
+      if (cells.length) console.log(`[行${r + 1}] ${cells.join(" | ")}`);
+    }
+  }
 }
 
 if (args.json) {
@@ -172,6 +185,7 @@ function parseArgs(argv) {
     if (argv[i] === "--sheet") out.sheet = argv[++i];
     else if (argv[i] === "--tab") out.tab = argv[++i];
     else if (argv[i] === "--json") out.json = true;
+    else if (argv[i] === "--dump") out.dump = true;
   }
   return out;
 }
