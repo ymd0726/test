@@ -53,6 +53,8 @@ export interface SubmitPlan {
   /** 入稿先広告セット */
   adsetId: string;
   adsetName: string;
+  /** 入稿先キャンペーン名（完了通知の表示用） */
+  campaignName?: string;
   /** テキスト類のコピー元広告 */
   sourceAdId: string;
   sourceAdName: string;

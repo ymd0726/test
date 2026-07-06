@@ -68,10 +68,10 @@ async function resolveAndAsk(
       });
       const buttons = outcome.adsetCandidates.slice(0, 5).map((c, i) => ({
         type: "button",
-        text: { type: "plain_text", text: truncate(`${c.name}`, 70) },
+        text: { type: "plain_text", text: truncate(c.campaignName ? `${c.campaignName} / ${c.name}` : c.name, 74) },
         action_id: `crin_exec_${i}`,
         value: JSON.stringify({ a: payload.text.trim(), ad: c.id, s: c.latestAd!.id }),
-        confirm: confirmDialog(plan.parentName, c.name, c.latestAd!.name),
+        confirm: confirmDialog(plan.parentName, `${c.campaignName || ""} / ${c.name}`, c.latestAd!.name),
       }));
       blocks.push({ type: "actions", elements: [...buttons, cancelButton()] });
       if (outcome.adsetCandidates.length > 5) {
@@ -85,7 +85,7 @@ async function resolveAndAsk(
         type: "section",
         text: {
           type: "mrkdwn",
-          text: `入稿先: *${plan.adsetName}*\nコピー元: ${plan.sourceAdName}`,
+          text: `📣 キャンペーン: *${plan.campaignName || "(不明)"}*\n🎯 広告セット: *${plan.adsetName}*\nコピー元: ${plan.sourceAdName}`,
         },
       });
       blocks.push({
@@ -171,6 +171,7 @@ async function confirmAndRun(
     const chosen = (outcome.adsetCandidates || []).find((c) => c.id === v.ad);
     if (chosen) {
       plan.adsetName = chosen.name;
+      plan.campaignName = chosen.campaignName;
       plan.sourceAdId = chosen.latestAd!.id;
       plan.sourceAdName = chosen.latestAd!.name;
     } else if (!plan.sourceAdId) {

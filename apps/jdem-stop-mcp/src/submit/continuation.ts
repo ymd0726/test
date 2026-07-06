@@ -205,7 +205,10 @@ async function runHop(
         const lines = [
           `✅ *入稿が完了しました: ${plan.parentName}*`,
           "",
-          ...plan.videos.map((v) => `・${v.adName}\n    video_id: \`${v.videoId}\` / ad_id: \`${v.adId}\`（*PAUSED*）`),
+          `📣 入稿先キャンペーン: *${plan.campaignName || "(不明)"}*`,
+          `🎯 入稿先広告セット: *${plan.adsetName || "(不明)"}*`,
+          "",
+          ...plan.videos.map((v) => `・${v.adName}（*PAUSED*）`),
           "",
           `📊 集計表: ${((plan as any)._sheetResults || []).join(" / ") || "対象なし"}`,
           (plan as any)._notionWarn ? `⚠️ ${(plan as any)._notionWarn}` : "📝 Notionステータス: 入稿済み",

@@ -153,12 +153,13 @@ export async function resolveSubmit(
       ...planBase,
       adsetId: c.id,
       adsetName: c.name,
+      campaignName: c.campaignName,
       sourceAdId: c.latestAd!.id,
       sourceAdName: c.latestAd!.name,
     };
   } else {
     // 複数広告セット → Slackで選択させる（選択後に同じplanBaseへ確定値を埋める）
-    outcome.plan = { ...planBase, adsetId: "", adsetName: "", sourceAdId: "", sourceAdName: "" };
+    outcome.plan = { ...planBase, adsetId: "", adsetName: "", campaignName: "", sourceAdId: "", sourceAdName: "" };
     outcome.adsetCandidates = usable;
   }
   return outcome;
@@ -175,10 +176,10 @@ function adNameFor(project: SubmitProject, fileBaseName: string): string {
   return fileBaseName; // full（既定）: Driveファイル名=Notionページ名 そのまま
 }
 
-/** 集計表表記: 先頭の案件コードを除去した cr{N}[_{XX}]_{説明} */
+/** 集計表表記: cr番号（+パターン番号）のみ。例 cr82 / cr79_01。説明は付けない（jde_mak要望 2026-07-06） */
 function sheetIdFor(fileBaseName: string): string {
-  const i = fileBaseName.search(/cr\d/i);
-  return i >= 0 ? fileBaseName.slice(i) : fileBaseName;
+  const m = fileBaseName.match(/cr\d+(?:_\d{2})?/i);
+  return m ? m[0].toLowerCase() : fileBaseName;
 }
 
 export function normalizeCrKey(s: string): string {
