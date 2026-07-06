@@ -1,0 +1,10 @@
+{
+  "name": "notion-drive-embed",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "BUG-13: GoogleドライブURLをNotionで一目で分かるインラインプレビューに変換するヘルパー",
+  "scripts": {
+    "test": "node --test"
+  }
+}
