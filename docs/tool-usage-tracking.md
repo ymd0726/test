@@ -49,7 +49,11 @@ Notion: 回数をSum集計 → 「誰が何回」「誰がどのツールを何�
 - ✅ フックE2E（ローカル）: PostToolUse で記録され、NOTION_TOKEN 未設定でも exit 0 で
   グレースフルにスキップ（ローカルには蓄積）を確認
 - ✅ Notion DB・3ビュー作成済み
-- 🔲 実Notion書き込み: `NOTION_TOKEN` を設定した実環境で 1行反映・差分非重複を確認（要トークン）
+- ✅ 実Notion書き込みテスト（2026-07-06）: 本番と同一スキーマの一時DBへ、本コードと同じ
+  行構造(builtin/MCP両方)を書き込み→SQL集計で回数一致を確認→一時DBは trash 済み。
+  この検証で `実行者/ツール/サーバ` は select だと option 事前登録が必要と判明したため
+  **rich_text に変更**（Notionはtextでもグループ集計可能。option管理不要で堅牢）。
+- 🔲 実運用トークンでの `POST /pages`（Integration接続後）での1行反映・差分非重複の最終確認
 
 ## 運用上の注意
 

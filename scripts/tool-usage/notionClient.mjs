@@ -33,14 +33,15 @@ export async function createUsageDatabase(token, parentPageId) {
     ],
     properties: {
       名称: { title: {} },
-      実行者: { select: {} },
-      ツール: { select: {} },
-      分類: { select: {} }, // MCP / builtin
-      サーバ: { select: {} }, // MCPサーバ名(builtinは空)
+      // 実行者/ツール/サーバ は rich_text(任意文字列で option 管理が不要・グループ集計も可能)
+      実行者: { rich_text: {} },
+      ツール: { rich_text: {} },
+      サーバ: { rich_text: {} }, // MCPサーバ名(builtinは空)
+      分類: { select: { options: [{ name: "MCP", color: "blue" }, { name: "builtin", color: "gray" }] } },
       回数: { number: {} },
       日付: { date: {} },
       セッションID: { rich_text: {} },
-      環境: { select: {} }, // web / local など
+      環境: { select: { options: [{ name: "web", color: "green" }, { name: "local", color: "orange" }] } },
     },
   });
   return db.id;
@@ -50,13 +51,13 @@ export async function createUsageDatabase(token, parentPageId) {
 export async function appendUsageRow(token, databaseId, row) {
   const props = {
     名称: { title: [{ text: { content: row.名称 } }] },
-    実行者: { select: { name: row.実行者 } },
-    ツール: { select: { name: row.ツール } },
+    実行者: { rich_text: [{ text: { content: row.実行者 } }] },
+    ツール: { rich_text: [{ text: { content: row.ツール } }] },
     回数: { number: row.回数 },
     日付: { date: { start: row.日付 } },
   };
   if (row.分類) props.分類 = { select: { name: row.分類 } };
-  if (row.サーバ) props.サーバ = { select: { name: row.サーバ } };
+  if (row.サーバ) props.サーバ = { rich_text: [{ text: { content: row.サーバ } }] };
   if (row.セッションID) props.セッションID = { rich_text: [{ text: { content: row.セッションID } }] };
   if (row.環境) props.環境 = { select: { name: row.環境 } };
   await notionApi(token, "pages", "POST", { parent: { database_id: databaseId }, properties: props });

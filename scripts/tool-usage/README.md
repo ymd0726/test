@@ -55,16 +55,21 @@
 | プロパティ | 型 | 内容 |
 | --- | --- | --- |
 | 名称 | title | `2026-07-06 山田 / Bash ×5` |
-| 実行者 | select | ユーザー |
-| ツール | select | ツール名（`Bash` / `mcp__Notion__notion-fetch` 等） |
+| 実行者 | text | ユーザー（任意文字列。select だと option 事前登録が必要になるため text） |
+| ツール | text | ツール名（`Bash` / `mcp__Notion__notion-fetch` 等） |
 | 分類 | select | `MCP` / `builtin` |
-| サーバ | select | MCPサーバ名（builtinは空） |
+| サーバ | text | MCPサーバ名（builtinは空） |
 | 回数 | number | その差分の回数 |
 | 日付 | date | 実行日 |
 | セッションID | text | セッション識別子 |
 | 環境 | select | `web` / `local` |
 
 集計は各ビューで `回数` 列の計算を **Sum** にすると人別/ツール別の合計が出る。
+Notion はテキストプロパティでも「Group by」できるため、text でも人別/ツール別集計は問題ない。
+
+> 実書き込みテスト（2026-07-06 実施・クリーンアップ済み）: 同一スキーマの一時DBに
+> 本コードと同じ行(Bash builtin ×3 / mcp__Notion__notion-fetch MCP・Notion ×2)を書き込み、
+> SQL集計で `Bash=3 / notion-fetch=2` を確認。テストDBは trash 済み。
 
 ## テスト
 
