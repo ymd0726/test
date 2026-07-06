@@ -176,13 +176,24 @@ export function buildCreativeParams(
     object_story_spec: JSON.stringify(story),
     // Instagram面もFacebookページ名義で配信（ページ由来IG/PBIA。手動入稿と同じ）
     use_page_actor_override: "true",
-    // エンハンス系を明示OFF（手動運用の「エンハンス0件」を再現）
-    degrees_of_freedom_spec: JSON.stringify({
-      creative_features_spec: { standard_enhancements: { enroll_status: "OPT_OUT" } },
-    }),
     // 関連メディアOFF
     contextual_multi_ads: JSON.stringify({ enroll_status: "OPT_OUT" }),
   };
+
+  // エンハンス設定: コピー元(cr84等)の設定を引き継ぐ＝クイック複製と同じ挙動。
+  // ただし standard_enhancements はMeta非推奨(3858504「標準エンハンスを含められない」)のため除去する。
+  // コピー元がエンハンスOFFで作られていれば、その個別OPT_OUT設定がそのまま引き継がれる。
+  const dof = source.degrees_of_freedom_spec
+    ? JSON.parse(JSON.stringify(source.degrees_of_freedom_spec))
+    : null;
+  if (dof?.creative_features_spec) {
+    delete dof.creative_features_spec.standard_enhancements; // 廃止フィールドを除去
+    if (Object.keys(dof.creative_features_spec).length === 0) delete dof.creative_features_spec;
+  }
+  if (dof && Object.keys(dof).length > 0) {
+    params.degrees_of_freedom_spec = JSON.stringify(dof);
+  }
+
   if (source.url_tags) {
     params.url_tags = replaceCrParam(source.url_tags, opts.crParam);
   }
