@@ -63,29 +63,60 @@ export async function resolveSubmit(
   if (!crKey) throw new Error(`CRページ名からcr番号を特定できません: ${parentName}`);
 
   // 2. Drive ファイル
-  // crフォルダは CLDB「cr倉庫_(GoogleDrive) #納品先」を最優先で実行時解決（フォルダ移動にデプロイ不要）。
-  // CLDB未設定・未共有・プロパティ空のときはWorker設定値にフォールバック。
-  let configuredFolderId = project.driveFolderId;
-  if (project.cldbPageId) {
-    try {
-      const cldbFolderId = await fetchCldbCrFolderId(env.NOTION_TOKEN, project.cldbPageId);
-      if (cldbFolderId) {
-        configuredFolderId = cldbFolderId;
-      } else {
-        warnings.push("ℹ️ CLDBのcr倉庫プロパティが未設定のため、Worker設定のフォルダを使用");
-      }
-    } catch (e: any) {
-      warnings.push(`ℹ️ CLDB参照失敗（${e.message}）。Worker設定のフォルダを使用`);
-    }
-  }
   const driveToken = await driveAccessToken(env.GOOGLE_SERVICE_ACCOUNT_JSON);
-  const folderId = await resolveFolderId(driveToken, {
-    folderId: configuredFolderId,
-    folderName: project.driveFolderName,
-  });
   // 親名の先頭部分（説明を除いた {案件}_{crKey}）でも拾えるように2段で検索
   const prefix = parentName.split(crKey)[0] + crKey; // 例: jde_mak_cr79
-  const all = await listCreativeFiles(driveToken, folderId, prefix);
+
+  let folderId: string;
+  let all: DriveFile[];
+  const sheetFolders = project.sheets.filter((s) => s.driveFolderId || s.driveFolderName);
+  if (sheetFolders.length > 0) {
+    // sheet単位のDriveフォルダ上書きがある案件（例: bla の face/body）。
+    // 各フォルダでprefix検索し、一致したフォルダが複数あれば「別部位の同名cr」の誤爆を避けて中断する。
+    const resolved = await Promise.all(
+      sheetFolders.map(async (s) => {
+        const fid = await resolveFolderId(driveToken, { folderId: s.driveFolderId, folderName: s.driveFolderName });
+        const files = await listCreativeFiles(driveToken, fid, prefix);
+        return { sheetName: s.sheetName || fid, folderId: fid, files };
+      })
+    );
+    const withMatches = resolved.filter((r) => r.files.length > 0);
+    if (withMatches.length > 1) {
+      throw new Error(
+        `複数のDriveフォルダ（${withMatches.map((w) => w.sheetName).join(" / ")}）で「${prefix}」が見つかりました。` +
+          `あいまいなため中断します（NotionページURLで指定するか、sheet別Driveフォルダ設定を確認してください）`
+      );
+    }
+    if (withMatches.length === 1) {
+      folderId = withMatches[0].folderId;
+      all = withMatches[0].files;
+    } else {
+      folderId = resolved[0]?.folderId || "";
+      all = [];
+    }
+  } else {
+    // 既存: project単位の単一Driveフォルダ。
+    // crフォルダは CLDB「cr倉庫_(GoogleDrive) #納品先」を最優先で実行時解決（フォルダ移動にデプロイ不要）。
+    // CLDB未設定・未共有・プロパティ空のときはWorker設定値にフォールバック。
+    let configuredFolderId = project.driveFolderId;
+    if (project.cldbPageId) {
+      try {
+        const cldbFolderId = await fetchCldbCrFolderId(env.NOTION_TOKEN, project.cldbPageId);
+        if (cldbFolderId) {
+          configuredFolderId = cldbFolderId;
+        } else {
+          warnings.push("ℹ️ CLDBのcr倉庫プロパティが未設定のため、Worker設定のフォルダを使用");
+        }
+      } catch (e: any) {
+        warnings.push(`ℹ️ CLDB参照失敗（${e.message}）。Worker設定のフォルダを使用`);
+      }
+    }
+    folderId = await resolveFolderId(driveToken, {
+      folderId: configuredFolderId,
+      folderName: project.driveFolderName,
+    });
+    all = await listCreativeFiles(driveToken, folderId, prefix);
+  }
   const childPattern = new RegExp(`${escapeReg(crKey)}_(\\d{2})`, "i");
   const children = all
     .filter((f) => childPattern.test(f.name))

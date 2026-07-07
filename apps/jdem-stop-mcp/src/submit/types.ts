@@ -6,6 +6,14 @@
 export interface ProjectSheet {
   spreadsheetId: string;
   sheetName?: string;
+  /**
+   * sheet単位のDriveフォルダ上書き（例: bla の face/body で完成素材フォルダが分かれる案件）。
+   * 設定したsheetが1つ以上あるプロジェクトは、resolve.ts が各フォルダでprefix検索し、
+   * 一致したフォルダが1つだけならそれを採用。複数フォルダで一致したら曖昧なので中断する
+   * （誤って別部位の同名crを掴むことを防ぐ）。未設定ならproject単位のdriveFolderId等を使う。
+   */
+  driveFolderId?: string;
+  driveFolderName?: string;
 }
 
 export interface SubmitProject {
