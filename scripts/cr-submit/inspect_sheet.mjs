@@ -30,6 +30,7 @@ if (!raw) {
   process.exit(1);
 }
 const creds = JSON.parse(raw);
+console.log(`# 実行中のサービスアカウント: ${creds.client_email}`);
 const auth = new google.auth.GoogleAuth({
   credentials: creds,
   scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
