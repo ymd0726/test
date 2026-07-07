@@ -86,25 +86,33 @@ function metaToken(env: Env, p: Project): string | undefined {
 // cr入稿くん driveFolderId は CLDB「cr倉庫_(GoogleDrive) #納品先」を2026-07-06に一括照合して抽出
 // （collection://6ca19ba4-11c6-4d40-ad66-990c678b2b0d）。集計表構造の案件差は
 // Notion「📊 集計表 構造仕様（全ツール共通リファレンス）」参照。
+//
+// crdbDataSourceId は全案件で同一値（3adda07df1cd407fac365e81c6da2582 = CRDB #クリエイティブdb）。
+// 2026-07-07に実地確認: このCRDBはjde専用ではなく「アイデア〜企画〜指示ファイルまで」を横断参照する
+// 全案件共通のDBで、各レコードはCLDB(案件)リレーションで案件に紐づく（例: pom_cr06_…もこのDB内に実在）。
+// cr名検索は project.crdbDataSourceId 内を bare な cr番号(例 "cr79")で contains 検索するため、
+// 別案件に同じcr番号が存在すると「複数あります」で止まりNotionページURL直指定を求められる
+// （誤って別案件のページを掴むことはない。安全側のフォールバック）。
+const CRDB_DATA_SOURCE_ID = "3adda07df1cd407fac365e81c6da2582"; // CRDB #クリエイティブdb（全案件共通）
 const PROJECTS: Project[] = [
   // ── 株式会社リードBM（既定トークン）・Meta連携あり ──
   { name: "jdem", channelId: "C06K15R5PLM", sheets: [{ spreadsheetId: "11ZkSchmHPDeaDLo6h3EfyNYW9pHisxw6ErH5KlU7-EI" }], metaAdAccountId: "376611118470846",
-    driveFolderId: "1NLdIeoFXs7-fZ1ZLVQmNiwnuHFjCd5TC" },
+    driveFolderId: "1NLdIeoFXs7-fZ1ZLVQmNiwnuHFjCd5TC", crdbDataSourceId: CRDB_DATA_SOURCE_ID },
   { name: "hyd",  channelId: "C05K6A1AYAX", sheets: [{ spreadsheetId: "1SkCSTuegQoZhNd3keYFOEZw2YIWOnbiRAe0rY-g22bY" }], metaAdAccountId: "240479525112751",
     driveFolderId: "1ZvE0rGBtOsZAnae8OfO3Uz-5XO9FcagA",
     // 構造仕様§6実測: 集計内(親)ゾーンにcr00テンプレが見つからない（CR一覧→ 以下に実クリエイティブが直列、テンプレ無し）。
     // GAS側の自動検出も安全側でエラーになる想定だが、原因未解明のため入口でブロック。要手動確認後に解除。
     submitBlocked: "集計内(親)ゾーンにcr00テンプレが見つからない（実測済・原因未解明）。Notion「集計表 構造仕様」hydの行を参照し解決後に解除" },
   { name: "blr",  channelId: "C08DWV6TNVD", sheets: [{ spreadsheetId: "1sml0bP7vPwkADT820q4Vw9hwmY1vS1VKeYx4HJrmCs4" }], metaAdAccountId: "1478950736840563",
-    driveFolderId: "1N2u8z8MrDEo7ApgrPpphz9hrmdyUs7Uh" }, // 集計外(パターン子)ゾーンの存在は未確認。子ありcrはGASが明示エラーで停止する想定（親単独は動作可）
+    driveFolderId: "1N2u8z8MrDEo7ApgrPpphz9hrmdyUs7Uh", crdbDataSourceId: CRDB_DATA_SOURCE_ID }, // 集計外(パターン子)ゾーンの存在は未確認。子ありcrはGASが明示エラーで停止する想定（親単独は動作可）
   { name: "rcl",  channelId: "C0ASMD3EV5W", sheets: [{ spreadsheetId: "1J1BxvhD7EdfK6iDErRSmwBBXGq56QESnLIAhgfROCB4" }], metaAdAccountId: "961684439806754",
-    driveFolderId: "1F1GW6mlvpvl4Ct9F5T2f74-9UYOw3XWN" },
+    driveFolderId: "1F1GW6mlvpvl4Ct9F5T2f74-9UYOw3XWN", crdbDataSourceId: CRDB_DATA_SOURCE_ID },
   { name: "nrn",  channelId: "C090XM34R8C", sheets: [{ spreadsheetId: "1Q7iph8TxZ5C5ouBb3vjvyNMNgLUmP-Uj1stCO9TewFA" }], metaAdAccountId: "1193318218072212",
-    driveFolderId: "1yppVlZaoAFwNJxeeFx2Oe6yIU4qQgrtL" },
+    driveFolderId: "1yppVlZaoAFwNJxeeFx2Oe6yIU4qQgrtL", crdbDataSourceId: CRDB_DATA_SOURCE_ID },
   { name: "ssh",  channelId: "C089212DETU", sheets: [{ spreadsheetId: "1FkJIJOyYykyHV66I4VLpxHXbkVf_bswK5Y9NojDpOeI" }], metaAdAccountId: "3751573135086293",
-    driveFolderId: "154PB5vb2qEgmKJTIda2DSRay3PyvmhzY" }, // ID行=7行目（他案件と異なる。GASの1〜8行探索で自動対応済み）
+    driveFolderId: "154PB5vb2qEgmKJTIda2DSRay3PyvmhzY", crdbDataSourceId: CRDB_DATA_SOURCE_ID }, // ID行=7行目（他案件と異なる。GASの1〜8行探索で自動対応済み）
   { name: "brm",  channelId: "C07KJES7LHW", sheets: [{ spreadsheetId: "1MSJ6sLNWIbZnYy1CbDUNg86KUWq9fX_MlFENKGdGKH8" }], metaAdAccountId: "825363383075510",
-    driveFolderId: "1g2t0BOjVesJ2laFH3lnWZzyjtLNBWd-L" },
+    driveFolderId: "1g2t0BOjVesJ2laFH3lnWZzyjtLNBWd-L", crdbDataSourceId: CRDB_DATA_SOURCE_ID },
   // ── 複数集計対象の案件 ──
   { name: "una",  channelId: "C08DV6STNER", metaAdAccountId: "1063670028480764", sheets: [
       { spreadsheetId: "1J_T8FurvLgRd6IhxjqE0AqGS8NfQPRanXp55dy9o5gI", sheetName: "meta_total" },        // 本店
@@ -112,7 +120,7 @@ const PROJECTS: Project[] = [
     ],
     // 本店フォルダのみ登録（銀座店はCLDB未登録）。銀座店のcrを入稿すると本店フォルダで
     // ファイルが見つからずエラーになる想定（誤爆ではなく安全側の失敗）。銀座店対応時はCLDBに登録を
-    driveFolderId: "1x7msuyaB8oaGkht3mKMYI3rE4j5g-zzr" },
+    driveFolderId: "1x7msuyaB8oaGkht3mKMYI3rE4j5g-zzr", crdbDataSourceId: CRDB_DATA_SOURCE_ID },
   { name: "bla",  channelId: "C09FYGDAFEX", metaAdAccountId: "1612534536164262", sheets: [
       { spreadsheetId: "1s7wI_d9CFRv0pGeNJXVoSg1Ux6VwKznpkf10qTjVgRw", sheetName: "meta_face" },
       { spreadsheetId: "1s7wI_d9CFRv0pGeNJXVoSg1Ux6VwKznpkf10qTjVgRw", sheetName: "meta_body" },
@@ -139,6 +147,7 @@ const PROJECTS: Project[] = [
       { spreadsheetId: "1oEK8JCJg2NcseWmnxLtfNFCe5A7XGJ_DJSj7c2EW1sg", sheetName: "kk_kou" },
     ],
     driveFolderId: "1i0xy_jjhzLY4RE6K22ahxxmm-vrHUNNM", // CLDB「n22_jde_kk_kou」
+    crdbDataSourceId: CRDB_DATA_SOURCE_ID,
     adNameStyle: "full" },
   // ── 株式会社リードBM・集計表のみ（Meta広告アカウントID未登録 → cr入稿くんはMeta未連携ゆえ利用不可。後付け可）──
   { name: "bbt",  channelId: "C0B3J7U8Q5N", sheets: [{ spreadsheetId: "1IoFvL9ZmbhoNRlFl_rvza8VwC0_bA1mJAT5z98-gGf8" }] }, // Drive倉庫もCLDB未登録
@@ -158,7 +167,7 @@ const PROJECTS: Project[] = [
     submitBlocked: "CLDB記載のタブ名「meta_全店共通CR別」がスプレッドシートに実在しない（実際のタブ名の確認・CLDB修正が必要）" },
   // ── Local Infomation BM（META_TOKEN_LOCAL）──
   { name: "grm",  channelId: "C09GWM75YV6", sheets: [{ spreadsheetId: "1Ug7qBDUUhLutvDLlBbQNiKvIhVbwOhxlOOYm-zPpwG0" }], metaAdAccountId: "1252444372845762", metaTokenSecret: "META_TOKEN_LOCAL",
-    driveFolderId: "1TrGMy-Z6MQKN3w2Dht0FG8zEeYi0QSMZ" },
+    driveFolderId: "1TrGMy-Z6MQKN3w2Dht0FG8zEeYi0QSMZ", crdbDataSourceId: CRDB_DATA_SOURCE_ID },
   { name: "fpl",  channelId: "C09NP3CE316", sheets: [{ spreadsheetId: "1fPuoBFCp4LoC8GVr84M9JWMoWwgr6tDzAGZEPEhz-VU" }], metaTokenSecret: "META_TOKEN_LOCAL",
     driveFolderId: "1p5FLvojnRZ8Smoymuz4hY50NLh9wsWa1" }, // metaAdAccountId未登録のためcr入稿くんはMeta未連携ゆえ利用不可（後付け可）
 ];
