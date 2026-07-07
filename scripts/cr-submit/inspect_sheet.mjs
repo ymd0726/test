@@ -44,6 +44,7 @@ const meta = await sheets.spreadsheets.get({
 });
 console.log(`# スプレッドシート: ${meta.data.properties.title} (${SPREADSHEET_ID})`);
 console.log(`# タブ数: ${meta.data.sheets.length}`);
+console.log(`# 全タブ名: ${meta.data.sheets.map((s) => s.properties.title).join(" | ")}`);
 
 const targets = args.tab
   ? meta.data.sheets.filter((s) => s.properties.title === args.tab)
