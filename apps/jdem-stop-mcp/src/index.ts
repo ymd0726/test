@@ -104,16 +104,14 @@ const PROJECTS: Project[] = [
   // ── 株式会社リードBM（既定トークン）・Meta連携あり ──
   { name: "jdem", channelId: "C06K15R5PLM", sheets: [{ spreadsheetId: "11ZkSchmHPDeaDLo6h3EfyNYW9pHisxw6ErH5KlU7-EI" }], metaAdAccountId: "376611118470846",
     driveFolderId: "1NLdIeoFXs7-fZ1ZLVQmNiwnuHFjCd5TC", crdbDataSourceId: CRDB_DATA_SOURCE_ID },
+  // hyd: 認証は ads-reader ではなく ad-analysis-bot@ad-analysis-bot.iam.gserviceaccount.com
+  // （Googleグループ lead_div1 経由で共有済み）。マーカーは「CR一覧→」(パターン開始/集計内)
+  // と「集計除外→」(集計外開始)。2026-07-08 ユーザーが集計内(親)ゾーンにcr00テンプレ(FD6)を
+  // 手動追加し、再実測でcr00ブロック数が1→2・マーカー直後に正しく配置されたことを確認したため
+  // submitBlockedを解除。
   { name: "hyd",  channelId: "C05K6A1AYAX", sheets: [{ spreadsheetId: "1SkCSTuegQoZhNd3keYFOEZw2YIWOnbiRAe0rY-g22bY" }], metaAdAccountId: "240479525112751",
-    driveFolderId: "1ZvE0rGBtOsZAnae8OfO3Uz-5XO9FcagA", crdbDataSourceId: CRDB_DATA_SOURCE_ID,
-    // 2026-07-07 権限共有(Googleグループ lead_div1 経由)後に再実測して判明:
-    // 実際に使われているサービスアカウントは ads-reader ではなく ad-analysis-bot@ad-analysis-bot.iam.gserviceaccount.com
-    // だった（要ユーザー共有→共有済み・解決）。ただし読み取れた結果、集計内(親)ゾーンにcr00テンプレが
-    // 実在しないことを列位置の突合せで確認済み（権限問題ではなく真の構造欠落）。マーカーは
-    // 「CR一覧→」(パターン開始・GAS追加済)と「集計除外→」(集計外開始・GAS追加済)。
-    // 親テンプレブロックを手動で1つ追加すれば解除できる見込み
-    submitBlocked: "集計内(親)ゾーンにcr00テンプレが実在しない（列位置確認済・権限問題は解決済み）。親テンプレブロックを手動追加すれば解除可能" },
-  { name: "blr",  channelId: "C08DWV6TNVD", sheets: [{ spreadsheetId: "1sml0bP7vPwkADT820q4Vw9hwmY1vS1VKeYx4HJrmCs4" }], metaAdAccountId: "1478950736840563",
+    driveFolderId: "1ZvE0rGBtOsZAnae8OfO3Uz-5XO9FcagA", crdbDataSourceId: CRDB_DATA_SOURCE_ID },
+  { name: "blr", channelId: "C08DWV6TNVD", sheets: [{ spreadsheetId: "1sml0bP7vPwkADT820q4Vw9hwmY1vS1VKeYx4HJrmCs4" }], metaAdAccountId: "1478950736840563",
     driveFolderId: "1N2u8z8MrDEo7ApgrPpphz9hrmdyUs7Uh", crdbDataSourceId: CRDB_DATA_SOURCE_ID }, // 集計外(パターン子)ゾーンの存在は未確認。子ありcrはGASが明示エラーで停止する想定（親単独は動作可）
   { name: "rcl",  channelId: "C0ASMD3EV5W", sheets: [{ spreadsheetId: "1J1BxvhD7EdfK6iDErRSmwBBXGq56QESnLIAhgfROCB4" }], metaAdAccountId: "961684439806754",
     driveFolderId: "1F1GW6mlvpvl4Ct9F5T2f74-9UYOw3XWN", crdbDataSourceId: CRDB_DATA_SOURCE_ID },
