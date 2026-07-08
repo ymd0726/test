@@ -152,7 +152,9 @@ export async function resolveSubmit(
   const candidates = await listAdsetCandidates(project.metaAdAccountId, metaToken, project.adsetAllowlist);
   const usable = candidates.filter((c) => c.latestAd);
   if (usable.length === 0) {
-    throw new Error("コピー元にできる直近cr広告を持つACTIVEな広告セットが見つかりません");
+    throw new Error(
+      "コピー元にできる直近cr広告を持つ広告セットが見つかりません（直近7日間に消化のあるセット、無ければACTIVE全セットを探索）"
+    );
   }
 
   // 4. プラン組み立て（実際に入稿する動画 = 子があれば子、無ければ親）

@@ -246,39 +246,73 @@ export interface AdsetCandidate {
   id: string;
   name: string;
   campaignName: string;
+  /** ACTIVE=配信中。PAUSED/CAMPAIGN_PAUSED等=停止中（DELETED/ARCHIVEDは候補から除外済み） */
+  effectiveStatus: string;
+  /** 直近7日間の消化金額。insights取得失敗時は null（=不明、絞り込み無効） */
+  spend7d: number | null;
   latestAd?: { id: string; name: string; createdTime: string };
 }
 
-/** ACTIVEな広告セット一覧と、各セットの直近cr広告（コピー元候補）を取得 */
+/**
+ * 入稿先候補の広告セット一覧と、各セットの直近cr広告（コピー元候補）を取得。
+ * 「直近7日間に消化があった広告セット」だけを候補にする（ON/OFF問わず。
+ * 使っていないキャンペーン/セットを省く）。消化ありが1件も無い・insights取得失敗の
+ * 場合は従来どおりACTIVE全セットにフォールバック。並びは消化額の大きい順。
+ */
 export async function listAdsetCandidates(
   accountId: string,
   token: string,
   allowlist?: string[]
 ): Promise<AdsetCandidate[]> {
-  const res = await graphGet(
-    `act_${accountId}/adsets?fields=${encodeURIComponent(
-      "id,name,effective_status,campaign{name},ads.limit(50){id,name,created_time}"
-    )}&limit=50`,
-    token
-  );
-  const out: AdsetCandidate[] = [];
+  const [res, spendMap] = await Promise.all([
+    graphGet(
+      `act_${accountId}/adsets?fields=${encodeURIComponent(
+        "id,name,effective_status,campaign{name},ads.limit(50){id,name,created_time}"
+      )}&limit=50`,
+      token
+    ),
+    getAdsetSpend7d(accountId, token),
+  ]);
+  const all: AdsetCandidate[] = [];
   for (const s of res.data || []) {
-    if (s.effective_status !== "ACTIVE") continue;
+    if (s.effective_status === "DELETED" || s.effective_status === "ARCHIVED") continue;
     if (allowlist && allowlist.length > 0 && !allowlist.includes(s.id)) continue;
     const ads: any[] = s.ads?.data || [];
     const crAds = ads
       .filter((a) => /cr\d/i.test(a.name))
       .sort((a, b) => String(b.created_time).localeCompare(String(a.created_time)));
-    out.push({
+    all.push({
       id: s.id,
       name: s.name,
       campaignName: s.campaign?.name || "",
+      effectiveStatus: s.effective_status,
+      spend7d: spendMap ? spendMap.get(s.id) || 0 : null,
       latestAd: crAds[0]
         ? { id: crAds[0].id, name: crAds[0].name, createdTime: crAds[0].created_time }
         : undefined,
     });
   }
-  return out;
+  const spent = spendMap ? all.filter((c) => (c.spend7d || 0) > 0) : [];
+  if (spent.length > 0) return spent.sort((a, b) => (b.spend7d || 0) - (a.spend7d || 0));
+  return all.filter((c) => c.effectiveStatus === "ACTIVE"); // フォールバック（従来動作）
+}
+
+/** 広告セット別の直近7日消化金額。失敗時はnull（絞り込みを諦めて従来動作にする） */
+async function getAdsetSpend7d(
+  accountId: string,
+  token: string
+): Promise<Map<string, number> | null> {
+  try {
+    const res = await graphGet(
+      `act_${accountId}/insights?level=adset&date_preset=last_7d&fields=adset_id,spend&limit=200`,
+      token
+    );
+    const m = new Map<string, number>();
+    for (const row of res.data || []) m.set(row.adset_id, Number(row.spend) || 0);
+    return m;
+  } catch {
+    return null;
+  }
 }
 
 /** 同名広告の存在チェック（冪等性: 二重入稿防止） */

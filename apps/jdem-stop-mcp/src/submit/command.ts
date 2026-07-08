@@ -64,25 +64,39 @@ async function resolveAndAsk(
     const blocks: any[] = [{ type: "section", text: { type: "mrkdwn", text: head } }];
 
     if (outcome.adsetCandidates) {
-      // 広告セット複数 → セットごとに実行ボタン
+      // 広告セット複数 → セットごとに実行ボタン。
+      // 候補は「直近7日間に消化のあったセット」に絞られている（listAdsetCandidates）。
+      // 🟢=配信中(ACTIVE) / ⏸=停止中。消化額の大きい順。
       blocks.push({
         type: "section",
         text: { type: "mrkdwn", text: "入稿先の広告セットを選んでください（コピー元=各セットの直近cr広告）:" },
       });
       const buttons = outcome.adsetCandidates.slice(0, 5).map((c, i) => ({
         type: "button",
-        text: { type: "plain_text", text: truncate(c.campaignName ? `${c.campaignName} / ${c.name}` : c.name, 74) },
+        text: {
+          type: "plain_text",
+          text: truncate(
+            `${c.effectiveStatus === "ACTIVE" ? "🟢" : "⏸"} ${c.campaignName ? `${c.campaignName} / ${c.name}` : c.name}`,
+            74
+          ),
+        },
         action_id: `crin_exec_${i}`,
         value: JSON.stringify({ a: payload.text.trim(), ad: c.id, s: c.latestAd!.id }),
         confirm: confirmDialog(plan.parentName, `${c.campaignName || ""} / ${c.name}`, c.latestAd!.name),
       }));
       blocks.push({ type: "actions", elements: [...buttons, cancelButton()] });
-      if (outcome.adsetCandidates.length > 5) {
-        blocks.push({
-          type: "context",
-          elements: [{ type: "mrkdwn", text: `他 ${outcome.adsetCandidates.length - 5} セットは省略。adsetAllowlistで絞ってください` }],
-        });
-      }
+      const filteredBySpend = outcome.adsetCandidates.some((c) => (c.spend7d ?? 0) > 0);
+      const notes: string[] = [
+        filteredBySpend
+          ? "🟢=配信中 / ⏸=停止中。直近7日間に消化があった広告セットのみ・消化額順"
+          : "直近7日間に消化のある広告セットが無いため、ACTIVEな全セットを表示",
+      ];
+      if (outcome.adsetCandidates.length > 5)
+        notes.push(`他 ${outcome.adsetCandidates.length - 5} セットは省略。adsetAllowlistで絞ってください`);
+      blocks.push({
+        type: "context",
+        elements: [{ type: "mrkdwn", text: notes.join("\n") }],
+      });
     } else {
       blocks.push({
         type: "section",
