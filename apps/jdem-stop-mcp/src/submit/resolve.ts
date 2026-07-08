@@ -47,13 +47,31 @@ export async function resolveSubmit(
       );
     }
     const key = normalizeCrKey(arg); // "cr79" / "79" → "cr79"
-    const hits = await findCrPageByName(env.NOTION_TOKEN, project.crdbDataSourceId, key);
-    // 前方一致で cr79 と cr790 を区別（cr79_ / cr79末尾のみ許容）
-    const exact = hits.filter((h) => new RegExp(`${key}(_|$|[^0-9])`).test(h.name));
-    if (exact.length === 0) throw new Error(`Notion CRDBに「${key}」のページが見つかりません`);
+    // CRDBは全案件共通DBのため、cr番号だけの検索では他案件の同番号crと衝突する。
+    // チャンネル=案件が確定しているので「{案件プレフィックス}_{cr番号}」で検索して絞り込む
+    // （cr停止くんと同じチャンネル=案件方式）。cr79/cr790 の混同は末尾条件(_|$|数字以外)で防ぐ。
+    const prefixes = project.crdbNamePrefixes?.length ? project.crdbNamePrefixes : [project.name];
+    const keyEnd = `${escapeReg(key)}(_|$|[^0-9])`;
+    const byId = new Map<string, CrPageInfo>();
+    for (const pre of prefixes) {
+      const hits = await findCrPageByName(env.NOTION_TOKEN, project.crdbDataSourceId, `${pre}_${key}`);
+      for (const h of hits) byId.set(h.pageId, h);
+    }
+    let exact = [...byId.values()].filter((h) =>
+      prefixes.some((pre) => new RegExp(`^${escapeReg(pre)}_${keyEnd}`, "i").test(h.name))
+    );
+    if (exact.length === 0) {
+      // 案件プレフィックス無しの旧命名ページ用フォールバック: 素のcr番号で検索（従来動作）
+      const hits = await findCrPageByName(env.NOTION_TOKEN, project.crdbDataSourceId, key);
+      exact = hits.filter((h) => new RegExp(keyEnd, "i").test(h.name));
+    }
+    if (exact.length === 0)
+      throw new Error(
+        `Notion CRDBに「${prefixes.map((p) => `${p}_${key}`).join(" / ")}」のページが見つかりません`
+      );
     if (exact.length > 1)
       throw new Error(
-        `Notion CRDBに「${key}」が複数あります:\n${exact.map((h) => `・${h.name}`).join("\n")}\nNotionページURLで指定してください`
+        `Notion CRDBに「${key}」の候補が複数あります:\n${exact.map((h) => `・${h.name}`).join("\n")}\n重複ページを整理するか、NotionページURLで指定してください`
       );
     crPage = exact[0];
   }

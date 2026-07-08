@@ -37,6 +37,14 @@ export interface SubmitProject {
   driveFolderName?: string;
   /** Notion CRDB の data source ID（クリエイティブ指示ページの検索先） */
   crdbDataSourceId?: string;
+  /**
+   * CRDBページ名の案件プレフィックス（例 "hyd" → hyd_cr50_…）。省略時は name を使う。
+   * CRDBは全案件共通DBのため、cr番号だけで検索すると他案件の同番号crと衝突する。
+   * チャンネル=案件が確定している前提で「{prefix}_{cr番号}」の前方一致に絞り込む。
+   * Slack案件キーとページ名プレフィックスが異なる案件（jdekmak→jde_mak等）の上書き用。
+   * 複数訴求チャンネル（jdek等）は複数指定可。
+   */
+  crdbNamePrefixes?: string[];
   /** Meta広告名の慣習: "full"=Notionページ名そのまま / "short"=cr{N}のみ */
   adNameStyle?: "full" | "short";
   /** 入稿先として提示する広告セットを限定したい場合のID配列（省略時はアカウント内のACTIVEな広告セットを列挙） */

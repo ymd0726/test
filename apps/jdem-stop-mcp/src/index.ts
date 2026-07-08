@@ -76,9 +76,11 @@ interface Project {
   metaAdAccountId?: string;  // 数字のみ。未設定はMeta実停止スキップ（集計表のみ）
   metaTokenSecret?: string;  // 別BMの案件のトークンsecret名。省略時は META_ACCESS_TOKEN
   // ── cr入稿くん（/cr-in）用。設定した案件だけ入稿可能 ──
+  cldbPageId?: string;       // CLDB案件ページID（設定時はcr倉庫フォルダを実行時解決。最優先）
   driveFolderId?: string;    // 完成動画フォルダのDrive ID（確実。名前検索より優先）
   driveFolderName?: string;  // または名前検索（例 "cr_jde"。同名複数あるとエラー）
   crdbDataSourceId?: string; // Notion CRDB（cr指示ページの検索先）
+  crdbNamePrefixes?: string[]; // CRDBページ名の案件プレフィックス（省略時はname。jdekmak→jde_mak等の上書き用）
   adNameStyle?: "full" | "short"; // Meta広告名: full=ファイル名そのまま / short=cr番号のみ
   adsetAllowlist?: string[]; // 入稿先候補にする広告セットID（省略時はACTIVE全セット）
   submitBlocked?: string;   // 設定時は/cr-inをこの理由で即エラー終了（既知の未解決事項がある案件）
@@ -96,9 +98,11 @@ function metaToken(env: Env, p: Project): string | undefined {
 // crdbDataSourceId は全案件で同一値（3adda07df1cd407fac365e81c6da2582 = CRDB #クリエイティブdb）。
 // 2026-07-07に実地確認: このCRDBはjde専用ではなく「アイデア〜企画〜指示ファイルまで」を横断参照する
 // 全案件共通のDBで、各レコードはCLDB(案件)リレーションで案件に紐づく（例: pom_cr06_…もこのDB内に実在）。
-// cr名検索は project.crdbDataSourceId 内を bare な cr番号(例 "cr79")で contains 検索するため、
-// 別案件に同じcr番号が存在すると「複数あります」で止まりNotionページURL直指定を求められる
-// （誤って別案件のページを掴むことはない。安全側のフォールバック）。
+// cr名検索は「{案件プレフィックス}_{cr番号}」(例 "hyd_cr50")で前方一致検索する（2026-07-08〜）。
+// チャンネル=案件が確定しているため他案件の同番号crとは衝突しない（cr停止くんと同じ方式）。
+// プレフィックスは省略時 project.name。jdekmak/jdekkou のようにSlack案件キーとページ名が
+// 異なる案件は crdbNamePrefixes で上書きする。プレフィックス付きで0件の場合は旧命名
+// （プレフィックス無し）ページ用に素のcr番号検索へフォールバックする。
 const CRDB_DATA_SOURCE_ID = "3adda07df1cd407fac365e81c6da2582"; // CRDB #クリエイティブdb（全案件共通）
 const PROJECTS: Project[] = [
   // ── 株式会社リードBM（既定トークン）・Meta連携あり ──
@@ -147,6 +151,7 @@ const PROJECTS: Project[] = [
     cldbPageId: "2a835c2adb56809b9953ee99115cc560", // CLDB「n22_jde_kk_mak」→ cr倉庫_(GoogleDrive)を実行時解決
     driveFolderId: "1M0Cc9_R_S-h_dm4SoZJ_Tigr8gWVrMck", // フォールバック: cr_jde_mak_巻き肩
     crdbDataSourceId: "3adda07df1cd407fac365e81c6da2582", // CRDB #クリエイティブdb（database_id。要: cr-stop-workerインテグレーションへの共有）
+    crdbNamePrefixes: ["jde_mak"], // CRDBページ名は jde_mak_cr79_…（Slack案件キーjdekmakと異なる）
     adNameStyle: "full", // jde系は広告名フル名称（jde_mak_cr84_… 実測済）
     adsetAllowlist: ["120246843077960183"], // mak本体広告セット（cr81/82/84の直近入稿先）
   },
@@ -155,6 +160,7 @@ const PROJECTS: Project[] = [
     ],
     driveFolderId: "1i0xy_jjhzLY4RE6K22ahxxmm-vrHUNNM", // CLDB「n22_jde_kk_kou」
     crdbDataSourceId: CRDB_DATA_SOURCE_ID,
+    crdbNamePrefixes: ["jde_kou"], // CRDBページ名は jde_kou_cr…（Slack案件キーjdekkouと異なる）
     adNameStyle: "full" },
   // ── 株式会社リードBM（2026-07-07 Meta Ads MCPで広告名実測してアカウントID確定）──
   { name: "bbt",  channelId: "C0B3J7U8Q5N", sheets: [{ spreadsheetId: "1IoFvL9ZmbhoNRlFl_rvza8VwC0_bA1mJAT5z98-gGf8" }],
