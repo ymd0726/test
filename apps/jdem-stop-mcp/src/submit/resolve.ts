@@ -69,11 +69,19 @@ export async function resolveSubmit(
       throw new Error(
         `Notion CRDBに「${prefixes.map((p) => `${p}_${key}`).join(" / ")}」のページが見つかりません`
       );
-    if (exact.length > 1)
+    // 変則ページ（冒頭替え/パターン替え/Nパターン等）は入稿対象から除外する（BUG-23）。
+    // 除外の結果1件に絞れればそのまま採用。全て変則ページだった場合は誤入稿せず明示エラー。
+    // URL直指定（上の分岐）は除外しない＝変則ページを意図的に入稿したい場合はURLで指定する。
+    const submittable = exact.filter((h) => isSubmittableCrName(h.name));
+    if (submittable.length === 0)
       throw new Error(
-        `Notion CRDBに「${key}」の候補が複数あります:\n${exact.map((h) => `・${h.name}`).join("\n")}\n重複ページを整理するか、NotionページURLで指定してください`
+        `「${key}」のCRDBページは変則ページ（冒頭替え/パターン替え/Nパターン等）のみでした:\n${exact.map((h) => `・${h.name}`).join("\n")}\n入稿対象のページをNotionページURLで指定してください`
       );
-    crPage = exact[0];
+    if (submittable.length > 1)
+      throw new Error(
+        `Notion CRDBに「${key}」の候補が複数あります:\n${submittable.map((h) => `・${h.name}`).join("\n")}\n重複ページを整理するか、NotionページURLで指定してください`
+      );
+    crPage = submittable[0];
   }
 
   const parentName = crPage.name; // 例: jde_mak_cr79_ブライダル訴求
@@ -217,6 +225,22 @@ export async function resolveSubmit(
 }
 
 // ---- 命名ヘルパー ----
+
+/**
+ * CRDBページ名がcr名検索の入稿対象になるか（BUG-23）。
+ * 「冒頭替え」「パターン替え」「3パターン」等の変則・派生案内ページは対象外にする。
+ * 新しい変則表記が見つかったらここに追記していく。
+ */
+const CRDB_NAME_EXCLUDES: RegExp[] = [
+  /冒頭替え/,
+  /パターン替え/,
+  /[0-9０-９]+\s*パターン/, // 例: 3パターン / ３パターン
+  /[nｎN]\s*パターン/, // 例: nパターン（数の伏せ字表記）
+];
+
+export function isSubmittableCrName(name: string): boolean {
+  return !CRDB_NAME_EXCLUDES.some((re) => re.test(name));
+}
 
 /** Meta広告名: 案件の慣習に合わせる（jde_mak系はフル名称） */
 function adNameFor(project: SubmitProject, fileBaseName: string): string {
