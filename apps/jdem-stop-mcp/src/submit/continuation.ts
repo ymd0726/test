@@ -217,8 +217,10 @@ async function runHop(
           "",
           ":point_right: 最終確認のうえ、広告マネージャで広告をONにしてください。",
         ];
-        await postProgress(env, plan, lines.join("\n"));
-        await postPublic(env, plan.channelId, lines.join("\n")); // チームにも完了を共有
+        // 完了通知はチャンネル向け1通のみ（BUG-24: ephemeralとの2重投稿をやめる。
+        // ephemeralは進捗・エラー用）。public投稿に失敗した場合だけephemeralで代替する。
+        const posted = await postPublic(env, plan.channelId, lines.join("\n"));
+        if (!posted) await postProgress(env, plan, lines.join("\n"));
         return; // 連鎖終了
       }
     }
@@ -295,17 +297,22 @@ export async function postProgress(
   }
 }
 
-/** チャンネル全員向けの通知（完了サマリー用。停止くんのnotifySlackと同挙動） */
-async function postPublic(env: { SLACK_BOT_TOKEN?: string }, channelId: string, text: string): Promise<void> {
-  if (!env.SLACK_BOT_TOKEN || !channelId) return;
+/**
+ * チャンネル全員向けの通知（完了サマリー用。停止くんのnotifySlackと同挙動）。
+ * 成功したかを返す（失敗時は呼び出し側がephemeralで代替できるように）。
+ */
+async function postPublic(env: { SLACK_BOT_TOKEN?: string }, channelId: string, text: string): Promise<boolean> {
+  if (!env.SLACK_BOT_TOKEN || !channelId) return false;
   try {
-    await fetch("https://slack.com/api/chat.postMessage", {
+    const res = await fetch("https://slack.com/api/chat.postMessage", {
       method: "POST",
       headers: { "content-type": "application/json; charset=utf-8", authorization: `Bearer ${env.SLACK_BOT_TOKEN}` },
       body: JSON.stringify({ channel: channelId, text }),
     });
+    const data: any = await res.json();
+    return !!data.ok;
   } catch {
-    /* 通知失敗は本処理を止めない */
+    return false; // 通知失敗は本処理を止めない
   }
 }
 
