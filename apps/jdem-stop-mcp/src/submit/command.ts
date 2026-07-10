@@ -71,7 +71,7 @@ async function resolveAndAsk(
         type: "section",
         text: { type: "mrkdwn", text: "入稿先の広告セットを選んでください（コピー元=各セットの直近cr広告）:" },
       });
-      const buttons = outcome.adsetCandidates.slice(0, 5).map((c, i) => ({
+      const buttons: any[] = outcome.adsetCandidates.slice(0, 5).map((c, i) => ({
         type: "button",
         text: {
           type: "plain_text",
@@ -84,6 +84,18 @@ async function resolveAndAsk(
         value: JSON.stringify({ a: payload.text.trim(), ad: c.id, s: c.latestAd!.id }),
         confirm: confirmDialog(plan.parentName, `${c.campaignName || ""} / ${c.name}`, c.latestAd!.name),
       }));
+      // 表示中の全セットへ同時入稿するボタン（BUG-31）。テキスト類は各セットの直近cr広告からコピー
+      if (outcome.adsetCandidates.length >= 2) {
+        const allNames = outcome.adsetCandidates.map((c) => c.name).join(" / ");
+        buttons.push({
+          type: "button",
+          style: "primary",
+          text: { type: "plain_text", text: `🚀 すべてに入稿（${outcome.adsetCandidates.length}セット）` },
+          action_id: "crin_exec_all",
+          value: JSON.stringify({ a: payload.text.trim(), all: 1 }),
+          confirm: confirmDialog(plan.parentName, truncate(allNames, 120), "各セットの直近cr広告"),
+        });
+      }
       blocks.push({ type: "actions", elements: [...buttons, cancelButton()] });
       const filteredBySpend = outcome.adsetCandidates.some((c) => (c.spend7d ?? 0) > 0);
       const notes: string[] = [
@@ -185,7 +197,7 @@ export function handleCrInInteraction(
       ctx.waitUntil(respond(responseUrl, { text: "案件が特定できません", replace_original: true }));
       return new Response("", { status: 200 });
     }
-    const v = JSON.parse(action.value) as { a: string; ad: string; s: string };
+    const v = JSON.parse(action.value) as { a: string; ad?: string; s?: string; all?: number };
     ctx.waitUntil(
       confirmAndRun(v, interaction, project, env, ctx, metaTokenFor(project), gasTargetsFor(project))
     );
@@ -222,7 +234,7 @@ export function handleCrInInteraction(
 }
 
 async function confirmAndRun(
-  v: { a: string; ad: string; s: string },
+  v: { a: string; ad?: string; s?: string; all?: number },
   interaction: any,
   project: SubmitProject,
   env: SubmitEnv,
@@ -242,16 +254,39 @@ async function confirmAndRun(
       responseUrl,
     });
     const plan = outcome.plan!;
-    plan.adsetId = v.ad;
-    const chosen = (outcome.adsetCandidates || []).find((c) => c.id === v.ad);
-    if (chosen) {
-      plan.adsetName = chosen.name;
-      plan.campaignName = chosen.campaignName;
-      plan.sourceAdId = chosen.latestAd!.id;
-      plan.sourceAdName = chosen.latestAd!.name;
-    } else if (!plan.sourceAdId) {
-      plan.sourceAdId = v.s;
-      plan.sourceAdName = "(直近cr広告)";
+    const cands = (outcome.adsetCandidates || []).filter((c) => c.latestAd);
+    if (v.all) {
+      // 「すべてに入稿」（BUG-31）: 表示された全候補セットをターゲットにする。
+      // 再解決の結果1セットに減っていた場合はそのまま単一入稿になる
+      if (cands.length === 0 && !plan.adsetId)
+        throw new Error("入稿先の広告セット候補が見つかりません（状況が変わった可能性）。もう一度 /cr-in を実行してください");
+      if (cands.length > 0) {
+        plan.targets = cands.map((c) => ({
+          adsetId: c.id,
+          adsetName: c.name,
+          campaignName: c.campaignName,
+          sourceAdId: c.latestAd!.id,
+          sourceAdName: c.latestAd!.name,
+        }));
+        const first = plan.targets[0];
+        plan.adsetId = first.adsetId;
+        plan.adsetName = first.adsetName;
+        plan.campaignName = first.campaignName;
+        plan.sourceAdId = first.sourceAdId;
+        plan.sourceAdName = first.sourceAdName;
+      }
+    } else {
+      plan.adsetId = v.ad!;
+      const chosen = cands.find((c) => c.id === v.ad);
+      if (chosen) {
+        plan.adsetName = chosen.name;
+        plan.campaignName = chosen.campaignName;
+        plan.sourceAdId = chosen.latestAd!.id;
+        plan.sourceAdName = chosen.latestAd!.name;
+      } else if (!plan.sourceAdId) {
+        plan.sourceAdId = v.s!;
+        plan.sourceAdName = "(直近cr広告)";
+      }
     }
     if (!project.metaAdAccountId) throw new Error("metaAdAccountId未設定");
     await startExecution(plan, env, ctx, metaToken, project.metaAdAccountId, gasTargets);

@@ -57,6 +57,16 @@ export interface SubmitProject {
   submitBlocked?: string;
 }
 
+/** 入稿先1件（複数広告セット同時入稿用。BUG-31） */
+export interface PlannedTarget {
+  adsetId: string;
+  adsetName: string;
+  campaignName?: string;
+  /** このセットのテキスト類コピー元（各セットの直近cr広告） */
+  sourceAdId: string;
+  sourceAdName: string;
+}
+
 /** /cr-in 解決フェーズの結果（確認ボタンに埋め込む実行プラン） */
 export interface SubmitPlan {
   project: string;
@@ -72,14 +82,20 @@ export interface SubmitPlan {
   videos: PlannedVideo[];
   /** パターン（子）があるか。集計表の親子展開に使う */
   hasChildren: boolean;
-  /** 入稿先広告セット */
+  /** 入稿先広告セット（複数入稿時は先頭ターゲット。表示用は結合名が入ることもある） */
   adsetId: string;
   adsetName: string;
   /** 入稿先キャンペーン名（完了通知の表示用） */
   campaignName?: string;
-  /** テキスト類のコピー元広告 */
+  /** テキスト類のコピー元広告（複数入稿時は先頭ターゲットのもの） */
   sourceAdId: string;
   sourceAdName: string;
+  /**
+   * 複数広告セット同時入稿（BUG-31「すべてに入稿」ボタン）。設定時はこちらを正とし、
+   * 各ターゲットごとに「そのセットの直近cr広告からspecコピー→creative→ad(PAUSED)」を作成する。
+   * 未設定時は従来どおり adsetId/sourceAdId の単一入稿。
+   */
+  targets?: PlannedTarget[];
   /** Slack返信先 */
   channelId: string;
   responseUrl: string;
@@ -100,6 +116,8 @@ export interface PlannedVideo {
   videoId?: string;
   creativeId?: string;
   adId?: string;
+  /** 複数広告セット入稿時: adsetId → 作成済みadId（再実行時のスキップ判定に使う） */
+  adIdsByAdset?: Record<string, string>;
 }
 
 export interface CreativeTextOverrides {

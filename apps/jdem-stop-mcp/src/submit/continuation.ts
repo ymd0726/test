@@ -129,42 +129,63 @@ async function runHop(
       }
 
       case "create_ads": {
-        await postProgress(env, plan, `🛠️ 広告を作成中…（コピー元: ${plan.sourceAdName}）`);
-        const source = await getSourceCreativeSpec(plan.sourceAdId, metaToken);
-        let igActorId: string | undefined; // 1815199リトライで解決したPBIAを2本目以降にも使い回す
+        // 入稿先ターゲット（複数広告セット同時入稿=BUG-31 対応。未設定時は従来の単一入稿）
+        const targets = plan.targets?.length
+          ? plan.targets
+          : [{ adsetId: plan.adsetId, adsetName: plan.adsetName, campaignName: plan.campaignName, sourceAdId: plan.sourceAdId, sourceAdName: plan.sourceAdName }];
+        await postProgress(
+          env,
+          plan,
+          targets.length > 1
+            ? `🛠️ 広告を作成中…（${targets.length}セットに入稿: ${targets.map((t) => t.adsetName).join(" / ")}）`
+            : `🛠️ 広告を作成中…（コピー元: ${plan.sourceAdName}）`
+        );
+        // サムネイルは動画ごとに1回だけ取得してターゲット間で使い回す
+        const thumbs = new Map<string, string>();
         for (const v of plan.videos) {
-          if (v.adId) continue; // 再実行時のスキップ
           const thumbnailUrl = await getVideoThumbnailUrl(v.videoId!, metaToken);
           if (!thumbnailUrl) {
             throw new Error(`動画 ${v.adName} のサムネイルがまだ生成されていません（video_id=${v.videoId}）。少し待って同じ /cr-in を再実行してください`);
           }
-          const crParam = v.sheetId.match(/cr\d+(?:_\d{2})?/i)?.[0] || plan.crKey;
-          const buildParams = (ig?: string) =>
-            buildCreativeParams(source, {
-              adName: v.adName,
-              videoId: v.videoId!,
-              thumbnailUrl,
-              crParam,
-              overrides: plan.overrides,
-              instagramActorId: ig,
+          thumbs.set(v.videoId!, thumbnailUrl);
+        }
+        let igActorId: string | undefined; // 1815199リトライで解決したPBIAを2本目以降にも使い回す
+        for (const t of targets) {
+          // テキスト類は「そのセットの直近cr広告」からコピー（セットごとにspec取得）
+          const source = await getSourceCreativeSpec(t.sourceAdId, metaToken);
+          for (const v of plan.videos) {
+            v.adIdsByAdset = v.adIdsByAdset || {};
+            if (v.adIdsByAdset[t.adsetId]) continue; // 再実行時のスキップ（作成済みペア）
+            const crParam = v.sheetId.match(/cr\d+(?:_\d{2})?/i)?.[0] || plan.crKey;
+            const buildParams = (ig?: string) =>
+              buildCreativeParams(source, {
+                adName: v.adName,
+                videoId: v.videoId!,
+                thumbnailUrl: thumbs.get(v.videoId!)!,
+                crParam,
+                overrides: plan.overrides,
+                instagramActorId: ig,
+              });
+            try {
+              v.creativeId = await createCreative(accountId, metaToken, buildParams(igActorId));
+            } catch (e: any) {
+              // IGアクセス権エラー(1815199) → ページ由来IG(PBIA)のIDを取得して明示指定でリトライ
+              if (!/1815199/.test(String(e.message)) ) throw e;
+              const pageId = source.object_story_spec?.page_id;
+              if (!pageId) throw e;
+              await postProgress(env, plan, `ℹ️ IG権限エラーのため、ページ由来IG（PBIA）を取得して再試行します…（page_id=${pageId}）`);
+              igActorId = await getOrCreatePageBackedIg(String(pageId), metaToken);
+              await postProgress(env, plan, `ℹ️ PBIA取得: ${igActorId}。再試行中…`);
+              v.creativeId = await createCreative(accountId, metaToken, buildParams(igActorId));
+            }
+            const adId = await createAd(accountId, metaToken, {
+              name: v.adName,
+              adsetId: t.adsetId,
+              creativeId: v.creativeId,
             });
-          try {
-            v.creativeId = await createCreative(accountId, metaToken, buildParams(igActorId));
-          } catch (e: any) {
-            // IGアクセス権エラー(1815199) → ページ由来IG(PBIA)のIDを取得して明示指定でリトライ
-            if (!/1815199/.test(String(e.message)) ) throw e;
-            const pageId = source.object_story_spec?.page_id;
-            if (!pageId) throw e;
-            await postProgress(env, plan, `ℹ️ IG権限エラーのため、ページ由来IG（PBIA）を取得して再試行します…（page_id=${pageId}）`);
-            igActorId = await getOrCreatePageBackedIg(String(pageId), metaToken);
-            await postProgress(env, plan, `ℹ️ PBIA取得: ${igActorId}。再試行中…`);
-            v.creativeId = await createCreative(accountId, metaToken, buildParams(igActorId));
+            v.adIdsByAdset[t.adsetId] = adId;
+            if (!v.adId) v.adId = adId;
           }
-          v.adId = await createAd(accountId, metaToken, {
-            name: v.adName,
-            adsetId: plan.adsetId,
-            creativeId: v.creativeId,
-          });
         }
         state.step = "sheet";
         break;
@@ -206,12 +227,18 @@ async function runHop(
         const notionLine = (plan as any)._notionWarn
           ? `:warning: Notion： ${(plan as any)._notionWarn}`
           : ":white_check_mark: Notion： 入稿済み";
+        const multi = plan.targets && plan.targets.length > 1 ? plan.targets : null;
+        const cpLine = multi
+          ? [...new Set(multi.map((t) => t.campaignName).filter(Boolean))].join(" / ")
+          : plan.campaignName;
+        const adsetLine = multi ? multi.map((t) => t.adsetName).join(" / ") : plan.adsetName;
+        const crSuffix = multi ? `（*PAUSED*×${multi.length}セット）` : "（*PAUSED*）";
         const lines = [
           `:mega: 入稿が完了しました: ${plan.parentName}`,
           "",
-          `:white_check_mark: cp　：${plan.campaignName || "(不明)"}`,
-          `:white_check_mark: adset：${plan.adsetName || "(不明)"}`,
-          ...plan.videos.map((v) => `:white_check_mark: cr　：${v.adName}（*PAUSED*）`),
+          `:white_check_mark: cp　：${cpLine || "(不明)"}`,
+          `:white_check_mark: adset：${adsetLine || "(不明)"}${multi ? `（${multi.length}セット同時入稿）` : ""}`,
+          ...plan.videos.map((v) => `:white_check_mark: cr　：${v.adName}${crSuffix}`),
           `:white_check_mark: 集計表： ${sheetNames}`,
           notionLine,
           "",
