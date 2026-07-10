@@ -8,7 +8,7 @@
 // 承認時に再度 resolve してから実行する（Slackのvalue 2000字制限対策＋常に最新状態で実行）。
 
 import { SubmitProject, SubmitEnv } from "./types";
-import { resolveSubmit } from "./resolve";
+import { resolveSubmit, CrPageAmbiguousError } from "./resolve";
 import { startExecution, postProgress } from "./continuation";
 
 interface SlashPayload {
@@ -122,6 +122,36 @@ async function resolveAndAsk(
     }
     await respond(payload.response_url, { blocks, response_type: "in_channel" });
   } catch (e: any) {
+    if (e instanceof CrPageAmbiguousError) {
+      // CRDB候補が複数 → エラーで止めず、ページ選択ボタンを出す（BUG-27）。
+      // 選択後は pageId で再解決するので、以降は通常フローと同じ。
+      const buttons = e.candidates.slice(0, 5).map((c, i) => ({
+        type: "button",
+        text: { type: "plain_text", text: truncate(c.name || "(無題)", 74) },
+        action_id: `crin_pick_${i}`,
+        value: JSON.stringify({ p: c.pageId }),
+      }));
+      const blocks: any[] = [
+        {
+          type: "section",
+          text: { type: "mrkdwn", text: `🔀 Notion CRDBに \`${payload.text.trim()}\` の候補が複数あります。入稿対象を選んでください:` },
+        },
+        { type: "actions", elements: [...buttons, cancelButton()] },
+        {
+          type: "context",
+          elements: [
+            {
+              type: "mrkdwn",
+              text:
+                (e.candidates.length > 5 ? `他 ${e.candidates.length - 5} 件は省略（NotionページURL指定で対応）。` : "") +
+                "不要な重複ページをNotion側で削除/リネームすると、次回からこの選択は不要になります",
+            },
+          ],
+        },
+      ];
+      await respond(payload.response_url, { blocks, response_type: "ephemeral" });
+      return;
+    }
     await respond(payload.response_url, {
       text: `❌ ${e.message}`,
       response_type: "ephemeral",
@@ -158,6 +188,33 @@ export function handleCrInInteraction(
     const v = JSON.parse(action.value) as { a: string; ad: string; s: string };
     ctx.waitUntil(
       confirmAndRun(v, interaction, project, env, ctx, metaTokenFor(project), gasTargetsFor(project))
+    );
+    return new Response("", { status: 200 });
+  }
+
+  if (action.action_id.startsWith("crin_pick_")) {
+    // CRDB候補選択（BUG-27）: 選んだpageIdを引数にして通常の解決フローへ入り直す
+    if (!project) {
+      ctx.waitUntil(respond(responseUrl, { text: "案件が特定できません", replace_original: true }));
+      return new Response("", { status: 200 });
+    }
+    if (project.submitBlocked) {
+      ctx.waitUntil(
+        respond(responseUrl, { text: `⚠️ この案件は cr入稿くん が未対応です: ${project.submitBlocked}`, replace_original: true })
+      );
+      return new Response("", { status: 200 });
+    }
+    const v = JSON.parse(action.value) as { p: string };
+    const payload: SlashPayload = {
+      text: v.p, // pageId（resolveSubmitのURL/ID直指定経路に乗る）
+      channel_id: interaction.channel?.id || interaction.container?.channel_id || "",
+      user_id: interaction.user?.id || "",
+      response_url: responseUrl,
+    };
+    ctx.waitUntil(
+      respond(responseUrl, { text: "🔎 選択したページで入稿プランを組み立て中…", replace_original: true }).then(() =>
+        resolveAndAsk(payload, project, env, metaTokenFor(project))
+      )
     );
     return new Response("", { status: 200 });
   }

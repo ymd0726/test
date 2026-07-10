@@ -10,6 +10,20 @@ import { driveAccessToken, resolveFolderId, listCreativeFiles, DriveFile } from 
 import { fetchCrPage, findCrPageByName, fetchCldbCrFolderId, CrPageInfo } from "./notion";
 import { listAdsetCandidates, findAdsByExactName, AdsetCandidate } from "./meta";
 
+/**
+ * cr名検索でCRDBページ候補が複数残ったときに投げる（BUG-27）。
+ * command.ts がcatchしてSlackにページ選択ボタンを表示する。
+ */
+export class CrPageAmbiguousError extends Error {
+  candidates: { pageId: string; name: string }[];
+  constructor(key: string, candidates: { pageId: string; name: string }[]) {
+    super(
+      `Notion CRDBに「${key}」の候補が複数あります:\n${candidates.map((c) => `・${c.name}`).join("\n")}`
+    );
+    this.candidates = candidates;
+  }
+}
+
 export interface ResolveInput {
   text: string; // /cr-in の引数
   channelId: string;
@@ -78,8 +92,10 @@ export async function resolveSubmit(
         `「${key}」のCRDBページは変則ページ（冒頭替え/パターン替え/Nパターン等）のみでした:\n${exact.map((h) => `・${h.name}`).join("\n")}\n入稿対象のページをNotionページURLで指定してください`
       );
     if (submittable.length > 1)
-      throw new Error(
-        `Notion CRDBに「${key}」の候補が複数あります:\n${submittable.map((h) => `・${h.name}`).join("\n")}\n重複ページを整理するか、NotionページURLで指定してください`
+      // 候補複数はSlack側でページ選択ボタンを出す（BUG-27）。command.tsがこの型をcatchして分岐
+      throw new CrPageAmbiguousError(
+        key,
+        submittable.map((h) => ({ pageId: h.pageId, name: h.name }))
       );
     crPage = submittable[0];
   }
