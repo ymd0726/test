@@ -308,6 +308,13 @@ function submitInsert_(sheet, lay, p, judgeRow) {
   sheet.getRange(1, tpl.start + 1, maxRows, width)
     .copyTo(sheet.getRange(1, insStart + 1, maxRows, width), { contentsOnly: false });
 
+  // 列幅を明示的にコピー（BUG-30）: insertColumnsAfterの新列は挿入位置の列
+  // （unit末尾＝細いスペーサー列のことがある）の幅を引き継ぎ、copyToは列幅を
+  // 複製しないため、テンプレ各列の幅を1列ずつ転写する
+  for (var wcol = 0; wcol < width; wcol++) {
+    sheet.setColumnWidth(insStart + 1 + wcol, sheet.getColumnWidth(tpl.start + 1 + wcol));
+  }
+
   // ID行の先頭列にcr名を書く
   sheet.getRange(lay.idRow, insStart + 1).setValue(p.id);
 
