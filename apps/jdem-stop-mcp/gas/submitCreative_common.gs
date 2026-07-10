@@ -91,8 +91,15 @@ function handleSubmitCreative(req) {
     // 冪等性: 既存IDチェック（大小無視）
     var existing = {};
     lay.idCells.forEach(function (c) { existing[c.id.toLowerCase()] = true; });
-    var dup = [parentId].concat(childIds).filter(function (id) { return existing[id.toLowerCase()]; });
-    if (dup.length) return { ok: false, error: '既に集計表に存在します: ' + dup.join(', ') + '（二重入稿防止のため中断）' };
+    // 子（集計外）の重複は真の二重入稿なので中断。親（集計内）は既存でも
+    // 「別パターンを後から追加」の正常ケースがある（cr83_01の次にcr83_02を入稿等）ため、
+    // 親が既存のときは親ブロックの再挿入だけスキップし、子は挿入する（BUG-32）
+    var dupChildren = childIds.filter(function (id) { return existing[id.toLowerCase()]; });
+    if (dupChildren.length) return { ok: false, error: '既に集計表に存在します: ' + dupChildren.join(', ') + '（二重入稿防止のため中断）' };
+    var parentExists = !!existing[parentId.toLowerCase()];
+    if (parentExists && childIds.length === 0) {
+      return { ok: false, error: '既に集計表に存在します: ' + parentId + '（二重入稿防止のため中断）' };
+    }
 
     if (lay.cr00.left === null) {
       return { ok: false, error: '集計内(親)ゾーンの cr00 テンプレが見つかりません（この案件は要手動確認。Notion「集計表 構造仕様」の既知の罠を参照）' };
@@ -112,7 +119,10 @@ function handleSubmitCreative(req) {
 
     var hasChildren = childIds.length > 0;
     var plan = [];
-    plan.push({ tpl: leftTpl, id: parentId, cls: hasChildren ? '親（子有り）' : '親（子無し）', zone: '集計内' });
+    // 親ブロックは既存なら再挿入しない（別パターン追加時）。新規のときだけ挿入
+    if (!parentExists) {
+      plan.push({ tpl: leftTpl, id: parentId, cls: hasChildren ? '親（子有り）' : '親（子無し）', zone: '集計内' });
+    }
     // 子は「後ろから」入れると _01,_02… が左→右の昇順で並ぶ
     for (var i = childIds.length - 1; i >= 0; i--) {
       plan.push({ tpl: rightTpl, id: childIds[i], cls: '子', zone: '集計外' });
@@ -143,6 +153,23 @@ function handleSubmitCreative(req) {
       inserted.push({ id: r.id, zone: r.zone, startCol: r.startCol, width: r.width });
       if (r.warn) warnings.push(r.warn);
     });
+
+    // 既存の親に子を後から追加した場合、既存親の分類を「親（子有り）」に更新し判定行を子にて判定へ。
+    // 子は集計外(右)に挿入され既存親(集計内・左)の列はズレないので、旧レイアウトの列で更新できる（BUG-32）
+    if (parentExists && hasChildren) {
+      try {
+        var pc = null;
+        lay.idCells.forEach(function (c) { if (c.id.toLowerCase() === parentId.toLowerCase() && pc === null) pc = c.col; });
+        if (pc !== null) {
+          var pTpl = submitUnit_(lay, pc);
+          if (pTpl.memoCol >= 0) {
+            sheet.getRange(SUBMIT_CLASS_ROW, pTpl.memoCol + 1).setValue('親（子有り）');
+            var pjc = sheet.getRange(judge.row, pTpl.memoCol + 1);
+            if (String(pjc.getValue()).indexOf('子にて判定') < 0) pjc.setValue('子にて判定');
+          }
+        }
+      } catch (eu) { warnings.push('既存親の分類更新に失敗: ' + eu.message); }
+    }
 
     PropertiesService.getScriptProperties().setProperty(
       SUBMIT_UNDO_KEY_PREFIX + req.spreadsheetId + ':' + parentId.toLowerCase(),
@@ -319,11 +346,20 @@ function submitInsert_(sheet, lay, p, judgeRow) {
     .copyTo(sheet.getRange(1, insStart + 1, maxRows, width), { contentsOnly: false });
 
   // 列幅を明示的にコピー（BUG-30）: insertColumnsAfterの新列は挿入位置の列
-  // （unit末尾＝細いスペーサー列のことがある）の幅を引き継ぎ、copyToは列幅を
-  // 複製しないため、テンプレ各列の幅を1列ずつ転写する
-  for (var wcol = 0; wcol < width; wcol++) {
-    sheet.setColumnWidth(insStart + 1 + wcol, sheet.getColumnWidth(tpl.start + 1 + wcol));
-  }
+  // （unit末尾＝細いスペーサー列のことがある）の幅を引き継ぎ、copyToは列幅を複製しない。
+  // 1列ずつsetColumnWidthすると巨大シートで遅く「集計表展開中」で停止する(BUG-32)ため、
+  // テンプレ幅をまとめて読み、連続する同一幅はsetColumnWidthsで一括転写して呼び出し回数を減らす。
+  try {
+    var widths = [];
+    for (var wc = 0; wc < width; wc++) widths.push(sheet.getColumnWidth(tpl.start + 1 + wc));
+    var runStart = 0;
+    for (var wi = 1; wi <= width; wi++) {
+      if (wi === width || widths[wi] !== widths[runStart]) {
+        sheet.setColumnWidths(insStart + 1 + runStart, wi - runStart, widths[runStart]);
+        runStart = wi;
+      }
+    }
+  } catch (ew) { warn += '列幅コピー失敗:' + ew.message + ' '; }
 
   // ID行の先頭列にcr名を書く
   sheet.getRange(lay.idRow, insStart + 1).setValue(p.id);
@@ -340,14 +376,16 @@ function submitInsert_(sheet, lay, p, judgeRow) {
     } catch (e) { warn += '分類設定失敗(' + p.id + '):' + e.message + ' '; }
   }
 
-  // 列グループ化を再現（深度1のrun単位）
+  // 列グループ化を再現（深度1のrun単位）し、作成後は折りたたむ（BUG-32: 解放ではなく閉じる）
   try {
     var run = null;
     for (var i = 0; i <= depths.length; i++) {
       var d = i < depths.length ? depths[i] : 0;
       if (d > 0 && run === null) run = i;
       if ((d === 0 || i === depths.length) && run !== null) {
-        sheet.getRange(1, insStart + 1 + run, 1, i - run).shiftColumnGroupDepth(1);
+        var grpRange = sheet.getRange(1, insStart + 1 + run, 1, i - run);
+        grpRange.shiftColumnGroupDepth(1);
+        grpRange.collapseGroups(); // 追加ブロックのグループは閉じた状態にする（山田要望 BUG-32）
         run = null;
       }
     }

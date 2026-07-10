@@ -193,8 +193,11 @@ async function runHop(
 
       case "sheet": {
         await postProgress(env, plan, "📊 集計表にCR00ブロックを展開中…");
+        // 集計内(親)ブロックは常に cr番号のみ（例 cr83）。パターン番号(_01/_02)や説明は付けない（BUG-32）。
+        // パターン番号を持つ動画は集計外(子)ブロックとして展開する。単独入稿でも cr83_01 は
+        // 「親cr83 / 子cr83_01」になる。パターン無し(cr82等)は親ブロックのみ（子なし単独CR）。
         const parentSheetId = sheetParentId(plan);
-        const childIds = plan.hasChildren ? plan.videos.map((v) => v.sheetId) : [];
+        const childIds = plan.videos.map((v) => v.sheetId).filter((sid) => /cr\d+_\d{2}/i.test(sid));
         const results: string[] = [];
         for (const t of gasTargets) {
           const r = await callSheetSubmit(env.SUBMIT_GAS_URL || env.COMMON_GAS_URL, {
@@ -285,9 +288,10 @@ async function chainNext(state: ContinuationState, env: SubmitEnv): Promise<void
 }
 
 function sheetParentId(plan: SubmitPlan): string {
-  // 親の集計表表記: cr79_説明（ファイル名から案件コードを除いたもの。子しか無い場合は子から親名を導出）
-  const i = plan.parentName.search(/cr\d/i);
-  return i >= 0 ? plan.parentName.slice(i) : plan.parentName;
+  // 集計内(親)ブロックの表記は cr番号のみ（例 cr83）。パターン番号(_01/_02)も説明も付けない（BUG-32）。
+  // plan.crKey は resolve.ts で抽出済みの「cr83」なのでそれを使う。
+  const m = plan.crKey.match(/cr\d+/i);
+  return m ? m[0].toLowerCase() : plan.crKey.toLowerCase();
 }
 
 /**
