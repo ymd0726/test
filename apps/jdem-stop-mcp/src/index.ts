@@ -463,12 +463,25 @@ function fmtPublicUndo(out: any, creative: string, memoMode: string, by: string)
 async function notifySlack(env: Env, channelId: string, text: string): Promise<{ ok: boolean; error?: string }> {
   if (!env.SLACK_BOT_TOKEN || !channelId) return { ok: false, error: "no token/channel" };
   try {
-    const res = await fetch("https://slack.com/api/chat.postMessage", {
-      method: "POST",
-      headers: { "Content-Type": "application/json; charset=utf-8", Authorization: `Bearer ${env.SLACK_BOT_TOKEN}` },
-      body: JSON.stringify({ channel: channelId, text }),
-    });
-    const data: any = await res.json();
+    const post = async () => {
+      const res = await fetch("https://slack.com/api/chat.postMessage", {
+        method: "POST",
+        headers: { "Content-Type": "application/json; charset=utf-8", Authorization: `Bearer ${env.SLACK_BOT_TOKEN}` },
+        body: JSON.stringify({ channel: channelId, text }),
+      });
+      return (await res.json()) as any;
+    };
+    let data = await post();
+    if (!data.ok && data.error === "not_in_channel") {
+      // Bot未参加チャンネル（BUG-29: rcl）→ publicなら参加を試みて1回だけ再送
+      const j = await fetch("https://slack.com/api/conversations.join", {
+        method: "POST",
+        headers: { "Content-Type": "application/json; charset=utf-8", Authorization: `Bearer ${env.SLACK_BOT_TOKEN}` },
+        body: JSON.stringify({ channel: channelId }),
+      });
+      const jd: any = await j.json();
+      if (jd.ok) data = await post();
+    }
     return data.ok ? { ok: true } : { ok: false, error: data.error };
   } catch (e) {
     return { ok: false, error: String(e) };

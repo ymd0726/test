@@ -275,12 +275,18 @@ export async function postProgress(
 ): Promise<void> {
   if (env.SLACK_BOT_TOKEN && to.channelId && to.userId) {
     try {
-      const res = await fetch("https://slack.com/api/chat.postEphemeral", {
-        method: "POST",
-        headers: { "content-type": "application/json; charset=utf-8", authorization: `Bearer ${env.SLACK_BOT_TOKEN}` },
-        body: JSON.stringify({ channel: to.channelId, user: to.userId, text }),
-      });
-      const data: any = await res.json();
+      const post = () =>
+        fetch("https://slack.com/api/chat.postEphemeral", {
+          method: "POST",
+          headers: { "content-type": "application/json; charset=utf-8", authorization: `Bearer ${env.SLACK_BOT_TOKEN}` },
+          body: JSON.stringify({ channel: to.channelId, user: to.userId, text }),
+        }).then((r) => r.json() as Promise<any>);
+      let data = await post();
+      if (!data.ok && data.error === "not_in_channel") {
+        // Botが未参加のチャンネル（BUG-29: rclで進捗が全滅した）→ 参加を試みて1回だけ再送。
+        // conversations.joinはpublicチャンネルのみ有効。失敗時はresponse_urlへフォールバック
+        if (await joinChannel(env.SLACK_BOT_TOKEN, to.channelId)) data = await post();
+      }
       if (data.ok) return;
     } catch {
       /* fallthrough */
@@ -297,6 +303,21 @@ export async function postProgress(
   }
 }
 
+/** Botをpublicチャンネルへ参加させる（not_in_channel対策）。成功可否を返す */
+async function joinChannel(botToken: string, channelId: string): Promise<boolean> {
+  try {
+    const res = await fetch("https://slack.com/api/conversations.join", {
+      method: "POST",
+      headers: { "content-type": "application/json; charset=utf-8", authorization: `Bearer ${botToken}` },
+      body: JSON.stringify({ channel: channelId }),
+    });
+    const data: any = await res.json();
+    return !!data.ok;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * チャンネル全員向けの通知（完了サマリー用。停止くんのnotifySlackと同挙動）。
  * 成功したかを返す（失敗時は呼び出し側がephemeralで代替できるように）。
@@ -304,12 +325,17 @@ export async function postProgress(
 async function postPublic(env: { SLACK_BOT_TOKEN?: string }, channelId: string, text: string): Promise<boolean> {
   if (!env.SLACK_BOT_TOKEN || !channelId) return false;
   try {
-    const res = await fetch("https://slack.com/api/chat.postMessage", {
-      method: "POST",
-      headers: { "content-type": "application/json; charset=utf-8", authorization: `Bearer ${env.SLACK_BOT_TOKEN}` },
-      body: JSON.stringify({ channel: channelId, text }),
-    });
-    const data: any = await res.json();
+    const post = () =>
+      fetch("https://slack.com/api/chat.postMessage", {
+        method: "POST",
+        headers: { "content-type": "application/json; charset=utf-8", authorization: `Bearer ${env.SLACK_BOT_TOKEN}` },
+        body: JSON.stringify({ channel: channelId, text }),
+      }).then((r) => r.json() as Promise<any>);
+    let data = await post();
+    if (!data.ok && data.error === "not_in_channel") {
+      // Bot未参加チャンネル → 参加を試みて1回だけ再送（BUG-29）
+      if (await joinChannel(env.SLACK_BOT_TOKEN, channelId)) data = await post();
+    }
     return !!data.ok;
   } catch {
     return false; // 通知失敗は本処理を止めない
