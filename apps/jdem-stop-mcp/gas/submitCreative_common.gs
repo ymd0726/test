@@ -35,7 +35,17 @@ function doPost(e) {
     var params = JSON.parse(e.postData.contents);
     var action = params.action || '';
     if (!params.spreadsheetId) return jsonOut({ ok: false, error: 'spreadsheetId がありません' });
-    if (action === 'submitCreative') return jsonOut(handleSubmitCreative(params));
+    if (action === 'submitCreative') {
+      // 複数の/cr-inがほぼ同時に走ると（例:「すべての入稿プラン」から連続実行）、
+      // 列位置の計算と挿入が交錯してブロックがズレるため、ScriptLockで直列化する
+      var lock = LockService.getScriptLock();
+      lock.waitLock(90 * 1000); // 先行する挿入の完了を最大90秒待つ
+      try {
+        return jsonOut(handleSubmitCreative(params));
+      } finally {
+        lock.releaseLock();
+      }
+    }
     if (action === 'submitUndo') return jsonOut(handleSubmitUndo(params));
     return jsonOut({ ok: false, error: '不明なaction: ' + action });
   } catch (err) {

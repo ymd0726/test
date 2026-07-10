@@ -137,12 +137,23 @@ async function resolveAndAsk(
     if (e instanceof CrPageAmbiguousError) {
       // CRDB候補が複数 → エラーで止めず、ページ選択ボタンを出す（BUG-27）。
       // 選択後は pageId で再解決するので、以降は通常フローと同じ。
-      const buttons = e.candidates.slice(0, 5).map((c, i) => ({
+      const buttons: any[] = e.candidates.slice(0, 5).map((c, i) => ({
         type: "button",
         text: { type: "plain_text", text: truncate(c.name || "(無題)", 74) },
         action_id: `crin_pick_${i}`,
         value: JSON.stringify({ p: c.pageId }),
       }));
+      // 全候補をまとめて入稿したいケース（cr83_01/cr83_02のような兄弟ページ。BUG-31続報）:
+      // 各ページの入稿プランを順に表示する。実行ボタンはプランごとに出るので誤爆しない
+      if (e.candidates.length >= 2) {
+        buttons.push({
+          type: "button",
+          style: "primary",
+          text: { type: "plain_text", text: `📤 すべての入稿プランを表示（${Math.min(e.candidates.length, 5)}件）` },
+          action_id: "crin_pick_all",
+          value: JSON.stringify({ ps: e.candidates.slice(0, 5).map((c) => c.pageId) }),
+        });
+      }
       const blocks: any[] = [
         {
           type: "section",
@@ -156,7 +167,7 @@ async function resolveAndAsk(
               type: "mrkdwn",
               text:
                 (e.candidates.length > 5 ? `他 ${e.candidates.length - 5} 件は省略（NotionページURL指定で対応）。` : "") +
-                "不要な重複ページをNotion側で削除/リネームすると、次回からこの選択は不要になります",
+                "「すべての入稿プランを表示」は候補ごとにプラン確認→実行ボタンを出します。不要な重複ページをNotion側で削除/リネームすると、次回からこの選択は不要になります",
             },
           ],
         },
@@ -200,6 +211,36 @@ export function handleCrInInteraction(
     const v = JSON.parse(action.value) as { a: string; ad?: string; s?: string; all?: number };
     ctx.waitUntil(
       confirmAndRun(v, interaction, project, env, ctx, metaTokenFor(project), gasTargetsFor(project))
+    );
+    return new Response("", { status: 200 });
+  }
+
+  if (action.action_id === "crin_pick_all") {
+    // CRDB候補の全ページ入稿（BUG-31続報）: 各ページの入稿プランを順に組み立てて表示する。
+    // 実行ボタンはプランごとに出るため、ユーザーが1件ずつ確認して実行する
+    if (!project) {
+      ctx.waitUntil(respond(responseUrl, { text: "案件が特定できません", replace_original: true }));
+      return new Response("", { status: 200 });
+    }
+    if (project.submitBlocked) {
+      ctx.waitUntil(
+        respond(responseUrl, { text: `⚠️ この案件は cr入稿くん が未対応です: ${project.submitBlocked}`, replace_original: true })
+      );
+      return new Response("", { status: 200 });
+    }
+    const va = JSON.parse(action.value) as { ps: string[] };
+    const base = {
+      channel_id: interaction.channel?.id || interaction.container?.channel_id || "",
+      user_id: interaction.user?.id || "",
+      response_url: responseUrl,
+    };
+    ctx.waitUntil(
+      (async () => {
+        await respond(responseUrl, { text: `🔎 ${va.ps.length}件の入稿プランを順に組み立て中…`, replace_original: true });
+        for (const p of va.ps) {
+          await resolveAndAsk({ ...base, text: p }, project, env, metaTokenFor(project));
+        }
+      })()
     );
     return new Response("", { status: 200 });
   }
