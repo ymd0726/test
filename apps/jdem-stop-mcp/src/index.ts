@@ -310,6 +310,18 @@ async function metaFindAds(token: string, adAccountId: string, creative: string)
     .filter((a: any) => adNameMatches(a.name, creative))
     .map((a: any) => ({ id: a.id, name: a.name, effective_status: a.effective_status }));
 
+  // ②' CONTAINが0件を返す癖への保険（BUG-28: rclで実在広告 rcl_cr01_01 が0件になった）:
+  //     フィルタ無しで直近500件を取得し、手元の厳密一致だけで拾い直す
+  if (matched.length === 0) {
+    const url2 = `https://graph.facebook.com/${GRAPH}/act_${adAccountId}/ads?fields=id,name,effective_status&limit=500&access_token=${encodeURIComponent(token)}`;
+    const d2 = await fetchJsonTimeout(url2, 12000);
+    if (!d2.error) {
+      matched = (d2.data || [])
+        .filter((a: any) => adNameMatches(a.name, creative))
+        .map((a: any) => ({ id: a.id, name: a.name, effective_status: a.effective_status }));
+    }
+  }
+
   // ③ 一致した広告だけ CP名/AS名 を取得（軽量・表示用）
   if (matched.length) {
     try {

@@ -107,19 +107,30 @@ function resolveSheet(ss, sheetName) {
 // ============================================================
 // 探索（読み取り専用・副作用なし）
 // ============================================================
+// セル値/入力値の正規化: ゼロ幅スペース等の不可視文字を除去し、全角空白→半角化して
+// trim+小文字化する（BUG-28: rclで「セルに存在するのに見つからない」対策。
+// スプレッドシートのセルにはコピペ由来の U+200B 等が混入することがある）
+function normCrName(s) {
+  return String(s)
+    .replace(/[\u200B-\u200D\uFEFF]/g, '') // ゼロ幅スペース/ゼロ幅接合子/BOM を除去
+    .replace(/[\u00A0\u3000]/g, ' ')        // NBSP・全角空白 → 半角空白
+    .trim()
+    .toLowerCase();
+}
+
 // クリエイティブ名の列を探す。ヘッダーブロック(1〜HEADER_ROW行)全体から探すので
 // 行6固定でも、結合セル(値が上の行に入る)でも拾える。見つかった列(1-based)を返す。
 function findNameCol(sheet, creativeName) {
   var lastCol = sheet.getLastColumn();
   if (lastCol < 1) return -1;
-  // クリエイティブ名は基本6行目だが、案件により7・8行目のこともある(ssh等)。
+  // クリエイティブ名は基本6行目だが、案件により5・7・8行目のこともある(rcl=5, ssh=7等)。
   // 1〜8行のヘッダーブロック全体から探す（cr名の完全一致なので誤検出しない）。
   var nameRows = Math.min(8, sheet.getLastRow());
   var block = sheet.getRange(1, 1, nameRows, lastCol).getValues();
-  var target = String(creativeName).trim().toLowerCase();
+  var target = normCrName(creativeName);
   for (var r = 0; r < block.length; r++) {
     for (var c = 0; c < block[r].length; c++) {
-      if (String(block[r][c]).trim().toLowerCase() === target) return c + 1;
+      if (normCrName(block[r][c]) === target) return c + 1;
     }
   }
   return -1;

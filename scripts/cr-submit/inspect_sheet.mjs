@@ -90,6 +90,21 @@ for (const sheet of targets) {
       }
       if (cells.length) console.log(`[行${r + 1}] ${cells.join(" | ")}`);
     }
+    // cr-idセルの不可視文字検査（BUG-28: 「存在するのに見つからない」原因の切り分け用）。
+    // ASCII外・制御・ゼロ幅文字や前後空白を含む cr セルを JSON+コードポイントで晒す
+    console.log(`\n--- cr-idセルの文字検査（非ASCII/不可視文字があれば表示）---`);
+    let suspicious = 0;
+    for (let r = 0; r < rows.length; r++) {
+      for (let c = 0; c < (rows[r] || []).length; c++) {
+        const raw = String(rows[r][c] ?? "");
+        if (!/cr\d/i.test(raw)) continue;
+        if (/^[\x20-\x7E]*$/.test(raw) && raw === raw.trim()) continue; // 純ASCII・前後空白なしはOK
+        const codes = [...raw].map((ch) => "U+" + ch.codePointAt(0).toString(16).toUpperCase().padStart(4, "0")).join(" ");
+        console.log(`${colToA1(c)}${r + 1}: ${JSON.stringify(raw)} [${codes}]`);
+        suspicious++;
+      }
+    }
+    console.log(suspicious === 0 ? "→ 問題のあるcr-idセルなし（全て純ASCII）" : `→ ${suspicious}件の要注意セル`);
   }
 }
 
