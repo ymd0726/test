@@ -235,9 +235,32 @@ export async function createAd(
     name: opts.name,
     adset_id: opts.adsetId,
     creative: JSON.stringify({ creative_id: opts.creativeId }),
-    status: "PAUSED", // 必ず一時停止で作成。ONは人が行う
+    status: "PAUSED", // まずPAUSEDで作成し、activateステップでONにする（一気通貫 BUG-33）
   });
   return res.id;
+}
+
+/** 広告/広告セット/キャンペーンの status を変更（ACTIVE/PAUSED）。全レベル共通 */
+export async function setEntityStatus(entityId: string, token: string, status: "ACTIVE" | "PAUSED"): Promise<void> {
+  await graphPost(`${entityId}`, token, { status });
+}
+
+/** 広告セットと親キャンペーンの configured status（ON/OFF判定用）を取得 */
+export async function getAdsetParentStatus(
+  adsetId: string,
+  token: string
+): Promise<{ adsetName: string; adsetStatus: string; campaignId?: string; campaignName?: string; campaignStatus?: string }> {
+  const r = await graphGet(
+    `${adsetId}?fields=${encodeURIComponent("name,status,campaign{id,name,status}")}`,
+    token
+  );
+  return {
+    adsetName: r.name,
+    adsetStatus: r.status,
+    campaignId: r.campaign?.id,
+    campaignName: r.campaign?.name,
+    campaignStatus: r.campaign?.status,
+  };
 }
 
 // ---------- 解決フェーズ用の読み取り ----------

@@ -10,6 +10,7 @@
 import { SubmitProject, SubmitEnv } from "./types";
 import { resolveSubmit, CrPageAmbiguousError } from "./resolve";
 import { startExecution, postProgress } from "./continuation";
+import { setEntityStatus } from "./meta";
 
 interface SlashPayload {
   text: string;
@@ -215,6 +216,17 @@ export function handleCrInInteraction(
     return new Response("", { status: 200 });
   }
 
+  if (action.action_id === "crin_actparent") {
+    // 停止中の広告セット/キャンペーンをON（BUG-33）。確認ダイアログ通過後にここへ来る
+    if (!project) {
+      ctx.waitUntil(respond(responseUrl, { text: "案件が特定できません", replace_original: true }));
+      return new Response("", { status: 200 });
+    }
+    const va = JSON.parse(action.value) as { p: { a: string; c: string }[] };
+    ctx.waitUntil(activateParents(va.p, project, env, metaTokenFor(project), responseUrl));
+    return new Response("", { status: 200 });
+  }
+
   if (action.action_id === "crin_pick_all") {
     // CRDB候補の全ページ入稿（BUG-31続報）: 各ページの入稿プランを順に組み立てて表示する。
     // 実行ボタンはプランごとに出るため、ユーザーが1件ずつ確認して実行する
@@ -341,6 +353,39 @@ async function confirmAndRun(
       },
       `❌ 実行開始に失敗しました: ${e.message}`
     );
+  }
+}
+
+/**
+ * 停止中の広告セット/キャンペーンをONにする（BUG-33）。キャンペーン→広告セットの順（上位から）。
+ * 同じIDは1回だけ。結果をresponse_urlで返す。
+ */
+async function activateParents(
+  pairs: { a: string; c: string }[],
+  project: SubmitProject,
+  env: SubmitEnv,
+  metaToken: string,
+  responseUrl: string
+): Promise<void> {
+  try {
+    const campaigns = [...new Set(pairs.map((p) => p.c).filter(Boolean))];
+    const adsets = [...new Set(pairs.map((p) => p.a).filter(Boolean))];
+    const done: string[] = [];
+    const failed: string[] = [];
+    for (const c of campaigns) {
+      try { await setEntityStatus(c, metaToken, "ACTIVE"); done.push(`cp:${c}`); }
+      catch (e: any) { failed.push(`cp:${c}(${e.message})`); }
+    }
+    for (const a of adsets) {
+      try { await setEntityStatus(a, metaToken, "ACTIVE"); done.push(`adset:${a}`); }
+      catch (e: any) { failed.push(`adset:${a}(${e.message})`); }
+    }
+    const parts: string[] = [];
+    if (done.length) parts.push(`✅ ONにしました: ${done.join(" / ")}`);
+    if (failed.length) parts.push(`❌ 失敗: ${failed.join(" / ")}`);
+    await respond(responseUrl, { text: parts.join("\n") || "対象がありませんでした", replace_original: true });
+  } catch (e: any) {
+    await respond(responseUrl, { text: `❌ 上位のON化に失敗しました: ${e.message}`, replace_original: true });
   }
 }
 

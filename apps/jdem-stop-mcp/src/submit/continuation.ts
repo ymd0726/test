@@ -27,6 +27,8 @@ import {
   buildCreativeParams,
   createCreative,
   createAd,
+  setEntityStatus,
+  getAdsetParentStatus,
 } from "./meta";
 import { callSheetSubmit } from "./gasClient";
 import { markSubmitted } from "./notion";
@@ -187,6 +189,52 @@ async function runHop(
             if (!v.adId) v.adId = adId;
           }
         }
+        state.step = "activate";
+        break;
+      }
+
+      case "activate": {
+        // 一気通貫: 作成した広告を全てONにする（BUG-33）。広告セット/キャンペーンは勝手にONにしない。
+        const adIds: string[] = [];
+        for (const v of plan.videos) {
+          for (const k of Object.keys(v.adIdsByAdset || {})) adIds.push(v.adIdsByAdset![k]);
+        }
+        await postProgress(env, plan, `▶️ 作成した広告 ${adIds.length}件をONにしています…`);
+        for (const id of adIds) {
+          try {
+            await setEntityStatus(id, metaToken, "ACTIVE");
+          } catch (e: any) {
+            (plan as any)._activateWarn = ((plan as any)._activateWarn || "") + `広告${id}のON化失敗: ${e.message}; `;
+          }
+        }
+        // 入稿先の広告セット/キャンペーンがOFFなら、完了時に「ONにするか」確認ボタンを出す
+        const targets = plan.targets?.length
+          ? plan.targets
+          : [{ adsetId: plan.adsetId, adsetName: plan.adsetName, campaignName: plan.campaignName, sourceAdId: plan.sourceAdId, sourceAdName: plan.sourceAdName }];
+        const seenAdsets = new Set<string>();
+        const offParents: any[] = [];
+        for (const t of targets) {
+          if (seenAdsets.has(t.adsetId)) continue;
+          seenAdsets.add(t.adsetId);
+          try {
+            const st = await getAdsetParentStatus(t.adsetId, metaToken);
+            const adsetOff = st.adsetStatus !== "ACTIVE";
+            const campOff = !!st.campaignStatus && st.campaignStatus !== "ACTIVE";
+            if (adsetOff || campOff) {
+              offParents.push({
+                adsetId: t.adsetId,
+                adsetName: st.adsetName || t.adsetName,
+                adsetOff,
+                campaignId: st.campaignId,
+                campaignName: st.campaignName || t.campaignName,
+                campOff,
+              });
+            }
+          } catch {
+            /* 状態取得失敗は致命ではない。確認ボタンを出さず完了する */
+          }
+        }
+        (plan as any)._offParents = offParents;
         state.step = "sheet";
         break;
       }
@@ -235,7 +283,12 @@ async function runHop(
           ? [...new Set(multi.map((t) => t.campaignName).filter(Boolean))].join(" / ")
           : plan.campaignName;
         const adsetLine = multi ? multi.map((t) => t.adsetName).join(" / ") : plan.adsetName;
-        const crSuffix = multi ? `（*PAUSED*×${multi.length}セット）` : "（*PAUSED*）";
+        const activateWarn: string = (plan as any)._activateWarn || "";
+        const offParents: any[] = (plan as any)._offParents || [];
+        // 一気通貫ON（BUG-33）: 広告はON化済み。ON化に失敗した広告があれば警告表示
+        const crSuffix = activateWarn
+          ? multi ? `（一部ON化失敗×${multi.length}セット）` : "（一部ON化失敗）"
+          : multi ? `（*ON*×${multi.length}セット）` : "（*ON*）";
         const lines = [
           `:mega: 入稿が完了しました: ${plan.parentName}`,
           "",
@@ -244,13 +297,28 @@ async function runHop(
           ...plan.videos.map((v) => `:white_check_mark: cr　：${v.adName}${crSuffix}`),
           `:white_check_mark: 集計表： ${sheetNames}`,
           notionLine,
-          "",
-          ":point_right: 最終確認のうえ、広告マネージャで広告をONにしてください。",
         ];
-        // 完了通知はチャンネル向け1通のみ（BUG-24: ephemeralとの2重投稿をやめる。
-        // ephemeralは進捗・エラー用）。public投稿に失敗した場合だけephemeralで代替する。
+        if (activateWarn) lines.push(`:warning: ${activateWarn}`);
+        if (offParents.length === 0) {
+          lines.push("", ":rocket: 広告はONにしました。配信が開始されます（最終確認をお願いします）。");
+        } else {
+          // 広告セット/キャンペーンがOFF → 勝手にONにしない。確認ボタンで許可を取る（BUG-33）
+          const names = offParents
+            .map((p) => `・${p.campOff ? `cp「${p.campaignName || p.campaignId}」` : ""}${p.adsetOff ? `${p.campOff ? " / " : ""}adset「${p.adsetName}」` : ""}（OFF）`)
+            .join("\n");
+          lines.push(
+            "",
+            ":warning: 広告はONにしましたが、上位が停止中のため *このままでは配信されません* :",
+            names
+          );
+        }
+        // 完了通知はチャンネル向け1通のみ（BUG-24）。public投稿に失敗した場合だけephemeralで代替する。
         const posted = await postPublic(env, plan.channelId, lines.join("\n"));
         if (!posted) await postProgress(env, plan, lines.join("\n"));
+        // OFF親があれば、操作者にだけ「ONにするか」の確認ボタンを出す（勝手にONにしない）
+        if (offParents.length > 0) {
+          await postParentActivatePrompt(env, plan, offParents);
+        }
         return; // 連鎖終了
       }
     }
@@ -265,6 +333,63 @@ async function runHop(
           .map((v) => `${v.adName}(video:${v.videoId}${v.adId ? `, ad:${v.adId}` : ""})`)
           .join(", ") || "なし"}\n再実行する場合は同じ \`/cr-in\` を実行してください（作成済みはスキップされます）。`
     );
+  }
+}
+
+/**
+ * 広告セット/キャンペーンがOFFのとき、操作者にだけ「ONにするか」の確認ボタンを出す（BUG-33）。
+ * 勝手にはONにしない。ボタン押下（+確認ダイアログ）で crin_actparent アクションが発火する。
+ */
+async function postParentActivatePrompt(
+  env: SubmitEnv,
+  plan: SubmitPlan,
+  offParents: any[]
+): Promise<void> {
+  if (!env.SLACK_BOT_TOKEN || !plan.channelId || !plan.userId) return;
+  // ボタンvalueはSlackの2000字制限に収めるため最小限（adsetId/campaignIdのみ）
+  const payload = offParents.map((p) => ({
+    a: p.adsetOff ? p.adsetId : "",
+    c: p.campOff ? p.campaignId : "",
+  }));
+  const summary = offParents
+    .map((p) => `${p.campOff ? `cp「${p.campaignName || p.campaignId}」` : ""}${p.adsetOff ? `${p.campOff ? "／" : ""}adset「${p.adsetName}」` : ""}`)
+    .join("、");
+  const blocks = [
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `⚠️ 停止中の上位（${summary}）をONにしますか？\nONにすると配信が開始され予算が動きます。広告セット/キャンペーンは自動ではONにしていません。`,
+      },
+    },
+    {
+      type: "actions",
+      elements: [
+        {
+          type: "button",
+          style: "primary",
+          text: { type: "plain_text", text: "▶️ 上位もONにする" },
+          action_id: "crin_actparent",
+          value: JSON.stringify({ p: payload }),
+          confirm: {
+            title: { type: "plain_text", text: "上位のON化" },
+            text: { type: "mrkdwn", text: `${summary} をONにします。配信が開始され予算が動きます。よろしいですか？` },
+            confirm: { type: "plain_text", text: "ONにする" },
+            deny: { type: "plain_text", text: "やめる" },
+          },
+        },
+        { type: "button", text: { type: "plain_text", text: "そのまま（OFFのまま）" }, action_id: "crin_cancel", value: "cancel" },
+      ],
+    },
+  ];
+  try {
+    await fetch("https://slack.com/api/chat.postEphemeral", {
+      method: "POST",
+      headers: { "content-type": "application/json; charset=utf-8", authorization: `Bearer ${env.SLACK_BOT_TOKEN}` },
+      body: JSON.stringify({ channel: plan.channelId, user: plan.userId, blocks, text: "停止中の上位をONにしますか？" }),
+    });
+  } catch {
+    /* 確認ボタンの投稿失敗は致命ではない */
   }
 }
 
