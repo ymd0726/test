@@ -47,6 +47,7 @@ function doPost(e) {
       }
     }
     if (action === 'submitUndo') return jsonOut(handleSubmitUndo(params));
+    if (action === 'insertCrThumbnail') return jsonOut(handleInsertCrThumbnail(params));
     return jsonOut({ ok: false, error: '不明なaction: ' + action });
   } catch (err) {
     return jsonOut({ ok: false, error: 'エラー: ' + err });
@@ -176,6 +177,51 @@ function handleSubmitCreative(req) {
       JSON.stringify({ sheetName: sheet.getName(), inserted: inserted, at: new Date().toISOString() })
     );
     return { ok: true, sheetName: sheet.getName(), inserted: inserted, warnings: warnings };
+  } catch (e) {
+    return { ok: false, error: String(e && e.message ? e.message : e) };
+  }
+}
+
+// ------------------------------------------------------------
+// crの冒頭サムネ（0:01フレーム）を該当ブロックのセルに「セル内画像」で挿入する（BUG-34）。
+// 画像URLは外部（GitHub Actions + ffmpeg）で生成した公開URLを渡す。
+// 挿入先は「cr名(ID)セルの右にある結合セル（サムネ表示用に拡大結合されている）」。
+// 案件により列位置が異なるため、ブロック内のcr名より右で最大面積の結合セルを自動選択する。
+// req: { spreadsheetId, sheetName?, id, imageUrl }
+// ------------------------------------------------------------
+function handleInsertCrThumbnail(req) {
+  try {
+    var id = String(req.id || '').trim();
+    if (!id) return { ok: false, error: 'id が必要です' };
+    if (!req.imageUrl) return { ok: false, error: 'imageUrl が必要です' };
+    var ss = SpreadsheetApp.openById(req.spreadsheetId);
+    var sheet = submitResolveSheet_(ss, req.sheetName);
+    var lay = submitLayout_(sheet);
+    var idCol = -1;
+    lay.idCells.forEach(function (c) { if (c.id.toLowerCase() === id.toLowerCase() && idCol < 0) idCol = c.col; });
+    if (idCol < 0) return { ok: false, error: '集計表に「' + id + '」が見つかりません' };
+
+    var unit = submitUnit_(lay, idCol); // このブロックの列範囲
+    var blockRange = sheet.getRange(1, unit.start + 1, sheet.getMaxRows(), unit.width);
+    var merges = blockRange.getMergedRanges();
+    // cr名より右で最大面積の結合セル＝サムネ表示セルとみなす
+    var best = null, bestArea = 0;
+    merges.forEach(function (m) {
+      var col0 = m.getColumn() - 1;
+      if (col0 <= idCol) return;
+      var area = m.getNumRows() * m.getNumColumns();
+      if (area > bestArea) { bestArea = area; best = m; }
+    });
+    var target = best
+      ? sheet.getRange(best.getRow(), best.getColumn())
+      : sheet.getRange(lay.idRow, Math.min(idCol + 1 + 10, sheet.getMaxColumns())); // 結合セルが無ければ10列右にフォールバック
+
+    var img = SpreadsheetApp.newCellImage()
+      .setSourceUrl(String(req.imageUrl))
+      .setAltTextTitle(id + ' 冒頭サムネ(0:01)')
+      .build();
+    target.setValue(img);
+    return { ok: true, id: id, cell: submitColA1_(target.getColumn() - 1) + target.getRow(), merged: !!best };
   } catch (e) {
     return { ok: false, error: String(e && e.message ? e.message : e) };
   }
