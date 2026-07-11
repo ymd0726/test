@@ -38,7 +38,7 @@
   "vars": {
     // チェック結果サマリの投稿先（管理チャンネルのSlackチャンネルID）。
     // 未設定の間はチェック・BUG起票は動くがSlack投稿だけされない。/check/run の ?channel= で上書き可。
-    "CHECK_SLACK_CHANNEL_ID": ""
+    "CHECK_SLACK_CHANNEL_ID": "C08HUUKSMQF"
   },
 
   // GAS_WEBAPP_URL と SHARED_SECRET は wrangler secret で設定する（README参照）。
