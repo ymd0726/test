@@ -28,6 +28,19 @@
     { "binding": "SELF_WORKER", "service": "jdem-stop-mcp" }
   ],
 
+  // 翌日自動チェックくん（TOOL-40）: 毎朝 7:30 JST（= 22:30 UTC）に前日分の
+  // cr入稿くん/cr停止くん実行を Meta/集計表/Notion と照合する。
+  // 手動テスト: GET /check/run?token=<SHARED_SECRET>&dryRun=1
+  "triggers": {
+    "crons": ["30 22 * * *"]
+  },
+
+  "vars": {
+    // チェック結果サマリの投稿先（管理チャンネルのSlackチャンネルID）。
+    // 未設定の間はチェック・BUG起票は動くがSlack投稿だけされない。/check/run の ?channel= で上書き可。
+    "CHECK_SLACK_CHANNEL_ID": ""
+  },
+
   // GAS_WEBAPP_URL と SHARED_SECRET は wrangler secret で設定する（README参照）。
   // ここには秘密情報を書かない。
   "observability": {

@@ -28,6 +28,11 @@ import { handleCrInCommand, handleCrInInteraction } from "./submit/command";
 import { handleContinue, CONTINUE_PATH } from "./submit/continuation";
 import type { SubmitEnv, SubmitProject } from "./submit/types";
 
+// ── 翌日自動チェックくん（TOOL-40）──
+import { startDailyCheck, handleCheckContinue, handleCheckRun, CHECK_CONTINUE_PATH } from "./check";
+import { createRunLog, updateRunLog } from "./check/runlog";
+import type { CheckDeps, CheckEnv } from "./check/types";
+
 const GRAPH = "v21.0"; // Meta Graph API バージョン（古くなったらここを上げる）
 
 interface Env {
@@ -365,7 +370,7 @@ const resumeAds = (token: string, ids: string[]) => setAdsStatus(token, ids, "AC
 // ============================================================
 interface StopResult {
   alreadyStopped?: boolean;
-  meta?: { configured: boolean; found: number; paused?: number; adNames?: string[] };
+  meta?: { configured: boolean; found: number; paused?: number; adNames?: string[]; adIds?: string[] };
   sheet?: any;
 }
 
@@ -387,7 +392,7 @@ async function doStop(env: Env, p: Project, creative: string, date: string): Pro
         return out;
       }
       for (const a of active) await metaSetStatus(token, a.id, "PAUSED");
-      out.meta = { configured: true, found: ads.length, paused: active.length, adNames: active.map((a) => a.name) };
+      out.meta = { configured: true, found: ads.length, paused: active.length, adNames: active.map((a) => a.name), adIds: active.map((a) => a.id) };
     }
   } else {
     out.meta = { configured: false, found: 0 };
@@ -414,7 +419,7 @@ async function doUndo(env: Env, p: Project, creative: string, memoMode: "full" |
     const ads = await metaFindAds(token, p.metaAdAccountId, creative);
     const paused = ads.filter((a) => a.effective_status === "PAUSED");
     for (const a of paused) await metaSetStatus(token, a.id, "ACTIVE");
-    out.meta = { resumed: paused.length, adNames: paused.map((a) => a.name) };
+    out.meta = { resumed: paused.length, adNames: paused.map((a) => a.name), adIds: paused.map((a) => a.id) };
   }
   return out;
 }
@@ -523,6 +528,37 @@ function sheetResultLabel(sheet: any): "成功" | "失敗" | "対象なし" {
   if (sheet?.success) return "成功";
   if (/該当cr/.test(String(sheet?.message || ""))) return "対象なし";
   return "失敗";
+}
+
+// ── 統一「ツール実行ログDB」への結果マッピング（TOOL-40 翌日自動チェックくん）──
+// 旧ログ(logToNotion=停止カウンター)は当面併記し、新DBには翌朝チェックに必要な
+// ad id・タブ名まで記録する。ログ失敗は本処理を止めない（createRunLogがnullを返すだけ）。
+function stopRunPatch(out: StopResult) {
+  const metaResult = !out.meta?.configured
+    ? "未実行"
+    : out.alreadyStopped || out.meta.found === 0
+      ? "対象なし"
+      : (out.meta.paused || 0) > 0
+        ? "成功"
+        : "失敗";
+  const sheetResult = out.alreadyStopped ? "未実行" : sheetResultLabel(out.sheet);
+  const ok = metaResult !== "失敗" && sheetResult !== "失敗";
+  return {
+    status: ok ? "完了" : "一部失敗",
+    metaResult,
+    sheetResult,
+    adIds: out.meta?.adIds || [],
+    sheetTabs: out.sheet?.sheet ? [String(out.sheet.sheet)] : [],
+  };
+}
+function undoRunPatch(out: any) {
+  const sheetResult = sheetResultLabel(out.sheet);
+  return {
+    status: sheetResult !== "失敗" ? "完了" : "一部失敗",
+    metaResult: out.meta ? "成功" : "未実行",
+    sheetResult,
+    adIds: out.meta?.adIds || [],
+  };
 }
 
 // ============================================================
@@ -737,9 +773,11 @@ export class CreativeStopMCP extends McpAgent<Env> {
         if (targets.length === 0) return asText({ success: false, message: `該当案件なし: ${creativeName}` });
         if (targets.length > 1) return asText({ success: false, message: `複数案件に存在(${targets.map((t) => t.name).join(",")})。projectを指定してください` });
         const p = targets[0];
+        const runLogId = await createRunLog(env.NOTION_TOKEN, { tool: "cr停止くん", action: "停止", project: p.name, crName: creativeName, userName: "claude.ai", userId: "", route: "Claude" });
         const out = await doStop(env, p, creativeName, date);
         if (!out.alreadyStopped && out.sheet?.success) await notifySlack(env, p.channelId, fmtPublicStop(out, creativeName, date, "via Claude"));
         await logToNotion(env, { creative: creativeName, user: "claude.ai", userId: "", action: "停止", project: p.name, route: "Claude", metaCount: out.meta?.paused || 0, sheetResult: out.alreadyStopped ? "対象なし" : sheetResultLabel(out.sheet) });
+        await updateRunLog(env.NOTION_TOKEN, runLogId, stopRunPatch(out));
         return asText({ project: p.name, message: fmtStop(out, creativeName, date), ...out });
       },
     );
@@ -757,9 +795,11 @@ export class CreativeStopMCP extends McpAgent<Env> {
         if (targets.length === 0) return asText({ success: false, message: `該当案件なし: ${creativeName}` });
         if (targets.length > 1) return asText({ success: false, message: `複数案件に存在(${targets.map((t) => t.name).join(",")})。projectを指定してください` });
         const p = targets[0];
+        const runLogId = await createRunLog(env.NOTION_TOKEN, { tool: "cr停止くん", action: "取消", project: p.name, crName: creativeName, userName: "claude.ai", userId: "", route: "Claude" });
         const out = await doUndo(env, p, creativeName, memoMode);
         if (out.sheet?.success) await notifySlack(env, p.channelId, fmtPublicUndo(out, creativeName, memoMode, "via Claude"));
         await logToNotion(env, { creative: creativeName, user: "claude.ai", userId: "", action: "取消", project: p.name, route: "Claude", metaCount: out.meta?.resumed || 0, sheetResult: sheetResultLabel(out.sheet) });
+        await updateRunLog(env.NOTION_TOKEN, runLogId, undoRunPatch(out));
         return asText({ project: p.name, message: fmtUndo(out, creativeName, memoMode), ...out });
       },
     );
@@ -1053,6 +1093,9 @@ function handleSlackInteract(env: Env, ctx: ExecutionContext, bodyText: string, 
       try {
         await postResponse(responseUrl, { replace_original: true, text: `⏳ *${v.c}* を${v.a === "undo" ? "取消" : "停止"}実行中…` });
         const inviteNote = (err?: string) => `\n⚠️ チャンネルへの全員通知に失敗（${err}）。このチャンネルで \`/invite @cr停止\` を実行してください。`;
+        // 実行ログDB（TOOL-40）: 開始時に「実行中」で作成。途中死してもチェッカーが検出できる
+        const runLogId = await createRunLog(env.NOTION_TOKEN, { tool: "cr停止くん", action: v.a === "undo" ? "取消" : "停止", project: project.name, crName: v.c, userName, userId, route: "Slack" });
+        const runLogWarn = !runLogId && env.NOTION_TOKEN ? "\n⚠️ 実行ログの記録に失敗（翌日自動チェックの対象外になります）" : "";
         // Meta失敗は集計表を止めない（権限不足等でも集計表記録は実行し、Metaエラーは併記）
         let metaErr = "";
         const target = await pickSheet(project, v.c); // 複数集計対象の案件は cr名で対象タブを判定
@@ -1061,25 +1104,39 @@ function handleSlackInteract(env: Env, ctx: ExecutionContext, bodyText: string, 
           if (metaOn && ids.length) { try { paused = await pauseAds(token!, ids); if (paused < ids.length) metaErr = `${ids.length - paused}件の停止に失敗`; } catch (e) { metaErr = String(e); } }
           const sheet = target ? await callGas(target, { action: "stop", creativeName: v.c, stopDate: v.d }) : { success: false, message: "集計表に該当crなし(複数対象)" };
           const extra = (metaErr ? `\n⚠️ Meta停止に失敗（${metaErr}）。Metaトークン/権限を確認してください。` : "");
-          let note = extra;
+          let note = extra + runLogWarn;
           if (paused || sheet?.success) {
             const r = await notifySlack(env, project.channelId, stopLines(v.c, v.d, paused, sheet, metaOn, `by <@${userId}>`) + extra);
             if (!r.ok) note += inviteNote(r.error);
           }
           await postResponse(responseUrl, { replace_original: true, text: stopLines(v.c, v.d, paused, sheet, metaOn, "") + note });
           await logToNotion(env, { creative: v.c, user: userName, userId, action: "停止", project: project.name, route: "Slack", metaCount: paused, sheetResult: sheetResultLabel(sheet) });
+          await updateRunLog(env.NOTION_TOKEN, runLogId, {
+            status: !metaErr && sheetResultLabel(sheet) !== "失敗" ? "完了" : "一部失敗",
+            metaResult: !metaOn ? "未実行" : ids.length === 0 ? "対象なし" : metaErr ? "失敗" : "成功",
+            sheetResult: sheetResultLabel(sheet),
+            adIds: ids,
+            sheetTabs: sheet?.sheet ? [String(sheet.sheet)] : target?.sheetName ? [target.sheetName] : [],
+          });
         } else {
           let resumed = 0;
           if (metaOn && ids.length) { try { resumed = await resumeAds(token!, ids); if (resumed < ids.length) metaErr = `${ids.length - resumed}件の再開に失敗`; } catch (e) { metaErr = String(e); } }
           const sheet = target ? await callGas(target, { action: "undo", creativeName: v.c, memoMode: v.m || "tag" }) : { success: false, message: "集計表に該当crなし(複数対象)" };
           const extra = (metaErr ? `\n⚠️ Meta再開に失敗（${metaErr}）。Metaトークン/権限を確認してください。` : "");
-          let note = extra;
+          let note = extra + runLogWarn;
           if (resumed || sheet?.success) {
             const r = await notifySlack(env, project.channelId, undoLines(v.c, v.m || "tag", resumed, sheet, metaOn, `by <@${userId}>`) + extra);
             if (!r.ok) note += inviteNote(r.error);
           }
           await postResponse(responseUrl, { replace_original: true, text: undoLines(v.c, v.m || "tag", resumed, sheet, metaOn, "") + note });
           await logToNotion(env, { creative: v.c, user: userName, userId, action: "取消", project: project.name, route: "Slack", metaCount: resumed, sheetResult: sheetResultLabel(sheet) });
+          await updateRunLog(env.NOTION_TOKEN, runLogId, {
+            status: !metaErr && sheetResultLabel(sheet) !== "失敗" ? "完了" : "一部失敗",
+            metaResult: !metaOn ? "未実行" : ids.length === 0 ? "対象なし" : metaErr ? "失敗" : "成功",
+            sheetResult: sheetResultLabel(sheet),
+            adIds: ids,
+            sheetTabs: target?.sheetName ? [target.sheetName] : [],
+          });
         }
       } catch (e) {
         await postResponse(responseUrl, { replace_original: true, text: `❌ エラー: ${e}` });
@@ -1124,6 +1181,15 @@ export default {
       return handleBudget(env, ctx, url);
     }
 
+    // --- 翌日自動チェックくん（TOOL-40）---
+    if (url.pathname === CHECK_CONTINUE_PATH && request.method === "POST") {
+      return handleCheckContinue(request, env as unknown as CheckEnv, ctx, checkDeps(env));
+    }
+    if (url.pathname === "/check/run") {
+      // 手動起動（cronを待たずにテスト）: ?token=<SHARED_SECRET>&dryRun=1&date=YYYY-MM-DD&channel=CXXXX&force=1
+      return handleCheckRun(url, env as unknown as CheckEnv, ctx, checkDeps(env));
+    }
+
     // --- MCP（共有シークレットをフルパスで保持）---
     const base = `/${env.SHARED_SECRET}`;
     if (url.pathname === `${base}/sse` || url.pathname === `${base}/sse/message`) {
@@ -1135,4 +1201,19 @@ export default {
 
     return new Response("Not found", { status: 404 });
   },
+
+  // 毎朝 7:30 JST（= 22:30 UTC。wrangler.jsonc triggers.crons）に前日分をチェック
+  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(
+      startDailyCheck(env as unknown as CheckEnv, checkDeps(env)).catch((e) => console.log(`daily check failed: ${e}`))
+    );
+  },
 };
+
+// チェックモジュールへ注入する依存（PROJECTSレジストリ・トークン解決。循環import回避のためここで束ねる）
+function checkDeps(env: Env): CheckDeps {
+  return {
+    projects: PROJECTS,
+    metaTokenFor: (p) => metaToken(env, p as Project),
+  };
+}

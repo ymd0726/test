@@ -307,6 +307,7 @@ async function confirmAndRun(
       responseUrl,
     });
     const plan = outcome.plan!;
+    plan.userName = interaction.user?.username || interaction.user?.name || ""; // 実行ログDB用（TOOL-40）
     const cands = (outcome.adsetCandidates || []).filter((c) => c.latestAd);
     if (v.all) {
       // 「すべてに入稿」（BUG-31）: 表示された全候補セットをターゲットにする。

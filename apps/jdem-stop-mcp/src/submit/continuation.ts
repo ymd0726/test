@@ -32,6 +32,7 @@ import {
 } from "./meta";
 import { callSheetSubmit } from "./gasClient";
 import { markSubmitted } from "./notion";
+import { createRunLog, updateRunLog } from "../check/runlog";
 
 export const CONTINUE_PATH = "/internal/cr-in/continue";
 
@@ -45,7 +46,27 @@ export async function startExecution(
   gasTargets: { spreadsheetId: string; sheetName?: string }[]
 ): Promise<void> {
   const state: ContinuationState = { step: "upload", index: 0, attempts: 0, plan, startedAt: Date.now() };
-  await postProgress(env, plan, `🚀 入稿を開始します: *${plan.parentName}*（動画 ${plan.videos.length} 本）`);
+  // 実行ログDB（TOOL-40）: 開始時に「実行中」で作成。翌朝チェックの照合キー（親cr/子cr/入稿先）も先に記録する
+  const runDetail = {
+    parentSheetId: sheetParentId(plan),
+    childSheetIds: plan.videos.map((v) => v.sheetId).filter((sid) => /cr\d+_\d{2}/i.test(sid)),
+  };
+  (plan as any)._runDetail = runDetail;
+  plan.runLogPageId = await createRunLog(env.NOTION_TOKEN, {
+    tool: "cr入稿くん",
+    action: "入稿",
+    project: plan.project,
+    crName: plan.parentName,
+    userName: plan.userName,
+    userId: plan.userId,
+    route: "Slack",
+    adsetIds: plan.targets?.length ? plan.targets.map((t) => t.adsetId) : [plan.adsetId],
+    sheetTabs: gasTargets.map((t) => t.sheetName || "").filter(Boolean),
+    notionCrPageId: plan.notionPageId,
+    detail: runDetail,
+  });
+  const logWarn = !plan.runLogPageId && env.NOTION_TOKEN ? "\n⚠️ 実行ログの記録に失敗（翌日自動チェックの対象外になります）" : "";
+  await postProgress(env, plan, `🚀 入稿を開始します: *${plan.parentName}*（動画 ${plan.videos.length} 本）${logWarn}`);
   ctx.waitUntil(runHop(state, env, metaToken, projectAccountId, gasTargets));
 }
 
@@ -235,6 +256,11 @@ async function runHop(
           }
         }
         (plan as any)._offParents = offParents;
+        // 実行ログ: Meta段階の結果（作成した全広告ID・ON化警告）を記録
+        await updateRunLog(env.NOTION_TOKEN, plan.runLogPageId, {
+          metaResult: (plan as any)._activateWarn ? "失敗" : "成功",
+          adIds,
+        });
         state.step = "sheet";
         break;
       }
@@ -259,6 +285,11 @@ async function runHop(
           results.push(r.ok ? `${t.sheetName || t.spreadsheetId}` : `${t.sheetName || t.spreadsheetId} ❌ ${r.error}`);
         }
         (plan as any)._sheetResults = results;
+        // 実行ログ: 集計表段階の結果
+        await updateRunLog(env.NOTION_TOKEN, plan.runLogPageId, {
+          sheetResult: results.some((r) => r.includes("❌")) ? "失敗" : "成功",
+          sheetTabs: gasTargets.map((t) => t.sheetName || "").filter(Boolean),
+        });
         state.step = "notion";
         break;
       }
@@ -269,6 +300,9 @@ async function runHop(
           notionWarn = await markSubmitted(env.NOTION_TOKEN, plan.notionPageId);
         }
         (plan as any)._notionWarn = notionWarn;
+        await updateRunLog(env.NOTION_TOKEN, plan.runLogPageId, {
+          notionResult: !plan.notionPageId ? "対象なし" : notionWarn ? "失敗" : "成功",
+        });
         state.step = "done";
         break;
       }
@@ -312,6 +346,13 @@ async function runHop(
             names
           );
         }
+        // 実行ログ: 最終ステータス（どこかで警告/失敗があれば一部失敗）
+        await updateRunLog(env.NOTION_TOKEN, plan.runLogPageId, {
+          status: activateWarn || (plan as any)._notionWarn || sheetNames.includes("❌") ? "一部失敗" : "完了",
+        });
+        if (!plan.runLogPageId && env.NOTION_TOKEN) {
+          lines.push(":warning: 実行ログの記録に失敗（翌日自動チェックの対象外になります）");
+        }
         // 完了通知はチャンネル向け1通のみ（BUG-24）。public投稿に失敗した場合だけephemeralで代替する。
         const posted = await postPublic(env, plan.channelId, lines.join("\n"));
         if (!posted) await postProgress(env, plan, lines.join("\n"));
@@ -324,6 +365,11 @@ async function runHop(
     }
     await chainNext(state, env);
   } catch (e: any) {
+    // 実行ログ: 失敗で確定（どのステップで死んだかを機械可読で残す→翌朝チェック/自動改修の入力）
+    await updateRunLog(env.NOTION_TOKEN, plan.runLogPageId, {
+      status: "失敗",
+      detail: { ...((plan as any)._runDetail || {}), failedStep: state.step, lastError: String(e.message || e).slice(0, 500) },
+    });
     await postProgress(
       env,
       plan,

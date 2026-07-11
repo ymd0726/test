@@ -100,6 +100,10 @@ export interface SubmitPlan {
   channelId: string;
   responseUrl: string;
   userId: string;
+  /** Slack表示名（実行ログDB用。TOOL-40） */
+  userName?: string;
+  /** 統一「ツール実行ログDB」のページID（開始時に作成し、継続ホップをまたいで更新する） */
+  runLogPageId?: string | null;
 }
 
 export interface PlannedVideo {
