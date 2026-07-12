@@ -26,7 +26,9 @@ jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
+      # ルートURLはBasic認証がかかっており401が返るが、スリープ復帰の起こしには
+      # HTTPリクエストが届けば十分なので、非2xx応答でも失敗扱いにしない（-fを付けない）。
       - name: Ping Render app
         run: |
-          curl -fsS --max-time 30 -o /dev/null -w "status=%{http_code} time=%{time_total}s\n" \
+          curl -sS --max-time 30 -o /dev/null -w "status=%{http_code} time=%{time_total}s\n" \
             "https://video-material-matcher.onrender.com/"
