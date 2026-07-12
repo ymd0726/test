@@ -1,6 +1,15 @@
 // 朝のチェック結果 Slack レポート（TOOL-40）
 
-import type { CheckState } from "./types";
+import type { CheckState, CheckSummary } from "./types";
+
+/**
+ * 投稿すべき「異常」があるか（BUG-47: 正常時はSlack投稿しない）。
+ * NG / 警告 / チェッカー未登録run / チェック処理自体の失敗 のいずれかがあれば true。
+ * チェッカー自体の起動・実行エラー（🚨）は呼び元の catch で別途投稿する。
+ */
+export function hasAbnormality(s: CheckSummary): boolean {
+  return s.ng > 0 || s.warn > 0 || s.unknownTool.length > 0 || s.errors.length > 0;
+}
 
 /** サマリ本文を組み立てる（1通・管理チャンネル向け） */
 export function buildSummaryText(state: CheckState, tookMs: number): string {

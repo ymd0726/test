@@ -108,7 +108,9 @@ curl -s -o /dev/null -w "%{http_code}\n" https://jdem-stop-mcp.<sub>.workers.dev
 ## 翌日自動チェックくん（TOOL-40）
 
 毎朝 **7:30 JST**（Cron `30 22 * * *` UTC）に、前日実行された cr入稿くん / cr停止くん の結果を
-Meta / 集計表 / Notion の実態と照合し、Slack管理チャンネルへサマリを1通投稿する（0件の日も必ず投稿）。
+Meta / 集計表 / Notion の実態と照合する。**異常（NG/警告/未登録/エラー）があるときだけ** Slack管理
+チャンネルへサマリを1通投稿する（BUG-47: 正常稼働・0件の日は投稿しない）。チェッカー自体の起動・実行
+エラーは 🚨 で投稿するため、"異常なのに沈黙" にはならない。
 NG は ClaudeTool のバグ報告DBへ自動起票（機械可読JSON付き、実行者メンション付き通知）。
 
 - 実行記録: 両ツールが実行開始時に統一「ツール実行ログDB」へ書き込む（`src/check/runlog.ts`）。
@@ -122,6 +124,7 @@ NG は ClaudeTool のバグ報告DBへ自動起票（機械可読JSON付き、�
   （空のままでもチェック・起票は動くが、Slack投稿だけされない）。
 - 手動テスト:
   `GET https://jdem-stop-mcp.lead1504.workers.dev/check/run?token=<SHARED_SECRET>&dryRun=1&channel=CXXXX`
-  （`dryRun=1`=起票・書き戻しなし / `date=YYYY-MM-DD` 対象日指定 / `force=1` チェック済みも再チェック）
+  （`dryRun=1`=起票・書き戻しなし / `date=YYYY-MM-DD` 対象日指定 / `force=1` チェック済みも再チェック /
+  `always=1` 正常時もサマリを投稿＝動作確認・死活監視用）
 - 拡張: 新ツールは (1) 実行時に `createRunLog`/`updateRunLog` で記録 (2) `src/check/checkers.ts` の
   `CHECKERS` にチェッカーを1つ追加、の2点で翌朝チェックの対象になる。

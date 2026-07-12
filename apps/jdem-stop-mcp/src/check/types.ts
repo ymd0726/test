@@ -82,6 +82,8 @@ export interface CheckState {
   dateJst: string;
   /** dryRun: BUG起票・チェック結果書き戻しをしない（Slack投稿のみ） */
   dryRun: boolean;
+  /** alwaysNotify: 正常時（異常なし・0件）でもSlackへ投稿する（BUG-47。既定は false＝異常時のみ投稿） */
+  alwaysNotify: boolean;
   /** 投稿先チャンネル（省略時は CHECK_SLACK_CHANNEL_ID） */
   channelId: string;
   runIds: string[];

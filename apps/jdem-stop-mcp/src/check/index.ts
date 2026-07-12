@@ -3,14 +3,15 @@
 // 毎朝 7:30 JST（Cron "30 22 * * *" UTC）に前日分の実行ログを照合する。
 // scheduled() はチェックの起動のみ行い、実処理は /internal/check/continue への
 // self-chaining（cr入稿くんと同じ SELF_WORKER 方式）で数runずつ進める。
-// 完了時に管理チャンネルへサマリを1通投稿（0件の日も必ず投稿＝沈黙させない）。
-// チェッカー自体の異常も catch して 🚨 を投稿する。
+// 完了時、NG/警告/未登録/エラーなど「異常」があるときだけ管理チャンネルへサマリを1通投稿する
+// （BUG-47: 正常稼働・0件の日は投稿しない）。チェッカー自体の異常は catch して 🚨 を投稿する。
+// 手動テストや死活監視用に ?always=1（alwaysNotify）を付けると正常時も投稿する。
 
 import type { CheckDeps, CheckEnv, CheckState, CheckSummary, RunLogRecord, CheckItem } from "./types";
 import { queryRunsForDate, fetchRunLog, writeCheckResult } from "./runlog";
 import { CHECKERS } from "./checkers";
 import { createBugPage } from "./bug";
-import { buildSummaryText, postSlack } from "./report";
+import { buildSummaryText, postSlack, hasAbnormality } from "./report";
 import { signHmac, verifyHmac } from "../submit/continuation";
 
 export const CHECK_CONTINUE_PATH = "/internal/check/continue";
@@ -26,6 +27,8 @@ export interface CheckRunOptions {
   channel?: string;
   /** チェック済みrunも再チェックする（BUGはfiledBugsでdedupe） */
   force?: boolean;
+  /** 正常時（異常なし・0件）でもSlackへサマリを投稿する（手動テスト/死活監視用）。既定は false */
+  alwaysNotify?: boolean;
 }
 
 /** チェック開始（cron / 手動 /check/run 共通の入口） */
@@ -38,6 +41,7 @@ export async function startDailyCheck(env: CheckEnv, deps: CheckDeps, opts: Chec
     const state: CheckState = {
       dateJst,
       dryRun: !!opts.dryRun,
+      alwaysNotify: !!opts.alwaysNotify,
       channelId,
       runIds: runs.map((r) => r.pageId),
       cursor: 0,
@@ -45,8 +49,10 @@ export async function startDailyCheck(env: CheckEnv, deps: CheckDeps, opts: Chec
       summary: { ok: 0, warn: 0, ng: 0, unknownTool: [], ngLines: [], warnLines: [], okLines: [], errors: [] },
     };
     if (state.runIds.length === 0) {
+      // 実行なし＝正常。BUG-47により通常は投稿しない（?always=1 のときのみ投稿）。
+      if (!state.alwaysNotify) return `0件（正常のため投稿なし）`;
       const r = await postSlack(env, channelId, buildSummaryText(state, Date.now() - state.startedAt));
-      return r.ok ? `0件（投稿済み）` : `0件（Slack投稿失敗: ${r.error}）`;
+      return r.ok ? `0件（always: 投稿済み）` : `0件（Slack投稿失敗: ${r.error}）`;
     }
     await chainNext(state, env);
     return `${state.runIds.length}件のチェックを開始しました（${dateJst}）`;
@@ -83,6 +89,7 @@ export async function handleCheckRun(url: URL, env: CheckEnv, ctx: ExecutionCont
     date: url.searchParams.get("date") || undefined,
     channel: url.searchParams.get("channel") || undefined,
     force: url.searchParams.get("force") === "1",
+    alwaysNotify: url.searchParams.get("always") === "1",
   };
   try {
     const msg = await startDailyCheck(env, deps, opts);
@@ -106,8 +113,13 @@ async function runCheckHop(state: CheckState, env: CheckEnv, deps: CheckDeps): P
       }
     }
     if (state.cursor >= state.runIds.length) {
-      const r = await postSlack(env, state.channelId, buildSummaryText(state, Date.now() - state.startedAt));
-      if (!r.ok) console.log(`check summary post failed: ${r.error}`);
+      // BUG-47: 異常（NG/警告/未登録/エラー）があるときだけ投稿。正常時は沈黙（?always=1で強制投稿）。
+      if (hasAbnormality(state.summary) || state.alwaysNotify) {
+        const r = await postSlack(env, state.channelId, buildSummaryText(state, Date.now() - state.startedAt));
+        if (!r.ok) console.log(`check summary post failed: ${r.error}`);
+      } else {
+        console.log(`check done: 正常（OK ${state.summary.ok}件）→ Slack投稿なし`);
+      }
       return; // 連鎖終了
     }
     await chainNext(state, env);
