@@ -28,6 +28,11 @@ import { handleCrInCommand, handleCrInInteraction } from "./submit/command";
 import { handleContinue, CONTINUE_PATH } from "./submit/continuation";
 import type { SubmitEnv, SubmitProject } from "./submit/types";
 
+// ── 翌日自動チェックくん（TOOL-40）──
+import { startDailyCheck, handleCheckContinue, handleCheckRun, CHECK_CONTINUE_PATH } from "./check";
+import { createRunLog, updateRunLog } from "./check/runlog";
+import type { CheckDeps, CheckEnv } from "./check/types";
+
 const GRAPH = "v21.0"; // Meta Graph API バージョン（古くなったらここを上げる）
 
 interface Env {
@@ -62,7 +67,13 @@ const NOTION_LOG_DB_ID = "095cdb118eb34379ae8c5fc372d9e4b1";
 
 // ── 案件レジストリ ──
 // sheets: 集計表の対象（複数タブ/複数スプレッドシート対応）。sheetName省略時は meta_total/自動検出。
-interface SheetTarget { spreadsheetId: string; sheetName?: string }
+interface SheetTarget {
+  spreadsheetId: string;
+  sheetName?: string;
+  // cr入稿くん: sheet単位のDriveフォルダ上書き（例: bla の face/body）
+  driveFolderId?: string;
+  driveFolderName?: string;
+}
 interface Project {
   name: string;
   channelId: string;
@@ -70,11 +81,14 @@ interface Project {
   metaAdAccountId?: string;  // 数字のみ。未設定はMeta実停止スキップ（集計表のみ）
   metaTokenSecret?: string;  // 別BMの案件のトークンsecret名。省略時は META_ACCESS_TOKEN
   // ── cr入稿くん（/cr-in）用。設定した案件だけ入稿可能 ──
+  cldbPageId?: string;       // CLDB案件ページID（設定時はcr倉庫フォルダを実行時解決。最優先）
   driveFolderId?: string;    // 完成動画フォルダのDrive ID（確実。名前検索より優先）
   driveFolderName?: string;  // または名前検索（例 "cr_jde"。同名複数あるとエラー）
   crdbDataSourceId?: string; // Notion CRDB（cr指示ページの検索先）
+  crdbNamePrefixes?: string[]; // CRDBページ名の案件プレフィックス（省略時はname。jdekmak→jde_mak等の上書き用）
   adNameStyle?: "full" | "short"; // Meta広告名: full=ファイル名そのまま / short=cr番号のみ
   adsetAllowlist?: string[]; // 入稿先候補にする広告セットID（省略時はACTIVE全セット）
+  submitBlocked?: string;   // 設定時は/cr-inをこの理由で即エラー終了（既知の未解決事項がある案件）
 }
 
 // 案件に対応するMetaトークンを返す（BMが違う案件は別secretを使う）
@@ -82,24 +96,55 @@ function metaToken(env: Env, p: Project): string | undefined {
   return env[p.metaTokenSecret || "META_ACCESS_TOKEN"];
 }
 
+// cr入稿くん driveFolderId は CLDB「cr倉庫_(GoogleDrive) #納品先」を2026-07-06に一括照合して抽出
+// （collection://6ca19ba4-11c6-4d40-ad66-990c678b2b0d）。集計表構造の案件差は
+// Notion「📊 集計表 構造仕様（全ツール共通リファレンス）」参照。
+//
+// crdbDataSourceId は全案件で同一値（3adda07df1cd407fac365e81c6da2582 = CRDB #クリエイティブdb）。
+// 2026-07-07に実地確認: このCRDBはjde専用ではなく「アイデア〜企画〜指示ファイルまで」を横断参照する
+// 全案件共通のDBで、各レコードはCLDB(案件)リレーションで案件に紐づく（例: pom_cr06_…もこのDB内に実在）。
+// cr名検索は「{案件プレフィックス}_{cr番号}」(例 "hyd_cr50")で前方一致検索する（2026-07-08〜）。
+// チャンネル=案件が確定しているため他案件の同番号crとは衝突しない（cr停止くんと同じ方式）。
+// プレフィックスは省略時 project.name。jdekmak/jdekkou のようにSlack案件キーとページ名が
+// 異なる案件は crdbNamePrefixes で上書きする。プレフィックス付きで0件の場合は旧命名
+// （プレフィックス無し）ページ用に素のcr番号検索へフォールバックする。
+const CRDB_DATA_SOURCE_ID = "3adda07df1cd407fac365e81c6da2582"; // CRDB #クリエイティブdb（全案件共通）
 const PROJECTS: Project[] = [
   // ── 株式会社リードBM（既定トークン）・Meta連携あり ──
-  { name: "jdem", channelId: "C06K15R5PLM", sheets: [{ spreadsheetId: "11ZkSchmHPDeaDLo6h3EfyNYW9pHisxw6ErH5KlU7-EI" }], metaAdAccountId: "376611118470846" },
-  { name: "hyd",  channelId: "C05K6A1AYAX", sheets: [{ spreadsheetId: "1SkCSTuegQoZhNd3keYFOEZw2YIWOnbiRAe0rY-g22bY" }], metaAdAccountId: "240479525112751" },
-  { name: "blr",  channelId: "C08DWV6TNVD", sheets: [{ spreadsheetId: "1sml0bP7vPwkADT820q4Vw9hwmY1vS1VKeYx4HJrmCs4" }], metaAdAccountId: "1478950736840563" },
-  { name: "rcl",  channelId: "C0ASMD3EV5W", sheets: [{ spreadsheetId: "1J1BxvhD7EdfK6iDErRSmwBBXGq56QESnLIAhgfROCB4" }], metaAdAccountId: "961684439806754" },
-  { name: "nrn",  channelId: "C090XM34R8C", sheets: [{ spreadsheetId: "1Q7iph8TxZ5C5ouBb3vjvyNMNgLUmP-Uj1stCO9TewFA" }], metaAdAccountId: "1193318218072212" },
-  { name: "ssh",  channelId: "C089212DETU", sheets: [{ spreadsheetId: "1FkJIJOyYykyHV66I4VLpxHXbkVf_bswK5Y9NojDpOeI" }], metaAdAccountId: "3751573135086293" },
-  { name: "brm",  channelId: "C07KJES7LHW", sheets: [{ spreadsheetId: "1MSJ6sLNWIbZnYy1CbDUNg86KUWq9fX_MlFENKGdGKH8" }], metaAdAccountId: "825363383075510" },
+  { name: "jdem", channelId: "C06K15R5PLM", sheets: [{ spreadsheetId: "11ZkSchmHPDeaDLo6h3EfyNYW9pHisxw6ErH5KlU7-EI" }], metaAdAccountId: "376611118470846",
+    driveFolderId: "1NLdIeoFXs7-fZ1ZLVQmNiwnuHFjCd5TC", crdbDataSourceId: CRDB_DATA_SOURCE_ID },
+  // hyd: 認証は ads-reader ではなく ad-analysis-bot@ad-analysis-bot.iam.gserviceaccount.com
+  // （Googleグループ lead_div1 経由で共有済み）。マーカーは「CR一覧→」(パターン開始/集計内)
+  // と「集計除外→」(集計外開始)。2026-07-08 ユーザーが集計内(親)ゾーンにcr00テンプレ(FD6)を
+  // 手動追加し、再実測でcr00ブロック数が1→2・マーカー直後に正しく配置されたことを確認したため
+  // submitBlockedを解除。
+  { name: "hyd",  channelId: "C05K6A1AYAX", sheets: [{ spreadsheetId: "1SkCSTuegQoZhNd3keYFOEZw2YIWOnbiRAe0rY-g22bY" }], metaAdAccountId: "240479525112751",
+    driveFolderId: "1ZvE0rGBtOsZAnae8OfO3Uz-5XO9FcagA", crdbDataSourceId: CRDB_DATA_SOURCE_ID },
+  { name: "blr", channelId: "C08DWV6TNVD", sheets: [{ spreadsheetId: "1sml0bP7vPwkADT820q4Vw9hwmY1vS1VKeYx4HJrmCs4" }], metaAdAccountId: "1478950736840563",
+    driveFolderId: "1N2u8z8MrDEo7ApgrPpphz9hrmdyUs7Uh", crdbDataSourceId: CRDB_DATA_SOURCE_ID }, // 集計外(パターン子)ゾーンの存在は未確認。子ありcrはGASが明示エラーで停止する想定（親単独は動作可）
+  { name: "rcl",  channelId: "C0ASMD3EV5W", sheets: [{ spreadsheetId: "1J1BxvhD7EdfK6iDErRSmwBBXGq56QESnLIAhgfROCB4" }], metaAdAccountId: "961684439806754",
+    driveFolderId: "1F1GW6mlvpvl4Ct9F5T2f74-9UYOw3XWN", crdbDataSourceId: CRDB_DATA_SOURCE_ID },
+  { name: "nrn",  channelId: "C090XM34R8C", sheets: [{ spreadsheetId: "1Q7iph8TxZ5C5ouBb3vjvyNMNgLUmP-Uj1stCO9TewFA" }], metaAdAccountId: "1193318218072212",
+    driveFolderId: "1yppVlZaoAFwNJxeeFx2Oe6yIU4qQgrtL", crdbDataSourceId: CRDB_DATA_SOURCE_ID },
+  { name: "ssh",  channelId: "C089212DETU", sheets: [{ spreadsheetId: "1FkJIJOyYykyHV66I4VLpxHXbkVf_bswK5Y9NojDpOeI" }], metaAdAccountId: "3751573135086293",
+    driveFolderId: "154PB5vb2qEgmKJTIda2DSRay3PyvmhzY", crdbDataSourceId: CRDB_DATA_SOURCE_ID }, // ID行=7行目（他案件と異なる。GASの1〜8行探索で自動対応済み）
+  { name: "brm",  channelId: "C07KJES7LHW", sheets: [{ spreadsheetId: "1MSJ6sLNWIbZnYy1CbDUNg86KUWq9fX_MlFENKGdGKH8" }], metaAdAccountId: "825363383075510",
+    driveFolderId: "1g2t0BOjVesJ2laFH3lnWZzyjtLNBWd-L", crdbDataSourceId: CRDB_DATA_SOURCE_ID },
   // ── 複数集計対象の案件 ──
   { name: "una",  channelId: "C08DV6STNER", metaAdAccountId: "1063670028480764", sheets: [
       { spreadsheetId: "1J_T8FurvLgRd6IhxjqE0AqGS8NfQPRanXp55dy9o5gI", sheetName: "meta_total" },        // 本店
       { spreadsheetId: "1icFYUtazAwq8yDGx6ySC04KvLw8Q3WQ6i_HvIhqE20k", sheetName: "meta_total_銀座店" }, // 銀座店（別スプレッド）
-  ] },
+    ],
+    // 本店フォルダのみ登録（銀座店はCLDB未登録）。銀座店のcrを入稿すると本店フォルダで
+    // ファイルが見つからずエラーになる想定（誤爆ではなく安全側の失敗）。銀座店対応時はCLDBに登録を
+    driveFolderId: "1x7msuyaB8oaGkht3mKMYI3rE4j5g-zzr", crdbDataSourceId: CRDB_DATA_SOURCE_ID },
   { name: "bla",  channelId: "C09FYGDAFEX", metaAdAccountId: "1612534536164262", sheets: [
-      { spreadsheetId: "1s7wI_d9CFRv0pGeNJXVoSg1Ux6VwKznpkf10qTjVgRw", sheetName: "meta_face" },
-      { spreadsheetId: "1s7wI_d9CFRv0pGeNJXVoSg1Ux6VwKznpkf10qTjVgRw", sheetName: "meta_body" },
-  ] },
+      // face/bodyでcr番号が独立採番のためDriveフォルダも分かれる（CLDB確認済）。
+      // resolve.tsがsheet単位のdriveFolderIdで両方検索し、一致した方だけを採用する
+      { spreadsheetId: "1s7wI_d9CFRv0pGeNJXVoSg1Ux6VwKznpkf10qTjVgRw", sheetName: "meta_face", driveFolderId: "1W9eVd0Goj9GnZTpAogU7stWi-uBJU4yE" },
+      { spreadsheetId: "1s7wI_d9CFRv0pGeNJXVoSg1Ux6VwKznpkf10qTjVgRw", sheetName: "meta_body", driveFolderId: "1HowqtJktuljTF37MWrOukhXBOtXlZjMV" },
+    ],
+    crdbDataSourceId: CRDB_DATA_SOURCE_ID },
   { name: "jdek", channelId: "C092WQSSPUL", metaAdAccountId: "1533513563939156", sheets: [ // #z-n22_jde_all（両訴求 自動判定）
       { spreadsheetId: "1oEK8JCJg2NcseWmnxLtfNFCe5A7XGJ_DJSj7c2EW1sg", sheetName: "kk_mak" },
       { spreadsheetId: "1oEK8JCJg2NcseWmnxLtfNFCe5A7XGJ_DJSj7c2EW1sg", sheetName: "kk_kou" },
@@ -107,25 +152,54 @@ const PROJECTS: Project[] = [
   { name: "jdekmak", channelId: "C09S1F9TXSP", metaAdAccountId: "1533513563939156", sheets: [ // #z-n22_jde_kk_mak（巻き肩）
       { spreadsheetId: "1oEK8JCJg2NcseWmnxLtfNFCe5A7XGJ_DJSj7c2EW1sg", sheetName: "kk_mak" },
     ],
-    // ── cr入稿くん（初期スコープ案件）──
-    driveFolderName: "cr_jde",  // TODO: 確定したら driveFolderId 直指定に切替（同名フォルダ誤検出防止）
-    crdbDataSourceId: "2c155406-c36d-4d7d-9d2a-22aefd4f17cf", // CRDB（E2Eで database_id と一致するか要確認）
+    // ── cr入稿くん（初期スコープ案件・実運用検証済）──
+    cldbPageId: "2a835c2adb56809b9953ee99115cc560", // CLDB「n22_jde_kk_mak」→ cr倉庫_(GoogleDrive)を実行時解決
+    driveFolderId: "1M0Cc9_R_S-h_dm4SoZJ_Tigr8gWVrMck", // フォールバック: cr_jde_mak_巻き肩
+    crdbDataSourceId: "3adda07df1cd407fac365e81c6da2582", // CRDB #クリエイティブdb（database_id。要: cr-stop-workerインテグレーションへの共有）
+    crdbNamePrefixes: ["jde_mak"], // CRDBページ名は jde_mak_cr79_…（Slack案件キーjdekmakと異なる）
     adNameStyle: "full", // jde系は広告名フル名称（jde_mak_cr84_… 実測済）
     adsetAllowlist: ["120246843077960183"], // mak本体広告セット（cr81/82/84の直近入稿先）
   },
   { name: "jdekkou", channelId: "C092NPS16P3", metaAdAccountId: "1533513563939156", sheets: [ // #z-n22_jde_kk_kou（甲剥がし）
       { spreadsheetId: "1oEK8JCJg2NcseWmnxLtfNFCe5A7XGJ_DJSj7c2EW1sg", sheetName: "kk_kou" },
-  ] },
-  // ── 株式会社リードBM・集計表のみ（Meta広告アカウントID未登録 → 後付け可）──
-  { name: "bbt",  channelId: "C0B3J7U8Q5N", sheets: [{ spreadsheetId: "1IoFvL9ZmbhoNRlFl_rvza8VwC0_bA1mJAT5z98-gGf8" }] },
-  { name: "lcl",  channelId: "C08SNLK4CMP", sheets: [{ spreadsheetId: "12WYKgq0i53_ZZXlO7rLZ5zWGLzN7fbPZrGGfeB9kIT0" }] },
-  { name: "aty",  channelId: "C07MTDU23A9", sheets: [{ spreadsheetId: "1Z3OIaJQgr2Nd8ElN0dB_lJ2a8Cls_J9756zaeGoJu9U" }] },
-  { name: "pom",  channelId: "C07K1AQ15T5", sheets: [{ spreadsheetId: "1WmFGDm4vJxJrB_wi4fH27Dq1Xyzj9BTiZv0D9boU6KA", sheetName: "meta_total_02" }] },
-  { name: "rof",  channelId: "C060E2R6AMR", sheets: [{ spreadsheetId: "1SeLfRmBE5wxabOkgWTIFRskbRk9H756E9Zz_trqiMzk", sheetName: "meta_全店共通CR別_face" }] },
-  { name: "rob",  channelId: "C05BQ9GPF9C", sheets: [{ spreadsheetId: "1Ww2jaG_0lsQ4-lq8SS3WCSGpcVuIaoqshR2RzztrbDk", sheetName: "meta_全店共通CR別" }] },
-  // ── Local Infomation BM（META_TOKEN_LOCAL）──
-  { name: "grm",  channelId: "C09GWM75YV6", sheets: [{ spreadsheetId: "1Ug7qBDUUhLutvDLlBbQNiKvIhVbwOhxlOOYm-zPpwG0" }], metaAdAccountId: "1252444372845762", metaTokenSecret: "META_TOKEN_LOCAL" },
-  { name: "fpl",  channelId: "C09NP3CE316", sheets: [{ spreadsheetId: "1fPuoBFCp4LoC8GVr84M9JWMoWwgr6tDzAGZEPEhz-VU" }], metaTokenSecret: "META_TOKEN_LOCAL" },
+    ],
+    driveFolderId: "1i0xy_jjhzLY4RE6K22ahxxmm-vrHUNNM", // CLDB「n22_jde_kk_kou」
+    crdbDataSourceId: CRDB_DATA_SOURCE_ID,
+    crdbNamePrefixes: ["jde_kou"], // CRDBページ名は jde_kou_cr…（Slack案件キーjdekkouと異なる）
+    adNameStyle: "full" },
+  // ── 株式会社リードBM（2026-07-07 Meta Ads MCPで広告名実測してアカウントID確定）──
+  { name: "bbt",  channelId: "C0B3J7U8Q5N", sheets: [{ spreadsheetId: "1IoFvL9ZmbhoNRlFl_rvza8VwC0_bA1mJAT5z98-gGf8" }],
+    metaAdAccountId: "1616783749463582", crdbDataSourceId: CRDB_DATA_SOURCE_ID }, // bbt_cr05_...で稼働確認済。Drive倉庫はCLDB未登録のため要登録
+  { name: "lcl",  channelId: "C08SNLK4CMP", sheets: [{ spreadsheetId: "12WYKgq0i53_ZZXlO7rLZ5zWGLzN7fbPZrGGfeB9kIT0" }],
+    driveFolderId: "1K7oUiBfIYZQozePFO_g3h0z8hfeOUy8I", metaAdAccountId: "2261332077579401", crdbDataSourceId: CRDB_DATA_SOURCE_ID }, // lcl_cr24_...で稼働確認済
+  { name: "aty",  channelId: "C07MTDU23A9", sheets: [{ spreadsheetId: "1Z3OIaJQgr2Nd8ElN0dB_lJ2a8Cls_J9756zaeGoJu9U" }],
+    driveFolderId: "1dHweykRQzMHD-tYNZaDTVebvFACbZvdi", metaAdAccountId: "780374144048761", crdbDataSourceId: CRDB_DATA_SOURCE_ID }, // aty_cr07_...で稼働確認済
+  { name: "pom",  channelId: "C07K1AQ15T5", sheets: [{ spreadsheetId: "1WmFGDm4vJxJrB_wi4fH27Dq1Xyzj9BTiZv0D9boU6KA", sheetName: "meta_total_02" }],
+    driveFolderId: "132T3oZCEWlPDnihFYOqmZn4eZ5VbwZbV", metaAdAccountId: "487263213795383", crdbDataSourceId: CRDB_DATA_SOURCE_ID }, // cr01/cr02_01-04等の命名一致確認済（現在は全PAUSED）
+  // rof/rob: 2026-07-07 構造ダンプで判明— 実は同一の共有スプレッドシート
+  // 「n03_rob&n08_rof_rose_集計表_2601-」(旧CLDB記載のrofのIDは古い別シートで404相当)。
+  // Metaも「【リード】01：ROSE」(Buzzmode, 1348469442433184)を両部位で共用（rob_cr2_XX/face系で稼働確認済）。
+  { name: "rof",  channelId: "C060E2R6AMR", sheets: [{ spreadsheetId: "1Ww2jaG_0lsQ4-lq8SS3WCSGpcVuIaoqshR2RzztrbDk", sheetName: "meta_CR_FACE" }],
+    // meta_CR_FACE: ID行=6行目・cr00×2確認(AB6/PZ6)・除外マーカーは「ナンバリング除外→」(新規発見、GAS側に追加済)。
+    // メモ列(親子分類プルダウン)は無い案件のため分類書込みはスキップされる想定（構造上問題なし）
+    metaAdAccountId: "1348469442433184", crdbDataSourceId: CRDB_DATA_SOURCE_ID,
+    driveFolderId: "1_ZAEE4rBLIPR9CeKrw5eWWykbJQcZgwS" }, // rob側Driveフォルダを暫定共用（face専用フォルダ未確認・要検証）
+  { name: "rob",  channelId: "C05BQ9GPF9C", sheets: [{ spreadsheetId: "1Ww2jaG_0lsQ4-lq8SS3WCSGpcVuIaoqshR2RzztrbDk", sheetName: "meta_CR_BODY" }],
+    metaAdAccountId: "1348469442433184", crdbDataSourceId: CRDB_DATA_SOURCE_ID,
+    driveFolderId: "1_ZAEE4rBLIPR9CeKrw5eWWykbJQcZgwS",
+    // meta_CR_BODYは実タブ名まで判明したが、1〜8行にID行が見つからない（店舗別サマリー構造に見える）。
+    // 実際のCRブロックが別行/別タブにある可能性があり要追加調査。解決までブロック
+    submitBlocked: "実タブ名は meta_CR_BODY と判明したが、1〜8行にID行(cr00等)が見つからない。実際のCRブロック位置の追加調査が必要" },
+  // ── Local Infomation BM（META_TOKEN_LOCAL）── grm/fplは既定Meta Ads MCP接続とは別ビジネスのため
+  // アカウント一覧に出てこない。fplのmetaAdAccountIdはLocal BM側で別途確認が必要
+  { name: "grm",  channelId: "C09GWM75YV6", sheets: [{ spreadsheetId: "1Ug7qBDUUhLutvDLlBbQNiKvIhVbwOhxlOOYm-zPpwG0" }], metaAdAccountId: "1252444372845762", metaTokenSecret: "META_TOKEN_LOCAL",
+    driveFolderId: "1TrGMy-Z6MQKN3w2Dht0FG8zEeYi0QSMZ", crdbDataSourceId: CRDB_DATA_SOURCE_ID },
+  { name: "fpl",  channelId: "C09NP3CE316", sheets: [{ spreadsheetId: "1fPuoBFCp4LoC8GVr84M9JWMoWwgr6tDzAGZEPEhz-VU" }], metaTokenSecret: "META_TOKEN_LOCAL",
+    driveFolderId: "1p5FLvojnRZ8Smoymuz4hY50NLh9wsWa1", crdbDataSourceId: CRDB_DATA_SOURCE_ID,
+    submitBlocked: "Local Infomation BM配下のMeta広告アカウントIDが未確認（既定のMeta Ads MCP接続では不可視）。要手動確認" },
+  // ── n10_fp（フローズンフィリップ）2026-07-07 新規登録 ──
+  { name: "fp",   channelId: "C068ESLAU03", sheets: [{ spreadsheetId: "145RGJ9yeCnR8vJexXVyO_LsDTMYVQPBehYkyAim9be8", sheetName: "meta_total" }],
+    metaAdAccountId: "767158244897727", driveFolderId: "16GyZta2Li0U74zIHrQuMn59o75anNrA9", crdbDataSourceId: CRDB_DATA_SOURCE_ID }, // cr44/cr45/cr46で稼働確認済
 ];
 
 // cr名がどの集計対象(タブ/スプレッド)にあるかを判定して返す（複数対象案件のルーティング）
@@ -241,6 +315,18 @@ async function metaFindAds(token: string, adAccountId: string, creative: string)
     .filter((a: any) => adNameMatches(a.name, creative))
     .map((a: any) => ({ id: a.id, name: a.name, effective_status: a.effective_status }));
 
+  // ②' CONTAINが0件を返す癖への保険（BUG-28: rclで実在広告 rcl_cr01_01 が0件になった）:
+  //     フィルタ無しで直近500件を取得し、手元の厳密一致だけで拾い直す
+  if (matched.length === 0) {
+    const url2 = `https://graph.facebook.com/${GRAPH}/act_${adAccountId}/ads?fields=id,name,effective_status&limit=500&access_token=${encodeURIComponent(token)}`;
+    const d2 = await fetchJsonTimeout(url2, 12000);
+    if (!d2.error) {
+      matched = (d2.data || [])
+        .filter((a: any) => adNameMatches(a.name, creative))
+        .map((a: any) => ({ id: a.id, name: a.name, effective_status: a.effective_status }));
+    }
+  }
+
   // ③ 一致した広告だけ CP名/AS名 を取得（軽量・表示用）
   if (matched.length) {
     try {
@@ -284,7 +370,7 @@ const resumeAds = (token: string, ids: string[]) => setAdsStatus(token, ids, "AC
 // ============================================================
 interface StopResult {
   alreadyStopped?: boolean;
-  meta?: { configured: boolean; found: number; paused?: number; adNames?: string[] };
+  meta?: { configured: boolean; found: number; paused?: number; adNames?: string[]; adIds?: string[] };
   sheet?: any;
 }
 
@@ -306,7 +392,7 @@ async function doStop(env: Env, p: Project, creative: string, date: string): Pro
         return out;
       }
       for (const a of active) await metaSetStatus(token, a.id, "PAUSED");
-      out.meta = { configured: true, found: ads.length, paused: active.length, adNames: active.map((a) => a.name) };
+      out.meta = { configured: true, found: ads.length, paused: active.length, adNames: active.map((a) => a.name), adIds: active.map((a) => a.id) };
     }
   } else {
     out.meta = { configured: false, found: 0 };
@@ -333,7 +419,7 @@ async function doUndo(env: Env, p: Project, creative: string, memoMode: "full" |
     const ads = await metaFindAds(token, p.metaAdAccountId, creative);
     const paused = ads.filter((a) => a.effective_status === "PAUSED");
     for (const a of paused) await metaSetStatus(token, a.id, "ACTIVE");
-    out.meta = { resumed: paused.length, adNames: paused.map((a) => a.name) };
+    out.meta = { resumed: paused.length, adNames: paused.map((a) => a.name), adIds: paused.map((a) => a.id) };
   }
   return out;
 }
@@ -382,12 +468,25 @@ function fmtPublicUndo(out: any, creative: string, memoMode: string, by: string)
 async function notifySlack(env: Env, channelId: string, text: string): Promise<{ ok: boolean; error?: string }> {
   if (!env.SLACK_BOT_TOKEN || !channelId) return { ok: false, error: "no token/channel" };
   try {
-    const res = await fetch("https://slack.com/api/chat.postMessage", {
-      method: "POST",
-      headers: { "Content-Type": "application/json; charset=utf-8", Authorization: `Bearer ${env.SLACK_BOT_TOKEN}` },
-      body: JSON.stringify({ channel: channelId, text }),
-    });
-    const data: any = await res.json();
+    const post = async () => {
+      const res = await fetch("https://slack.com/api/chat.postMessage", {
+        method: "POST",
+        headers: { "Content-Type": "application/json; charset=utf-8", Authorization: `Bearer ${env.SLACK_BOT_TOKEN}` },
+        body: JSON.stringify({ channel: channelId, text }),
+      });
+      return (await res.json()) as any;
+    };
+    let data = await post();
+    if (!data.ok && data.error === "not_in_channel") {
+      // Bot未参加チャンネル（BUG-29: rcl）→ publicなら参加を試みて1回だけ再送
+      const j = await fetch("https://slack.com/api/conversations.join", {
+        method: "POST",
+        headers: { "Content-Type": "application/json; charset=utf-8", Authorization: `Bearer ${env.SLACK_BOT_TOKEN}` },
+        body: JSON.stringify({ channel: channelId }),
+      });
+      const jd: any = await j.json();
+      if (jd.ok) data = await post();
+    }
     return data.ok ? { ok: true } : { ok: false, error: data.error };
   } catch (e) {
     return { ok: false, error: String(e) };
@@ -429,6 +528,37 @@ function sheetResultLabel(sheet: any): "成功" | "失敗" | "対象なし" {
   if (sheet?.success) return "成功";
   if (/該当cr/.test(String(sheet?.message || ""))) return "対象なし";
   return "失敗";
+}
+
+// ── 統一「ツール実行ログDB」への結果マッピング（TOOL-40 翌日自動チェックくん）──
+// 旧ログ(logToNotion=停止カウンター)は当面併記し、新DBには翌朝チェックに必要な
+// ad id・タブ名まで記録する。ログ失敗は本処理を止めない（createRunLogがnullを返すだけ）。
+function stopRunPatch(out: StopResult) {
+  const metaResult = !out.meta?.configured
+    ? "未実行"
+    : out.alreadyStopped || out.meta.found === 0
+      ? "対象なし"
+      : (out.meta.paused || 0) > 0
+        ? "成功"
+        : "失敗";
+  const sheetResult = out.alreadyStopped ? "未実行" : sheetResultLabel(out.sheet);
+  const ok = metaResult !== "失敗" && sheetResult !== "失敗";
+  return {
+    status: ok ? "完了" : "一部失敗",
+    metaResult,
+    sheetResult,
+    adIds: out.meta?.adIds || [],
+    sheetTabs: out.sheet?.sheet ? [String(out.sheet.sheet)] : [],
+  };
+}
+function undoRunPatch(out: any) {
+  const sheetResult = sheetResultLabel(out.sheet);
+  return {
+    status: sheetResult !== "失敗" ? "完了" : "一部失敗",
+    metaResult: out.meta ? "成功" : "未実行",
+    sheetResult,
+    adIds: out.meta?.adIds || [],
+  };
 }
 
 // ============================================================
@@ -643,9 +773,11 @@ export class CreativeStopMCP extends McpAgent<Env> {
         if (targets.length === 0) return asText({ success: false, message: `該当案件なし: ${creativeName}` });
         if (targets.length > 1) return asText({ success: false, message: `複数案件に存在(${targets.map((t) => t.name).join(",")})。projectを指定してください` });
         const p = targets[0];
+        const runLogId = await createRunLog(env.NOTION_TOKEN, { tool: "cr停止くん", action: "停止", project: p.name, crName: creativeName, userName: "claude.ai", userId: "", route: "Claude" });
         const out = await doStop(env, p, creativeName, date);
         if (!out.alreadyStopped && out.sheet?.success) await notifySlack(env, p.channelId, fmtPublicStop(out, creativeName, date, "via Claude"));
         await logToNotion(env, { creative: creativeName, user: "claude.ai", userId: "", action: "停止", project: p.name, route: "Claude", metaCount: out.meta?.paused || 0, sheetResult: out.alreadyStopped ? "対象なし" : sheetResultLabel(out.sheet) });
+        await updateRunLog(env.NOTION_TOKEN, runLogId, stopRunPatch(out));
         return asText({ project: p.name, message: fmtStop(out, creativeName, date), ...out });
       },
     );
@@ -663,9 +795,11 @@ export class CreativeStopMCP extends McpAgent<Env> {
         if (targets.length === 0) return asText({ success: false, message: `該当案件なし: ${creativeName}` });
         if (targets.length > 1) return asText({ success: false, message: `複数案件に存在(${targets.map((t) => t.name).join(",")})。projectを指定してください` });
         const p = targets[0];
+        const runLogId = await createRunLog(env.NOTION_TOKEN, { tool: "cr停止くん", action: "取消", project: p.name, crName: creativeName, userName: "claude.ai", userId: "", route: "Claude" });
         const out = await doUndo(env, p, creativeName, memoMode);
         if (out.sheet?.success) await notifySlack(env, p.channelId, fmtPublicUndo(out, creativeName, memoMode, "via Claude"));
         await logToNotion(env, { creative: creativeName, user: "claude.ai", userId: "", action: "取消", project: p.name, route: "Claude", metaCount: out.meta?.resumed || 0, sheetResult: sheetResultLabel(out.sheet) });
+        await updateRunLog(env.NOTION_TOKEN, runLogId, undoRunPatch(out));
         return asText({ project: p.name, message: fmtUndo(out, creativeName, memoMode), ...out });
       },
     );
@@ -959,6 +1093,9 @@ function handleSlackInteract(env: Env, ctx: ExecutionContext, bodyText: string, 
       try {
         await postResponse(responseUrl, { replace_original: true, text: `⏳ *${v.c}* を${v.a === "undo" ? "取消" : "停止"}実行中…` });
         const inviteNote = (err?: string) => `\n⚠️ チャンネルへの全員通知に失敗（${err}）。このチャンネルで \`/invite @cr停止\` を実行してください。`;
+        // 実行ログDB（TOOL-40）: 開始時に「実行中」で作成。途中死してもチェッカーが検出できる
+        const runLogId = await createRunLog(env.NOTION_TOKEN, { tool: "cr停止くん", action: v.a === "undo" ? "取消" : "停止", project: project.name, crName: v.c, userName, userId, route: "Slack" });
+        const runLogWarn = !runLogId && env.NOTION_TOKEN ? "\n⚠️ 実行ログの記録に失敗（翌日自動チェックの対象外になります）" : "";
         // Meta失敗は集計表を止めない（権限不足等でも集計表記録は実行し、Metaエラーは併記）
         let metaErr = "";
         const target = await pickSheet(project, v.c); // 複数集計対象の案件は cr名で対象タブを判定
@@ -967,25 +1104,39 @@ function handleSlackInteract(env: Env, ctx: ExecutionContext, bodyText: string, 
           if (metaOn && ids.length) { try { paused = await pauseAds(token!, ids); if (paused < ids.length) metaErr = `${ids.length - paused}件の停止に失敗`; } catch (e) { metaErr = String(e); } }
           const sheet = target ? await callGas(target, { action: "stop", creativeName: v.c, stopDate: v.d }) : { success: false, message: "集計表に該当crなし(複数対象)" };
           const extra = (metaErr ? `\n⚠️ Meta停止に失敗（${metaErr}）。Metaトークン/権限を確認してください。` : "");
-          let note = extra;
+          let note = extra + runLogWarn;
           if (paused || sheet?.success) {
             const r = await notifySlack(env, project.channelId, stopLines(v.c, v.d, paused, sheet, metaOn, `by <@${userId}>`) + extra);
             if (!r.ok) note += inviteNote(r.error);
           }
           await postResponse(responseUrl, { replace_original: true, text: stopLines(v.c, v.d, paused, sheet, metaOn, "") + note });
           await logToNotion(env, { creative: v.c, user: userName, userId, action: "停止", project: project.name, route: "Slack", metaCount: paused, sheetResult: sheetResultLabel(sheet) });
+          await updateRunLog(env.NOTION_TOKEN, runLogId, {
+            status: !metaErr && sheetResultLabel(sheet) !== "失敗" ? "完了" : "一部失敗",
+            metaResult: !metaOn ? "未実行" : ids.length === 0 ? "対象なし" : metaErr ? "失敗" : "成功",
+            sheetResult: sheetResultLabel(sheet),
+            adIds: ids,
+            sheetTabs: sheet?.sheet ? [String(sheet.sheet)] : target?.sheetName ? [target.sheetName] : [],
+          });
         } else {
           let resumed = 0;
           if (metaOn && ids.length) { try { resumed = await resumeAds(token!, ids); if (resumed < ids.length) metaErr = `${ids.length - resumed}件の再開に失敗`; } catch (e) { metaErr = String(e); } }
           const sheet = target ? await callGas(target, { action: "undo", creativeName: v.c, memoMode: v.m || "tag" }) : { success: false, message: "集計表に該当crなし(複数対象)" };
           const extra = (metaErr ? `\n⚠️ Meta再開に失敗（${metaErr}）。Metaトークン/権限を確認してください。` : "");
-          let note = extra;
+          let note = extra + runLogWarn;
           if (resumed || sheet?.success) {
             const r = await notifySlack(env, project.channelId, undoLines(v.c, v.m || "tag", resumed, sheet, metaOn, `by <@${userId}>`) + extra);
             if (!r.ok) note += inviteNote(r.error);
           }
           await postResponse(responseUrl, { replace_original: true, text: undoLines(v.c, v.m || "tag", resumed, sheet, metaOn, "") + note });
           await logToNotion(env, { creative: v.c, user: userName, userId, action: "取消", project: project.name, route: "Slack", metaCount: resumed, sheetResult: sheetResultLabel(sheet) });
+          await updateRunLog(env.NOTION_TOKEN, runLogId, {
+            status: !metaErr && sheetResultLabel(sheet) !== "失敗" ? "完了" : "一部失敗",
+            metaResult: !metaOn ? "未実行" : ids.length === 0 ? "対象なし" : metaErr ? "失敗" : "成功",
+            sheetResult: sheetResultLabel(sheet),
+            adIds: ids,
+            sheetTabs: target?.sheetName ? [target.sheetName] : [],
+          });
         }
       } catch (e) {
         await postResponse(responseUrl, { replace_original: true, text: `❌ エラー: ${e}` });
@@ -1030,6 +1181,15 @@ export default {
       return handleBudget(env, ctx, url);
     }
 
+    // --- 翌日自動チェックくん（TOOL-40）---
+    if (url.pathname === CHECK_CONTINUE_PATH && request.method === "POST") {
+      return handleCheckContinue(request, env as unknown as CheckEnv, ctx, checkDeps(env));
+    }
+    if (url.pathname === "/check/run") {
+      // 手動起動（cronを待たずにテスト）: ?token=<SHARED_SECRET>&dryRun=1&date=YYYY-MM-DD&channel=CXXXX&force=1
+      return handleCheckRun(url, env as unknown as CheckEnv, ctx, checkDeps(env));
+    }
+
     // --- MCP（共有シークレットをフルパスで保持）---
     const base = `/${env.SHARED_SECRET}`;
     if (url.pathname === `${base}/sse` || url.pathname === `${base}/sse/message`) {
@@ -1041,4 +1201,19 @@ export default {
 
     return new Response("Not found", { status: 404 });
   },
+
+  // 毎朝 7:30 JST（= 22:30 UTC。wrangler.jsonc triggers.crons）に前日分をチェック
+  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(
+      startDailyCheck(env as unknown as CheckEnv, checkDeps(env)).catch((e) => console.log(`daily check failed: ${e}`))
+    );
+  },
 };
+
+// チェックモジュールへ注入する依存（PROJECTSレジストリ・トークン解決。循環import回避のためここで束ねる）
+function checkDeps(env: Env): CheckDeps {
+  return {
+    projects: PROJECTS,
+    metaTokenFor: (p) => metaToken(env, p as Project),
+  };
+}

@@ -6,6 +6,14 @@
 export interface ProjectSheet {
   spreadsheetId: string;
   sheetName?: string;
+  /**
+   * sheet単位のDriveフォルダ上書き（例: bla の face/body で完成素材フォルダが分かれる案件）。
+   * 設定したsheetが1つ以上あるプロジェクトは、resolve.ts が各フォルダでprefix検索し、
+   * 一致したフォルダが1つだけならそれを採用。複数フォルダで一致したら曖昧なので中断する
+   * （誤って別部位の同名crを掴むことを防ぐ）。未設定ならproject単位のdriveFolderId等を使う。
+   */
+  driveFolderId?: string;
+  driveFolderName?: string;
 }
 
 export interface SubmitProject {
@@ -21,16 +29,42 @@ export interface SubmitProject {
   metaTokenSecret?: string;
 
   // ---- 入稿用の追加フィールド ----
-  /** Google Drive のcrフォルダID（例: cr_jde 配下の案件フォルダ）。未設定なら名前検索 */
+  /** CLDB案件ページID。設定時は「cr倉庫_(GoogleDrive) #納品先」プロパティからcrフォルダを実行時解決（最優先） */
+  cldbPageId?: string;
+  /** Google Drive のcrフォルダID（CLDB未設定/読取失敗時のフォールバック） */
   driveFolderId?: string;
   /** Drive フォルダを名前検索する場合のフォルダ名（例: "cr_grm"） */
   driveFolderName?: string;
   /** Notion CRDB の data source ID（クリエイティブ指示ページの検索先） */
   crdbDataSourceId?: string;
+  /**
+   * CRDBページ名の案件プレフィックス（例 "hyd" → hyd_cr50_…）。省略時は name を使う。
+   * CRDBは全案件共通DBのため、cr番号だけで検索すると他案件の同番号crと衝突する。
+   * チャンネル=案件が確定している前提で「{prefix}_{cr番号}」の前方一致に絞り込む。
+   * Slack案件キーとページ名プレフィックスが異なる案件（jdekmak→jde_mak等）の上書き用。
+   * 複数訴求チャンネル（jdek等）は複数指定可。
+   */
+  crdbNamePrefixes?: string[];
   /** Meta広告名の慣習: "full"=Notionページ名そのまま / "short"=cr{N}のみ */
   adNameStyle?: "full" | "short";
   /** 入稿先として提示する広告セットを限定したい場合のID配列（省略時はアカウント内のACTIVEな広告セットを列挙） */
   adsetAllowlist?: string[];
+  /**
+   * 設定時は /cr-in をこの理由で即エラー終了させる（既知の未解決事項がある案件用）。
+   * 例: 集計表タブ名がCLDB記載と不一致・ID行未特定・複数Driveフォルダで1件に決め打てない等。
+   * 解決したら削除してcr入稿くんを有効化する。
+   */
+  submitBlocked?: string;
+}
+
+/** 入稿先1件（複数広告セット同時入稿用。BUG-31） */
+export interface PlannedTarget {
+  adsetId: string;
+  adsetName: string;
+  campaignName?: string;
+  /** このセットのテキスト類コピー元（各セットの直近cr広告） */
+  sourceAdId: string;
+  sourceAdName: string;
 }
 
 /** /cr-in 解決フェーズの結果（確認ボタンに埋め込む実行プラン） */
@@ -48,16 +82,28 @@ export interface SubmitPlan {
   videos: PlannedVideo[];
   /** パターン（子）があるか。集計表の親子展開に使う */
   hasChildren: boolean;
-  /** 入稿先広告セット */
+  /** 入稿先広告セット（複数入稿時は先頭ターゲット。表示用は結合名が入ることもある） */
   adsetId: string;
   adsetName: string;
-  /** テキスト類のコピー元広告 */
+  /** 入稿先キャンペーン名（完了通知の表示用） */
+  campaignName?: string;
+  /** テキスト類のコピー元広告（複数入稿時は先頭ターゲットのもの） */
   sourceAdId: string;
   sourceAdName: string;
+  /**
+   * 複数広告セット同時入稿（BUG-31「すべてに入稿」ボタン）。設定時はこちらを正とし、
+   * 各ターゲットごとに「そのセットの直近cr広告からspecコピー→creative→ad(PAUSED)」を作成する。
+   * 未設定時は従来どおり adsetId/sourceAdId の単一入稿。
+   */
+  targets?: PlannedTarget[];
   /** Slack返信先 */
   channelId: string;
   responseUrl: string;
   userId: string;
+  /** Slack表示名（実行ログDB用。TOOL-40） */
+  userName?: string;
+  /** 統一「ツール実行ログDB」のページID（開始時に作成し、継続ホップをまたいで更新する） */
+  runLogPageId?: string | null;
 }
 
 export interface PlannedVideo {
@@ -74,6 +120,8 @@ export interface PlannedVideo {
   videoId?: string;
   creativeId?: string;
   adId?: string;
+  /** 複数広告セット入稿時: adsetId → 作成済みadId（再実行時のスキップ判定に使う） */
+  adIdsByAdset?: Record<string, string>;
 }
 
 export interface CreativeTextOverrides {
@@ -84,7 +132,7 @@ export interface CreativeTextOverrides {
 
 /** self-chaining continuation の状態 */
 export interface ContinuationState {
-  step: "upload" | "wait_ready" | "create_ads" | "sheet" | "notion" | "done";
+  step: "upload" | "wait_ready" | "create_ads" | "activate" | "sheet" | "notion" | "done";
   /** videos[] のうち現在処理中のindex（upload/wait_ready用） */
   index: number;
   /** wait_ready の試行回数（バックオフ・上限用） */
@@ -109,6 +157,8 @@ export interface SubmitEnv {
   SHARED_SECRET: string;
   /** 自分自身のURL（continuation self-fetch用）例: https://jdem-stop-mcp.lead1504.workers.dev */
   SELF_URL: string;
+  /** 自分自身へのService Binding（wrangler.jsonc services）。公開URL経由の自己fetchはCloudflareが404にするため必須 */
+  SELF_WORKER?: { fetch: (input: Request | string, init?: RequestInit) => Promise<Response> };
 }
 
 export const GRAPH = "https://graph.facebook.com/v21.0";

@@ -30,6 +30,7 @@ if (!raw) {
   process.exit(1);
 }
 const creds = JSON.parse(raw);
+console.log(`# 実行中のサービスアカウント: ${creds.client_email}`);
 const auth = new google.auth.GoogleAuth({
   credentials: creds,
   scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
@@ -44,6 +45,7 @@ const meta = await sheets.spreadsheets.get({
 });
 console.log(`# スプレッドシート: ${meta.data.properties.title} (${SPREADSHEET_ID})`);
 console.log(`# タブ数: ${meta.data.sheets.length}`);
+console.log(`# 全タブ名: ${meta.data.sheets.map((s) => s.properties.title).join(" | ")}`);
 
 const targets = args.tab
   ? meta.data.sheets.filter((s) => s.properties.title === args.tab)
@@ -76,6 +78,34 @@ for (const sheet of targets) {
   if (!args.tab && info.cr00Blocks.length === 0) continue; // 全タブモードではcr00があるタブだけ報告
   report.tabs.push(info);
   printTab(info);
+
+  // --dump: 対象タブの1〜ID行の非空セルを A1:値 で全出力（実構造の目視確認用）
+  if (args.tab && args.dump) {
+    console.log(`\n--- ${p.title} 非空セルダンプ（1〜${rows.length}行 / A1:値）---`);
+    for (let r = 0; r < rows.length; r++) {
+      const cells = [];
+      for (let c = 0; c < (rows[r] || []).length; c++) {
+        const v = String(rows[r][c] ?? "").trim();
+        if (v) cells.push(`${colToA1(c)}${r + 1}=${v.slice(0, 30)}`);
+      }
+      if (cells.length) console.log(`[行${r + 1}] ${cells.join(" | ")}`);
+    }
+    // cr-idセルの不可視文字検査（BUG-28: 「存在するのに見つからない」原因の切り分け用）。
+    // ASCII外・制御・ゼロ幅文字や前後空白を含む cr セルを JSON+コードポイントで晒す
+    console.log(`\n--- cr-idセルの文字検査（非ASCII/不可視文字があれば表示）---`);
+    let suspicious = 0;
+    for (let r = 0; r < rows.length; r++) {
+      for (let c = 0; c < (rows[r] || []).length; c++) {
+        const raw = String(rows[r][c] ?? "");
+        if (!/cr\d/i.test(raw)) continue;
+        if (/^[\x20-\x7E]*$/.test(raw) && raw === raw.trim()) continue; // 純ASCII・前後空白なしはOK
+        const codes = [...raw].map((ch) => "U+" + ch.codePointAt(0).toString(16).toUpperCase().padStart(4, "0")).join(" ");
+        console.log(`${colToA1(c)}${r + 1}: ${JSON.stringify(raw)} [${codes}]`);
+        suspicious++;
+      }
+    }
+    console.log(suspicious === 0 ? "→ 問題のあるcr-idセルなし（全て純ASCII）" : `→ ${suspicious}件の要注意セル`);
+  }
 }
 
 if (args.json) {
@@ -172,6 +202,7 @@ function parseArgs(argv) {
     if (argv[i] === "--sheet") out.sheet = argv[++i];
     else if (argv[i] === "--tab") out.tab = argv[++i];
     else if (argv[i] === "--json") out.json = true;
+    else if (argv[i] === "--dump") out.dump = true;
   }
   return out;
 }

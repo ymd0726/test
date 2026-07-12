@@ -13,7 +13,22 @@ export async function driveAccessToken(saJson: string): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
   if (cachedToken && cachedToken.exp - 60 > now) return cachedToken.token;
 
-  const sa: ServiceAccount = JSON.parse(saJson);
+  if (!saJson) {
+    throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON が未設定です（Cloudflare → Settings → Variables and Secrets で追加してください）");
+  }
+  let sa: ServiceAccount;
+  try {
+    sa = JSON.parse(saJson.replace(/^﻿/, "").trim());
+  } catch {
+    const head = saJson.slice(0, 12).replace(/[\r\n]/g, "⏎");
+    throw new Error(
+      `GOOGLE_SERVICE_ACCOUNT_JSON がJSONとして読めません（先頭: "${head}…" / 長さ${saJson.length}文字）。` +
+        `JSON鍵ファイルの中身を「{」から「}」まで丸ごと貼り直してください`
+    );
+  }
+  if (!sa.client_email || !sa.private_key) {
+    throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON に client_email / private_key がありません。サービスアカウントのJSON鍵か確認してください");
+  }
   const header = b64url(JSON.stringify({ alg: "RS256", typ: "JWT" }));
   const claims = b64url(
     JSON.stringify({

@@ -1,0 +1,50 @@
+name: crサムネ挿入（0:01フレーム / cr入稿くん BUG-34）
+
+# 手動実行。Drive動画から0:01のフレームをffmpegで抽出し、集計表の該当ブロックの
+# 結合セルに「セル内画像」として挿入する。cr入稿くん実行環境(Worker/GAS)は動画デコード
+# 不可のため、ffmpegが使えるこのActions層で「フレーム抽出基盤」を実行する。
+on:
+  workflow_dispatch:
+    inputs:
+      sheet:
+        description: "スプレッドシートID または URL"
+        required: true
+        default: "1oEK8JCJg2NcseWmnxLtfNFCe5A7XGJ_DJSj7c2EW1sg"
+      tab:
+        description: "タブ名（例: kk_mak）"
+        required: true
+        default: "kk_mak"
+      sec:
+        description: "抽出秒（既定 1 = 0:01）"
+        required: false
+        default: "1"
+      jobs:
+        description: '[{"id":"cr83","fileId":"<動画DriveID>"},...]（親cr83には子_01のfileIdを指定）'
+        required: true
+        default: '[]'
+
+jobs:
+  thumbnail:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Ensure ffmpeg
+        run: ffmpeg -version >/dev/null 2>&1 || sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install deps
+        working-directory: scripts/cr-submit
+        run: npm install --no-audit --no-fund
+      - name: Extract & insert thumbnails
+        working-directory: scripts/cr-submit
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SUBMIT_GAS_URL: ${{ secrets.SUBMIT_GAS_URL }}
+        run: |
+          node extract_thumbnail.mjs \
+            --sheet "${{ github.event.inputs.sheet }}" \
+            --tab "${{ github.event.inputs.tab }}" \
+            --gas "$SUBMIT_GAS_URL" \
+            --sec "${{ github.event.inputs.sec }}" \
+            --jobs "${{ github.event.inputs.jobs }}"

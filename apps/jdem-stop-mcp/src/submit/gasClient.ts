@@ -23,7 +23,9 @@ export interface SheetSubmitResult {
   error?: string;
 }
 
-const GAS_TIMEOUT_MS = 25_000;
+// hyd等の巨大シート（1400列超）では copyTo+列グループ再作成が25秒を超えることがある
+// （BUG-24のログで実測: The operation was aborted）。hopはwaitUntil内で走るため60秒まで待つ。
+const GAS_TIMEOUT_MS = 60_000;
 
 export async function callSheetSubmit(
   gasUrl: string,
@@ -47,6 +49,14 @@ export async function callSheetSubmit(
     }
     return (await res.json()) as SheetSubmitResult;
   } catch (e: any) {
+    // タイムアウト中断の場合、GAS側の処理はサーバー側で継続している可能性がある
+    // （クライアント切断ではGAS実行は止まらない）。再実行は同名CRの冪等ガードで安全。
+    if (e.name === "AbortError" || /abort/i.test(String(e.message))) {
+      return {
+        ok: false,
+        error: `GAS応答待ちタイムアウト（${GAS_TIMEOUT_MS / 1000}秒）。処理自体は完了している可能性があるため集計表を確認してください`,
+      };
+    }
     return { ok: false, error: `GAS呼び出し失敗: ${e.message}` };
   } finally {
     clearTimeout(t);

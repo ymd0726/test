@@ -48,7 +48,26 @@
    - `GOOGLE_SERVICE_ACCOUNT_JSON` … Drive読み取り用。ad-analysisと同じ `ads-reader@gtm-ppzfmhfm-nty3y.iam.gserviceaccount.com` を流用可。
      **対象のDrive crフォルダ（例: 運用代行業/n22_jde/cr_jde…）をこのSAに閲覧共有すること**
    - `SELF_URL` … Worker自身のURL（continuation self-fetch用）: `https://jdem-stop-mcp.lead1504.workers.dev`
+     （※実運用では wrangler.jsonc の Service Binding `SELF_WORKER` を使うため未設定でも可）
    - （`SHARED_SECRET` / `META_ACCESS_TOKEN` / `NOTION_TOKEN` / `COMMON_GAS_URL` は既存を流用）
+
+   > **⚠️ META_ACCESS_TOKEN の必須スコープ（cr入稿くんで追加）**
+   > 停止くんは `ads_management` だけで動くが、**入稿（ページ/IGを使う広告creativeの作成）には追加スコープが必須**。
+   > BM → システムユーザー(cr-worker) → 「トークンを生成」で、以下を全て含めて**無期限**で再発行し `META_ACCESS_TOKEN` を更新する:
+   > - `ads_management`（既存・停止用）
+   > - `business_management`（既存）
+   > - **`pages_read_engagement`**（ページを使った広告作成に必須。未付与だと `(#200) ...pages_read_engagement...` エラー）
+   > - `pages_manage_ads`（ページ広告作成）/ `pages_show_list`
+   >
+   > さらに **BM → アカウント → ページ** で対象ページ（例: Hotbeauty+ / page_id=609155522278280）を
+   > システムユーザーに**フルアクセスで割り当て**ること（スコープと割り当ての両方が必要）。
+   > 有効期限は必ず「**期限切れなし（無期限）**」を選ぶ（60日だと自動運用が60日で停止する）。
+   >
+   > **⚠️ Metaアプリを「ライブ」モードに公開すること**（cr入稿くんで追加）
+   > トークン発行元のMetaアプリが「開発モード」だと、広告creativeの新規作成が
+   > `error_subcode 1885183「クリエイティブ投稿は開発モードのアプリにより作成されたものです」` で失敗する。
+   > developers.facebook.com → 対象アプリ → ステータスを **ライブ** に切替（要: プライバシーポリシーURL）。
+   > 自社所有アセットへの操作のためアプリレビューは不要。停止くん（PAUSEのみ）は開発モードでも動くため見落としやすい。
 4. **共通GASに `submitCreative_common.gs` を追加**して doPost ルーティングに2行追記 → 「デプロイを管理 → 新バージョン」でデプロイ（URL維持）
 5. **PROJECTSレジストリに入稿用フィールドを追記**（対象案件のみ）:
 
@@ -128,3 +147,8 @@
 - ファーストカットのサムネイル画像セル挿入は未対応（Driveサムネイル `=IMAGE()` 参照が実現候補）
 - daily/weekly/monthlyタブへの同時展開は `gasTargetsFor()` に対象を足せば可能（初期はmeta系1タブのみ）
 - 実行ログDBのアクション選択肢に「入稿」を追加しておくこと
+- **crフォルダのCLDB管理（横展開時のTODO・山田提案 2026-07-04）**:
+  現在はWorkerレジストリに `driveFolderId` を直書き（案件追加のたびにデプロイが必要）。
+  案件ごとにフォルダ位置が異なるため、横展開時はCLDBに「crフォルダ」プロパティ（DriveフォルダURL）を追加し、
+  Workerが解決フェーズでCLDBから読む方式へ切替える（コードは folderId/folderName 両対応済みのため、
+  CLDB読取関数を1つ足して resolveFolderId に渡すだけで移行可能）。マッピング管理が現場で完結しデプロイ不要になる。

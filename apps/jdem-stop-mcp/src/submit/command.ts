@@ -8,8 +8,9 @@
 // 承認時に再度 resolve してから実行する（Slackのvalue 2000字制限対策＋常に最新状態で実行）。
 
 import { SubmitProject, SubmitEnv } from "./types";
-import { resolveSubmit } from "./resolve";
+import { resolveSubmit, CrPageAmbiguousError } from "./resolve";
 import { startExecution, postProgress } from "./continuation";
+import { setEntityStatus } from "./meta";
 
 interface SlashPayload {
   text: string;
@@ -28,6 +29,9 @@ export function handleCrInCommand(
 ): Response {
   if (!project) {
     return slackEphemeral("このチャンネルは案件レジストリに未登録です（PROJECTSに追加してください）");
+  }
+  if (project.submitBlocked) {
+    return slackEphemeral(`⚠️ この案件は cr入稿くん が未対応です: ${project.submitBlocked}`);
   }
   ctx.waitUntil(resolveAndAsk(payload, project, env, metaTokenFor(project)));
   return slackEphemeral(`🔎 \`${payload.text.trim()}\` の入稿プランを組み立て中…`);
@@ -61,31 +65,57 @@ async function resolveAndAsk(
     const blocks: any[] = [{ type: "section", text: { type: "mrkdwn", text: head } }];
 
     if (outcome.adsetCandidates) {
-      // 広告セット複数 → セットごとに実行ボタン
+      // 広告セット複数 → セットごとに実行ボタン。
+      // 候補は「直近7日間に消化のあったセット」に絞られている（listAdsetCandidates）。
+      // 🟢=配信中(ACTIVE) / ⏸=停止中。消化額の大きい順。
       blocks.push({
         type: "section",
         text: { type: "mrkdwn", text: "入稿先の広告セットを選んでください（コピー元=各セットの直近cr広告）:" },
       });
-      const buttons = outcome.adsetCandidates.slice(0, 5).map((c, i) => ({
+      const buttons: any[] = outcome.adsetCandidates.slice(0, 5).map((c, i) => ({
         type: "button",
-        text: { type: "plain_text", text: truncate(`${c.name}`, 70) },
+        text: {
+          type: "plain_text",
+          text: truncate(
+            `${c.effectiveStatus === "ACTIVE" ? "🟢" : "⏸"} ${c.campaignName ? `${c.campaignName} / ${c.name}` : c.name}`,
+            74
+          ),
+        },
         action_id: `crin_exec_${i}`,
         value: JSON.stringify({ a: payload.text.trim(), ad: c.id, s: c.latestAd!.id }),
-        confirm: confirmDialog(plan.parentName, c.name, c.latestAd!.name),
+        confirm: confirmDialog(plan.parentName, `${c.campaignName || ""} / ${c.name}`, c.latestAd!.name),
       }));
-      blocks.push({ type: "actions", elements: [...buttons, cancelButton()] });
-      if (outcome.adsetCandidates.length > 5) {
-        blocks.push({
-          type: "context",
-          elements: [{ type: "mrkdwn", text: `他 ${outcome.adsetCandidates.length - 5} セットは省略。adsetAllowlistで絞ってください` }],
+      // 表示中の全セットへ同時入稿するボタン（BUG-31）。テキスト類は各セットの直近cr広告からコピー
+      if (outcome.adsetCandidates.length >= 2) {
+        const allNames = outcome.adsetCandidates.map((c) => c.name).join(" / ");
+        buttons.push({
+          type: "button",
+          style: "primary",
+          text: { type: "plain_text", text: `🚀 すべてに入稿（${outcome.adsetCandidates.length}セット）` },
+          action_id: "crin_exec_all",
+          value: JSON.stringify({ a: payload.text.trim(), all: 1 }),
+          confirm: confirmDialog(plan.parentName, truncate(allNames, 120), "各セットの直近cr広告"),
         });
       }
+      blocks.push({ type: "actions", elements: [...buttons, cancelButton()] });
+      const filteredBySpend = outcome.adsetCandidates.some((c) => (c.spend7d ?? 0) > 0);
+      const notes: string[] = [
+        filteredBySpend
+          ? "🟢=配信中 / ⏸=停止中。直近7日間に消化があった広告セットのみ・消化額順"
+          : "直近7日間に消化のある広告セットが無いため、ACTIVEな全セットを表示",
+      ];
+      if (outcome.adsetCandidates.length > 5)
+        notes.push(`他 ${outcome.adsetCandidates.length - 5} セットは省略。adsetAllowlistで絞ってください`);
+      blocks.push({
+        type: "context",
+        elements: [{ type: "mrkdwn", text: notes.join("\n") }],
+      });
     } else {
       blocks.push({
         type: "section",
         text: {
           type: "mrkdwn",
-          text: `入稿先: *${plan.adsetName}*\nコピー元: ${plan.sourceAdName}`,
+          text: `📣 キャンペーン: *${plan.campaignName || "(不明)"}*\n🎯 広告セット: *${plan.adsetName}*\nコピー元: ${plan.sourceAdName}`,
         },
       });
       blocks.push({
@@ -105,6 +135,47 @@ async function resolveAndAsk(
     }
     await respond(payload.response_url, { blocks, response_type: "in_channel" });
   } catch (e: any) {
+    if (e instanceof CrPageAmbiguousError) {
+      // CRDB候補が複数 → エラーで止めず、ページ選択ボタンを出す（BUG-27）。
+      // 選択後は pageId で再解決するので、以降は通常フローと同じ。
+      const buttons: any[] = e.candidates.slice(0, 5).map((c, i) => ({
+        type: "button",
+        text: { type: "plain_text", text: truncate(c.name || "(無題)", 74) },
+        action_id: `crin_pick_${i}`,
+        value: JSON.stringify({ p: c.pageId }),
+      }));
+      // 全候補をまとめて入稿したいケース（cr83_01/cr83_02のような兄弟ページ。BUG-31続報）:
+      // 各ページの入稿プランを順に表示する。実行ボタンはプランごとに出るので誤爆しない
+      if (e.candidates.length >= 2) {
+        buttons.push({
+          type: "button",
+          style: "primary",
+          text: { type: "plain_text", text: `📤 すべての入稿プランを表示（${Math.min(e.candidates.length, 5)}件）` },
+          action_id: "crin_pick_all",
+          value: JSON.stringify({ ps: e.candidates.slice(0, 5).map((c) => c.pageId) }),
+        });
+      }
+      const blocks: any[] = [
+        {
+          type: "section",
+          text: { type: "mrkdwn", text: `🔀 Notion CRDBに \`${payload.text.trim()}\` の候補が複数あります。入稿対象を選んでください:` },
+        },
+        { type: "actions", elements: [...buttons, cancelButton()] },
+        {
+          type: "context",
+          elements: [
+            {
+              type: "mrkdwn",
+              text:
+                (e.candidates.length > 5 ? `他 ${e.candidates.length - 5} 件は省略（NotionページURL指定で対応）。` : "") +
+                "「すべての入稿プランを表示」は候補ごとにプラン確認→実行ボタンを出します。不要な重複ページをNotion側で削除/リネームすると、次回からこの選択は不要になります",
+            },
+          ],
+        },
+      ];
+      await respond(payload.response_url, { blocks, response_type: "ephemeral" });
+      return;
+    }
     await respond(payload.response_url, {
       text: `❌ ${e.message}`,
       response_type: "ephemeral",
@@ -138,9 +209,77 @@ export function handleCrInInteraction(
       ctx.waitUntil(respond(responseUrl, { text: "案件が特定できません", replace_original: true }));
       return new Response("", { status: 200 });
     }
-    const v = JSON.parse(action.value) as { a: string; ad: string; s: string };
+    const v = JSON.parse(action.value) as { a: string; ad?: string; s?: string; all?: number };
     ctx.waitUntil(
       confirmAndRun(v, interaction, project, env, ctx, metaTokenFor(project), gasTargetsFor(project))
+    );
+    return new Response("", { status: 200 });
+  }
+
+  if (action.action_id === "crin_actparent") {
+    // 停止中の広告セット/キャンペーンをON（BUG-33）。確認ダイアログ通過後にここへ来る
+    if (!project) {
+      ctx.waitUntil(respond(responseUrl, { text: "案件が特定できません", replace_original: true }));
+      return new Response("", { status: 200 });
+    }
+    const va = JSON.parse(action.value) as { p: { a: string; c: string }[] };
+    ctx.waitUntil(activateParents(va.p, project, env, metaTokenFor(project), responseUrl));
+    return new Response("", { status: 200 });
+  }
+
+  if (action.action_id === "crin_pick_all") {
+    // CRDB候補の全ページ入稿（BUG-31続報）: 各ページの入稿プランを順に組み立てて表示する。
+    // 実行ボタンはプランごとに出るため、ユーザーが1件ずつ確認して実行する
+    if (!project) {
+      ctx.waitUntil(respond(responseUrl, { text: "案件が特定できません", replace_original: true }));
+      return new Response("", { status: 200 });
+    }
+    if (project.submitBlocked) {
+      ctx.waitUntil(
+        respond(responseUrl, { text: `⚠️ この案件は cr入稿くん が未対応です: ${project.submitBlocked}`, replace_original: true })
+      );
+      return new Response("", { status: 200 });
+    }
+    const va = JSON.parse(action.value) as { ps: string[] };
+    const base = {
+      channel_id: interaction.channel?.id || interaction.container?.channel_id || "",
+      user_id: interaction.user?.id || "",
+      response_url: responseUrl,
+    };
+    ctx.waitUntil(
+      (async () => {
+        await respond(responseUrl, { text: `🔎 ${va.ps.length}件の入稿プランを順に組み立て中…`, replace_original: true });
+        for (const p of va.ps) {
+          await resolveAndAsk({ ...base, text: p }, project, env, metaTokenFor(project));
+        }
+      })()
+    );
+    return new Response("", { status: 200 });
+  }
+
+  if (action.action_id.startsWith("crin_pick_")) {
+    // CRDB候補選択（BUG-27）: 選んだpageIdを引数にして通常の解決フローへ入り直す
+    if (!project) {
+      ctx.waitUntil(respond(responseUrl, { text: "案件が特定できません", replace_original: true }));
+      return new Response("", { status: 200 });
+    }
+    if (project.submitBlocked) {
+      ctx.waitUntil(
+        respond(responseUrl, { text: `⚠️ この案件は cr入稿くん が未対応です: ${project.submitBlocked}`, replace_original: true })
+      );
+      return new Response("", { status: 200 });
+    }
+    const v = JSON.parse(action.value) as { p: string };
+    const payload: SlashPayload = {
+      text: v.p, // pageId（resolveSubmitのURL/ID直指定経路に乗る）
+      channel_id: interaction.channel?.id || interaction.container?.channel_id || "",
+      user_id: interaction.user?.id || "",
+      response_url: responseUrl,
+    };
+    ctx.waitUntil(
+      respond(responseUrl, { text: "🔎 選択したページで入稿プランを組み立て中…", replace_original: true }).then(() =>
+        resolveAndAsk(payload, project, env, metaTokenFor(project))
+      )
     );
     return new Response("", { status: 200 });
   }
@@ -148,7 +287,7 @@ export function handleCrInInteraction(
 }
 
 async function confirmAndRun(
-  v: { a: string; ad: string; s: string },
+  v: { a: string; ad?: string; s?: string; all?: number },
   interaction: any,
   project: SubmitProject,
   env: SubmitEnv,
@@ -158,6 +297,7 @@ async function confirmAndRun(
 ): Promise<void> {
   const responseUrl = interaction.response_url;
   try {
+    if (project.submitBlocked) throw new Error(`この案件は cr入稿くん が未対応です: ${project.submitBlocked}`);
     await respond(responseUrl, { text: "🔎 最新状態を確認して実行します…", replace_original: true });
     // 承認時に再解決（ボタン表示中に状況が変わっていても最新で実行）
     const outcome = await resolveSubmit(project, env, metaToken, {
@@ -167,20 +307,86 @@ async function confirmAndRun(
       responseUrl,
     });
     const plan = outcome.plan!;
-    plan.adsetId = v.ad;
-    const chosen = (outcome.adsetCandidates || []).find((c) => c.id === v.ad);
-    if (chosen) {
-      plan.adsetName = chosen.name;
-      plan.sourceAdId = chosen.latestAd!.id;
-      plan.sourceAdName = chosen.latestAd!.name;
-    } else if (!plan.sourceAdId) {
-      plan.sourceAdId = v.s;
-      plan.sourceAdName = "(直近cr広告)";
+    plan.userName = interaction.user?.username || interaction.user?.name || ""; // 実行ログDB用（TOOL-40）
+    const cands = (outcome.adsetCandidates || []).filter((c) => c.latestAd);
+    if (v.all) {
+      // 「すべてに入稿」（BUG-31）: 表示された全候補セットをターゲットにする。
+      // 再解決の結果1セットに減っていた場合はそのまま単一入稿になる
+      if (cands.length === 0 && !plan.adsetId)
+        throw new Error("入稿先の広告セット候補が見つかりません（状況が変わった可能性）。もう一度 /cr-in を実行してください");
+      if (cands.length > 0) {
+        plan.targets = cands.map((c) => ({
+          adsetId: c.id,
+          adsetName: c.name,
+          campaignName: c.campaignName,
+          sourceAdId: c.latestAd!.id,
+          sourceAdName: c.latestAd!.name,
+        }));
+        const first = plan.targets[0];
+        plan.adsetId = first.adsetId;
+        plan.adsetName = first.adsetName;
+        plan.campaignName = first.campaignName;
+        plan.sourceAdId = first.sourceAdId;
+        plan.sourceAdName = first.sourceAdName;
+      }
+    } else {
+      plan.adsetId = v.ad!;
+      const chosen = cands.find((c) => c.id === v.ad);
+      if (chosen) {
+        plan.adsetName = chosen.name;
+        plan.campaignName = chosen.campaignName;
+        plan.sourceAdId = chosen.latestAd!.id;
+        plan.sourceAdName = chosen.latestAd!.name;
+      } else if (!plan.sourceAdId) {
+        plan.sourceAdId = v.s!;
+        plan.sourceAdName = "(直近cr広告)";
+      }
     }
     if (!project.metaAdAccountId) throw new Error("metaAdAccountId未設定");
     await startExecution(plan, env, ctx, metaToken, project.metaAdAccountId, gasTargets);
   } catch (e: any) {
-    await postProgress(responseUrl, `❌ 実行開始に失敗しました: ${e.message}`);
+    await postProgress(
+      env,
+      {
+        channelId: interaction.channel?.id || interaction.container?.channel_id,
+        userId: interaction.user?.id,
+        responseUrl,
+      },
+      `❌ 実行開始に失敗しました: ${e.message}`
+    );
+  }
+}
+
+/**
+ * 停止中の広告セット/キャンペーンをONにする（BUG-33）。キャンペーン→広告セットの順（上位から）。
+ * 同じIDは1回だけ。結果をresponse_urlで返す。
+ */
+async function activateParents(
+  pairs: { a: string; c: string }[],
+  project: SubmitProject,
+  env: SubmitEnv,
+  metaToken: string,
+  responseUrl: string
+): Promise<void> {
+  try {
+    const campaigns = [...new Set(pairs.map((p) => p.c).filter(Boolean))];
+    const adsets = [...new Set(pairs.map((p) => p.a).filter(Boolean))];
+    const done: string[] = [];
+    const failed: string[] = [];
+    for (const c of campaigns) {
+      try { await setEntityStatus(c, metaToken, "ACTIVE"); done.push(`cp:${c}`); }
+      catch (e: any) { failed.push(`cp:${c}(${e.message})`); }
+    }
+    for (const a of adsets) {
+      try { await setEntityStatus(a, metaToken, "ACTIVE"); done.push(`adset:${a}`); }
+      catch (e: any) { failed.push(`adset:${a}(${e.message})`); }
+    }
+    const parts: string[] = [];
+    if (done.length) parts.push(`✅ ONにしました: ${done.join(" / ")}`);
+    if (failed.length) parts.push(`❌ 失敗: ${failed.join(" / ")}`);
+    await respond(responseUrl, { text: parts.join("\n") || "対象がありませんでした", replace_original: true });
+  } catch (e: any) {
+    await respond(responseUrl, { text: `❌ 上位のON化に失敗しました: ${e.message}`, replace_original: true });
   }
 }
 

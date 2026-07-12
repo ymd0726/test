@@ -21,13 +21,18 @@ import {
   transferVideoChunk,
   finishVideoUpload,
   videoStatus,
+  getVideoThumbnailUrl,
   getSourceCreativeSpec,
+  getOrCreatePageBackedIg,
   buildCreativeParams,
   createCreative,
   createAd,
+  setEntityStatus,
+  getAdsetParentStatus,
 } from "./meta";
 import { callSheetSubmit } from "./gasClient";
 import { markSubmitted } from "./notion";
+import { createRunLog, updateRunLog } from "../check/runlog";
 
 export const CONTINUE_PATH = "/internal/cr-in/continue";
 
@@ -41,7 +46,27 @@ export async function startExecution(
   gasTargets: { spreadsheetId: string; sheetName?: string }[]
 ): Promise<void> {
   const state: ContinuationState = { step: "upload", index: 0, attempts: 0, plan, startedAt: Date.now() };
-  await postProgress(plan.responseUrl, `🚀 入稿を開始します: *${plan.parentName}*（動画 ${plan.videos.length} 本）`);
+  // 実行ログDB（TOOL-40）: 開始時に「実行中」で作成。翌朝チェックの照合キー（親cr/子cr/入稿先）も先に記録する
+  const runDetail = {
+    parentSheetId: sheetParentId(plan),
+    childSheetIds: plan.videos.map((v) => v.sheetId).filter((sid) => /cr\d+_\d{2}/i.test(sid)),
+  };
+  (plan as any)._runDetail = runDetail;
+  plan.runLogPageId = await createRunLog(env.NOTION_TOKEN, {
+    tool: "cr入稿くん",
+    action: "入稿",
+    project: plan.project,
+    crName: plan.parentName,
+    userName: plan.userName,
+    userId: plan.userId,
+    route: "Slack",
+    adsetIds: plan.targets?.length ? plan.targets.map((t) => t.adsetId) : [plan.adsetId],
+    sheetTabs: gasTargets.map((t) => t.sheetName || "").filter(Boolean),
+    notionCrPageId: plan.notionPageId,
+    detail: runDetail,
+  });
+  const logWarn = !plan.runLogPageId && env.NOTION_TOKEN ? "\n⚠️ 実行ログの記録に失敗（翌日自動チェックの対象外になります）" : "";
+  await postProgress(env, plan, `🚀 入稿を開始します: *${plan.parentName}*（動画 ${plan.videos.length} 本）${logWarn}`);
   ctx.waitUntil(runHop(state, env, metaToken, projectAccountId, gasTargets));
 }
 
@@ -86,10 +111,7 @@ async function runHop(
     switch (state.step) {
       case "upload": {
         const v = plan.videos[state.index];
-        await postProgress(
-          plan.responseUrl,
-          `⏳ ${v.adName} をアップロード中… (${state.index + 1}/${plan.videos.length})`
-        );
+        await postProgress(env, plan, `⏳ ${v.adName} をアップロード中… (${state.index + 1}/${plan.videos.length})`);
         const driveToken = await driveAccessToken(env.GOOGLE_SERVICE_ACCOUNT_JSON);
         let session = await startVideoUpload(accountId, metaToken, v.fileSizeBytes);
         while (session.startOffset < v.fileSizeBytes) {
@@ -103,8 +125,21 @@ async function runHop(
       }
 
       case "wait_ready": {
+        // 1ホップで最大4回チェック（5秒間隔）。連鎖ホップ数を抑える（Service Bindingのネスト上限対策）
         const v = plan.videos[state.index];
-        const status = await videoStatus(v.videoId!, metaToken);
+        let status = "";
+        for (let i = 0; i < 4; i++) {
+          status = await videoStatus(v.videoId!, metaToken);
+          state.attempts += 1;
+          if (status === "ready" || status === "error") break;
+          if (state.attempts > MAX_READY_ATTEMPTS) {
+            throw new Error(`動画 ${v.adName} の処理待ちがタイムアウトしました (video_id=${v.videoId})`);
+          }
+          await sleep(5000);
+        }
+        if (status === "error") {
+          throw new Error(`動画 ${v.adName} の処理がMeta側でエラーになりました (video_id=${v.videoId})`);
+        }
         if (status === "ready") {
           if (state.index + 1 < plan.videos.length) {
             state.index += 1;
@@ -112,45 +147,131 @@ async function runHop(
           } else {
             state.step = "create_ads";
           }
-        } else if (status === "error") {
-          throw new Error(`動画 ${v.adName} の処理がMeta側でエラーになりました (video_id=${v.videoId})`);
-        } else {
-          state.attempts += 1;
-          if (state.attempts > MAX_READY_ATTEMPTS) {
-            throw new Error(`動画 ${v.adName} の処理待ちがタイムアウトしました (video_id=${v.videoId})`);
-          }
-          await sleep(5000);
         }
         break;
       }
 
       case "create_ads": {
-        await postProgress(plan.responseUrl, `🛠️ 広告を作成中…（コピー元: ${plan.sourceAdName}）`);
-        const source = await getSourceCreativeSpec(plan.sourceAdId, metaToken);
+        // 入稿先ターゲット（複数広告セット同時入稿=BUG-31 対応。未設定時は従来の単一入稿）
+        const targets = plan.targets?.length
+          ? plan.targets
+          : [{ adsetId: plan.adsetId, adsetName: plan.adsetName, campaignName: plan.campaignName, sourceAdId: plan.sourceAdId, sourceAdName: plan.sourceAdName }];
+        await postProgress(
+          env,
+          plan,
+          targets.length > 1
+            ? `🛠️ 広告を作成中…（${targets.length}セットに入稿: ${targets.map((t) => t.adsetName).join(" / ")}）`
+            : `🛠️ 広告を作成中…（コピー元: ${plan.sourceAdName}）`
+        );
+        // サムネイルは動画ごとに1回だけ取得してターゲット間で使い回す
+        const thumbs = new Map<string, string>();
         for (const v of plan.videos) {
-          if (v.adId) continue; // 再実行時のスキップ
-          const crParam = v.sheetId.match(/cr\d+(?:_\d{2})?/i)?.[0] || plan.crKey;
-          const params = buildCreativeParams(source, {
-            adName: v.adName,
-            videoId: v.videoId!,
-            crParam,
-            overrides: plan.overrides,
-          });
-          v.creativeId = await createCreative(accountId, metaToken, params);
-          v.adId = await createAd(accountId, metaToken, {
-            name: v.adName,
-            adsetId: plan.adsetId,
-            creativeId: v.creativeId,
-          });
+          const thumbnailUrl = await getVideoThumbnailUrl(v.videoId!, metaToken);
+          if (!thumbnailUrl) {
+            throw new Error(`動画 ${v.adName} のサムネイルがまだ生成されていません（video_id=${v.videoId}）。少し待って同じ /cr-in を再実行してください`);
+          }
+          thumbs.set(v.videoId!, thumbnailUrl);
         }
+        let igActorId: string | undefined; // 1815199リトライで解決したPBIAを2本目以降にも使い回す
+        for (const t of targets) {
+          // テキスト類は「そのセットの直近cr広告」からコピー（セットごとにspec取得）
+          const source = await getSourceCreativeSpec(t.sourceAdId, metaToken);
+          for (const v of plan.videos) {
+            v.adIdsByAdset = v.adIdsByAdset || {};
+            if (v.adIdsByAdset[t.adsetId]) continue; // 再実行時のスキップ（作成済みペア）
+            const crParam = v.sheetId.match(/cr\d+(?:_\d{2})?/i)?.[0] || plan.crKey;
+            const buildParams = (ig?: string) =>
+              buildCreativeParams(source, {
+                adName: v.adName,
+                videoId: v.videoId!,
+                thumbnailUrl: thumbs.get(v.videoId!)!,
+                crParam,
+                overrides: plan.overrides,
+                instagramActorId: ig,
+              });
+            try {
+              v.creativeId = await createCreative(accountId, metaToken, buildParams(igActorId));
+            } catch (e: any) {
+              // IGアクセス権エラー(1815199) → ページ由来IG(PBIA)のIDを取得して明示指定でリトライ
+              if (!/1815199/.test(String(e.message)) ) throw e;
+              const pageId = source.object_story_spec?.page_id;
+              if (!pageId) throw e;
+              await postProgress(env, plan, `ℹ️ IG権限エラーのため、ページ由来IG（PBIA）を取得して再試行します…（page_id=${pageId}）`);
+              igActorId = await getOrCreatePageBackedIg(String(pageId), metaToken);
+              await postProgress(env, plan, `ℹ️ PBIA取得: ${igActorId}。再試行中…`);
+              v.creativeId = await createCreative(accountId, metaToken, buildParams(igActorId));
+            }
+            const adId = await createAd(accountId, metaToken, {
+              name: v.adName,
+              adsetId: t.adsetId,
+              creativeId: v.creativeId,
+            });
+            v.adIdsByAdset[t.adsetId] = adId;
+            if (!v.adId) v.adId = adId;
+          }
+        }
+        state.step = "activate";
+        break;
+      }
+
+      case "activate": {
+        // 一気通貫: 作成した広告を全てONにする（BUG-33）。広告セット/キャンペーンは勝手にONにしない。
+        const adIds: string[] = [];
+        for (const v of plan.videos) {
+          for (const k of Object.keys(v.adIdsByAdset || {})) adIds.push(v.adIdsByAdset![k]);
+        }
+        await postProgress(env, plan, `▶️ 作成した広告 ${adIds.length}件をONにしています…`);
+        for (const id of adIds) {
+          try {
+            await setEntityStatus(id, metaToken, "ACTIVE");
+          } catch (e: any) {
+            (plan as any)._activateWarn = ((plan as any)._activateWarn || "") + `広告${id}のON化失敗: ${e.message}; `;
+          }
+        }
+        // 入稿先の広告セット/キャンペーンがOFFなら、完了時に「ONにするか」確認ボタンを出す
+        const targets = plan.targets?.length
+          ? plan.targets
+          : [{ adsetId: plan.adsetId, adsetName: plan.adsetName, campaignName: plan.campaignName, sourceAdId: plan.sourceAdId, sourceAdName: plan.sourceAdName }];
+        const seenAdsets = new Set<string>();
+        const offParents: any[] = [];
+        for (const t of targets) {
+          if (seenAdsets.has(t.adsetId)) continue;
+          seenAdsets.add(t.adsetId);
+          try {
+            const st = await getAdsetParentStatus(t.adsetId, metaToken);
+            const adsetOff = st.adsetStatus !== "ACTIVE";
+            const campOff = !!st.campaignStatus && st.campaignStatus !== "ACTIVE";
+            if (adsetOff || campOff) {
+              offParents.push({
+                adsetId: t.adsetId,
+                adsetName: st.adsetName || t.adsetName,
+                adsetOff,
+                campaignId: st.campaignId,
+                campaignName: st.campaignName || t.campaignName,
+                campOff,
+              });
+            }
+          } catch {
+            /* 状態取得失敗は致命ではない。確認ボタンを出さず完了する */
+          }
+        }
+        (plan as any)._offParents = offParents;
+        // 実行ログ: Meta段階の結果（作成した全広告ID・ON化警告）を記録
+        await updateRunLog(env.NOTION_TOKEN, plan.runLogPageId, {
+          metaResult: (plan as any)._activateWarn ? "失敗" : "成功",
+          adIds,
+        });
         state.step = "sheet";
         break;
       }
 
       case "sheet": {
-        await postProgress(plan.responseUrl, "📊 集計表にCR00ブロックを展開中…");
+        await postProgress(env, plan, "📊 集計表にCR00ブロックを展開中…");
+        // 集計内(親)ブロックは常に cr番号のみ（例 cr83）。パターン番号(_01/_02)や説明は付けない（BUG-32）。
+        // パターン番号を持つ動画は集計外(子)ブロックとして展開する。単独入稿でも cr83_01 は
+        // 「親cr83 / 子cr83_01」になる。パターン無し(cr82等)は親ブロックのみ（子なし単独CR）。
         const parentSheetId = sheetParentId(plan);
-        const childIds = plan.hasChildren ? plan.videos.map((v) => v.sheetId) : [];
+        const childIds = plan.videos.map((v) => v.sheetId).filter((sid) => /cr\d+_\d{2}/i.test(sid));
         const results: string[] = [];
         for (const t of gasTargets) {
           const r = await callSheetSubmit(env.SUBMIT_GAS_URL || env.COMMON_GAS_URL, {
@@ -161,9 +282,14 @@ async function runHop(
             childIds,
             dryRun: false,
           });
-          results.push(r.ok ? `${t.sheetName || t.spreadsheetId}: ✅` : `${t.sheetName || t.spreadsheetId}: ❌ ${r.error}`);
+          results.push(r.ok ? `${t.sheetName || t.spreadsheetId}` : `${t.sheetName || t.spreadsheetId} ❌ ${r.error}`);
         }
         (plan as any)._sheetResults = results;
+        // 実行ログ: 集計表段階の結果
+        await updateRunLog(env.NOTION_TOKEN, plan.runLogPageId, {
+          sheetResult: results.some((r) => r.includes("❌")) ? "失敗" : "成功",
+          sheetTabs: gasTargets.map((t) => t.sheetName || "").filter(Boolean),
+        });
         state.step = "notion";
         break;
       }
@@ -174,29 +300,79 @@ async function runHop(
           notionWarn = await markSubmitted(env.NOTION_TOKEN, plan.notionPageId);
         }
         (plan as any)._notionWarn = notionWarn;
+        await updateRunLog(env.NOTION_TOKEN, plan.runLogPageId, {
+          notionResult: !plan.notionPageId ? "対象なし" : notionWarn ? "失敗" : "成功",
+        });
         state.step = "done";
         break;
       }
 
       case "done": {
+        const sheetNames = ((plan as any)._sheetResults || []).join(" / ") || "対象なし";
+        const notionLine = (plan as any)._notionWarn
+          ? `:warning: Notion： ${(plan as any)._notionWarn}`
+          : ":white_check_mark: Notion： 入稿済み";
+        const multi = plan.targets && plan.targets.length > 1 ? plan.targets : null;
+        const cpLine = multi
+          ? [...new Set(multi.map((t) => t.campaignName).filter(Boolean))].join(" / ")
+          : plan.campaignName;
+        const adsetLine = multi ? multi.map((t) => t.adsetName).join(" / ") : plan.adsetName;
+        const activateWarn: string = (plan as any)._activateWarn || "";
+        const offParents: any[] = (plan as any)._offParents || [];
+        // 一気通貫ON（BUG-33）: 広告はON化済み。ON化に失敗した広告があれば警告表示
+        const crSuffix = activateWarn
+          ? multi ? `（一部ON化失敗×${multi.length}セット）` : "（一部ON化失敗）"
+          : multi ? `（*ON*×${multi.length}セット）` : "（*ON*）";
         const lines = [
-          `✅ *入稿が完了しました: ${plan.parentName}*`,
+          `:mega: 入稿が完了しました: ${plan.parentName}`,
           "",
-          ...plan.videos.map((v) => `・${v.adName}\n    video_id: \`${v.videoId}\` / ad_id: \`${v.adId}\`（*PAUSED*）`),
-          "",
-          `📊 集計表: ${((plan as any)._sheetResults || []).join(" / ") || "対象なし"}`,
-          (plan as any)._notionWarn ? `⚠️ ${(plan as any)._notionWarn}` : "📝 Notionステータス: 入稿済み",
-          "",
-          "👉 最終確認のうえ、広告マネージャで広告をONにしてください。",
+          `:white_check_mark: cp　：${cpLine || "(不明)"}`,
+          `:white_check_mark: adset：${adsetLine || "(不明)"}${multi ? `（${multi.length}セット同時入稿）` : ""}`,
+          ...plan.videos.map((v) => `:white_check_mark: cr　：${v.adName}${crSuffix}`),
+          `:white_check_mark: 集計表： ${sheetNames}`,
+          notionLine,
         ];
-        await postProgress(plan.responseUrl, lines.join("\n"));
+        if (activateWarn) lines.push(`:warning: ${activateWarn}`);
+        if (offParents.length === 0) {
+          lines.push("", ":rocket: 広告はONにしました。配信が開始されます（最終確認をお願いします）。");
+        } else {
+          // 広告セット/キャンペーンがOFF → 勝手にONにしない。確認ボタンで許可を取る（BUG-33）
+          const names = offParents
+            .map((p) => `・${p.campOff ? `cp「${p.campaignName || p.campaignId}」` : ""}${p.adsetOff ? `${p.campOff ? " / " : ""}adset「${p.adsetName}」` : ""}（OFF）`)
+            .join("\n");
+          lines.push(
+            "",
+            ":warning: 広告はONにしましたが、上位が停止中のため *このままでは配信されません* :",
+            names
+          );
+        }
+        // 実行ログ: 最終ステータス（どこかで警告/失敗があれば一部失敗）
+        await updateRunLog(env.NOTION_TOKEN, plan.runLogPageId, {
+          status: activateWarn || (plan as any)._notionWarn || sheetNames.includes("❌") ? "一部失敗" : "完了",
+        });
+        if (!plan.runLogPageId && env.NOTION_TOKEN) {
+          lines.push(":warning: 実行ログの記録に失敗（翌日自動チェックの対象外になります）");
+        }
+        // 完了通知はチャンネル向け1通のみ（BUG-24）。public投稿に失敗した場合だけephemeralで代替する。
+        const posted = await postPublic(env, plan.channelId, lines.join("\n"));
+        if (!posted) await postProgress(env, plan, lines.join("\n"));
+        // OFF親があれば、操作者にだけ「ONにするか」の確認ボタンを出す（勝手にONにしない）
+        if (offParents.length > 0) {
+          await postParentActivatePrompt(env, plan, offParents);
+        }
         return; // 連鎖終了
       }
     }
     await chainNext(state, env);
   } catch (e: any) {
+    // 実行ログ: 失敗で確定（どのステップで死んだかを機械可読で残す→翌朝チェック/自動改修の入力）
+    await updateRunLog(env.NOTION_TOKEN, plan.runLogPageId, {
+      status: "失敗",
+      detail: { ...((plan as any)._runDetail || {}), failedStep: state.step, lastError: String(e.message || e).slice(0, 500) },
+    });
     await postProgress(
-      plan.responseUrl,
+      env,
+      plan,
       `❌ 入稿処理でエラーが発生しました（step=${state.step}）: ${e.message}\n` +
         `ここまでの作成物: ${plan.videos
           .filter((v) => v.videoId)
@@ -206,33 +382,165 @@ async function runHop(
   }
 }
 
-/** 次のホップを自分自身へPOST（署名付き） */
+/**
+ * 広告セット/キャンペーンがOFFのとき、操作者にだけ「ONにするか」の確認ボタンを出す（BUG-33）。
+ * 勝手にはONにしない。ボタン押下（+確認ダイアログ）で crin_actparent アクションが発火する。
+ */
+async function postParentActivatePrompt(
+  env: SubmitEnv,
+  plan: SubmitPlan,
+  offParents: any[]
+): Promise<void> {
+  if (!env.SLACK_BOT_TOKEN || !plan.channelId || !plan.userId) return;
+  // ボタンvalueはSlackの2000字制限に収めるため最小限（adsetId/campaignIdのみ）
+  const payload = offParents.map((p) => ({
+    a: p.adsetOff ? p.adsetId : "",
+    c: p.campOff ? p.campaignId : "",
+  }));
+  const summary = offParents
+    .map((p) => `${p.campOff ? `cp「${p.campaignName || p.campaignId}」` : ""}${p.adsetOff ? `${p.campOff ? "／" : ""}adset「${p.adsetName}」` : ""}`)
+    .join("、");
+  const blocks = [
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `⚠️ 停止中の上位（${summary}）をONにしますか？\nONにすると配信が開始され予算が動きます。広告セット/キャンペーンは自動ではONにしていません。`,
+      },
+    },
+    {
+      type: "actions",
+      elements: [
+        {
+          type: "button",
+          style: "primary",
+          text: { type: "plain_text", text: "▶️ 上位もONにする" },
+          action_id: "crin_actparent",
+          value: JSON.stringify({ p: payload }),
+          confirm: {
+            title: { type: "plain_text", text: "上位のON化" },
+            text: { type: "mrkdwn", text: `${summary} をONにします。配信が開始され予算が動きます。よろしいですか？` },
+            confirm: { type: "plain_text", text: "ONにする" },
+            deny: { type: "plain_text", text: "やめる" },
+          },
+        },
+        { type: "button", text: { type: "plain_text", text: "そのまま（OFFのまま）" }, action_id: "crin_cancel", value: "cancel" },
+      ],
+    },
+  ];
+  try {
+    await fetch("https://slack.com/api/chat.postEphemeral", {
+      method: "POST",
+      headers: { "content-type": "application/json; charset=utf-8", authorization: `Bearer ${env.SLACK_BOT_TOKEN}` },
+      body: JSON.stringify({ channel: plan.channelId, user: plan.userId, blocks, text: "停止中の上位をONにしますか？" }),
+    });
+  } catch {
+    /* 確認ボタンの投稿失敗は致命ではない */
+  }
+}
+
+/**
+ * 次のホップを自分自身へPOST（署名付き）。
+ * Workerは自分の公開URLをfetchできない（edgeが404を返す）ため、
+ * Service Binding（SELF_WORKER）経由で内部直結する。バインディング未設定時のみ公開URLを試す。
+ */
 async function chainNext(state: ContinuationState, env: SubmitEnv): Promise<void> {
   const body = JSON.stringify(state);
   const sig = await signHmac(env.SHARED_SECRET, body);
-  const res = await fetch(`${env.SELF_URL}${CONTINUE_PATH}`, {
+  const init: RequestInit = {
     method: "POST",
     headers: { "content-type": "application/json", "x-continuation-signature": sig },
     body,
-  });
+  };
+  const res = env.SELF_WORKER
+    ? await env.SELF_WORKER.fetch(`https://self${CONTINUE_PATH}`, init)
+    : await fetch(`${env.SELF_URL}${CONTINUE_PATH}`, init);
   if (!res.ok) throw new Error(`continuation連鎖失敗: ${res.status}`);
 }
 
 function sheetParentId(plan: SubmitPlan): string {
-  // 親の集計表表記: cr79_説明（ファイル名から案件コードを除いたもの。子しか無い場合は子から親名を導出）
-  const i = plan.parentName.search(/cr\d/i);
-  return i >= 0 ? plan.parentName.slice(i) : plan.parentName;
+  // 集計内(親)ブロックの表記は cr番号のみ（例 cr83）。パターン番号(_01/_02)も説明も付けない（BUG-32）。
+  // plan.crKey は resolve.ts で抽出済みの「cr83」なのでそれを使う。
+  const m = plan.crKey.match(/cr\d+/i);
+  return m ? m[0].toLowerCase() : plan.crKey.toLowerCase();
 }
 
-export async function postProgress(responseUrl: string, text: string): Promise<void> {
+/**
+ * 進捗表示。Slackのresponse_urlは「30分以内・5回まで」の制限があり、
+ * 進捗が多いと途中から黙って捨てられる（実際に発生）。
+ * そのためBotトークンでのephemeral投稿を優先し、失敗時のみresponse_urlに落とす。
+ */
+export async function postProgress(
+  env: { SLACK_BOT_TOKEN?: string },
+  to: { channelId?: string; userId?: string; responseUrl: string },
+  text: string
+): Promise<void> {
+  if (env.SLACK_BOT_TOKEN && to.channelId && to.userId) {
+    try {
+      const post = () =>
+        fetch("https://slack.com/api/chat.postEphemeral", {
+          method: "POST",
+          headers: { "content-type": "application/json; charset=utf-8", authorization: `Bearer ${env.SLACK_BOT_TOKEN}` },
+          body: JSON.stringify({ channel: to.channelId, user: to.userId, text }),
+        }).then((r) => r.json() as Promise<any>);
+      let data = await post();
+      if (!data.ok && data.error === "not_in_channel") {
+        // Botが未参加のチャンネル（BUG-29: rclで進捗が全滅した）→ 参加を試みて1回だけ再送。
+        // conversations.joinはpublicチャンネルのみ有効。失敗時はresponse_urlへフォールバック
+        if (await joinChannel(env.SLACK_BOT_TOKEN, to.channelId)) data = await post();
+      }
+      if (data.ok) return;
+    } catch {
+      /* fallthrough */
+    }
+  }
   try {
-    await fetch(responseUrl, {
+    await fetch(to.responseUrl, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ text, response_type: "in_channel", replace_original: false }),
+      body: JSON.stringify({ text, response_type: "ephemeral", replace_original: false }),
     });
   } catch {
     // 進捗表示の失敗は本処理を止めない
+  }
+}
+
+/** Botをpublicチャンネルへ参加させる（not_in_channel対策）。成功可否を返す */
+async function joinChannel(botToken: string, channelId: string): Promise<boolean> {
+  try {
+    const res = await fetch("https://slack.com/api/conversations.join", {
+      method: "POST",
+      headers: { "content-type": "application/json; charset=utf-8", authorization: `Bearer ${botToken}` },
+      body: JSON.stringify({ channel: channelId }),
+    });
+    const data: any = await res.json();
+    return !!data.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * チャンネル全員向けの通知（完了サマリー用。停止くんのnotifySlackと同挙動）。
+ * 成功したかを返す（失敗時は呼び出し側がephemeralで代替できるように）。
+ */
+async function postPublic(env: { SLACK_BOT_TOKEN?: string }, channelId: string, text: string): Promise<boolean> {
+  if (!env.SLACK_BOT_TOKEN || !channelId) return false;
+  try {
+    const post = () =>
+      fetch("https://slack.com/api/chat.postMessage", {
+        method: "POST",
+        headers: { "content-type": "application/json; charset=utf-8", authorization: `Bearer ${env.SLACK_BOT_TOKEN}` },
+        body: JSON.stringify({ channel: channelId, text }),
+      }).then((r) => r.json() as Promise<any>);
+    let data = await post();
+    if (!data.ok && data.error === "not_in_channel") {
+      // Bot未参加チャンネル → 参加を試みて1回だけ再送（BUG-29）
+      if (await joinChannel(env.SLACK_BOT_TOKEN, channelId)) data = await post();
+    }
+    return !!data.ok;
+  } catch {
+    return false; // 通知失敗は本処理を止めない
   }
 }
 

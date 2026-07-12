@@ -13,6 +13,10 @@ on:
         description: "タブ名（空なら cr00 を含む全タブを自動検出）"
         required: false
         default: ""
+      dump:
+        description: "true で対象タブの非空セルを A1:値 で全ダンプ（tab指定時のみ有効）"
+        required: false
+        default: "false"
 
 jobs:
   inspect:
@@ -30,8 +34,10 @@ jobs:
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: |
+          DUMP=""
+          if [ "${{ github.event.inputs.dump }}" = "true" ]; then DUMP="--dump"; fi
           if [ -n "${{ github.event.inputs.tab }}" ]; then
-            node inspect_sheet.mjs --sheet "${{ github.event.inputs.sheet }}" --tab "${{ github.event.inputs.tab }}" --json
+            node inspect_sheet.mjs --sheet "${{ github.event.inputs.sheet }}" --tab "${{ github.event.inputs.tab }}" $DUMP
           else
             node inspect_sheet.mjs --sheet "${{ github.event.inputs.sheet }}" --json
           fi

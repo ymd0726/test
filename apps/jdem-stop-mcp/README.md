@@ -104,3 +104,27 @@ curl -s -o /dev/null -w "%{http_code}\n" https://jdem-stop-mcp.<sub>.workers.dev
 | ツール実行で `JSON以外が返りました` | GASデプロイの「アクセスできるユーザー」が **全員** でない。要再設定 |
 | `クリエイティブが見つかりません` | creativeName または対象タブの不一致（GAS側 CONFIG.SHEET_NAME を確認） |
 | ログ確認 | `npx wrangler tail` でリアルタイムログ |
+
+## 翌日自動チェックくん（TOOL-40）
+
+毎朝 **7:30 JST**（Cron `30 22 * * *` UTC）に、前日実行された cr入稿くん / cr停止くん の結果を
+Meta / 集計表 / Notion の実態と照合する。**異常（NG/警告/未登録/エラー）があるときだけ** Slack管理
+チャンネルへサマリを1通投稿する（BUG-47: 正常稼働・0件の日は投稿しない）。チェッカー自体の起動・実行
+エラーは 🚨 で投稿するため、"異常なのに沈黙" にはならない。
+NG は ClaudeTool のバグ報告DBへ自動起票（機械可読JSON付き、実行者メンション付き通知）。
+
+- 実行記録: 両ツールが実行開始時に統一「ツール実行ログDB」へ書き込む（`src/check/runlog.ts`）。
+  DB本体は Notion TOOL-40 ページ配下に **Worker が初回に自動作成**する（手動作成・ID設定は不要。
+  Workerの Notion インテグレーションが TOOL-40 ページを参照できる必要あり）。
+- チェック本体: `src/check/`（orchestrator=index.ts / checkers.ts / meta.ts / sheets.ts / bug.ts / report.ts）。
+  実処理は `/internal/check/continue` の自己連鎖（cr入稿くんと同じ SELF_WORKER 方式）。
+- 集計表の検証は Sheets API の読み取り専用（GASの再デプロイ不要）。SAは Drive 用の
+  `GOOGLE_SERVICE_ACCOUNT_JSON` を流用（drive.readonly スコープはSheets読取にも有効）。
+- 設定: `wrangler.jsonc` の `vars.CHECK_SLACK_CHANNEL_ID` に管理チャンネルIDを入れる
+  （空のままでもチェック・起票は動くが、Slack投稿だけされない）。
+- 手動テスト:
+  `GET https://jdem-stop-mcp.lead1504.workers.dev/check/run?token=<SHARED_SECRET>&dryRun=1&channel=CXXXX`
+  （`dryRun=1`=起票・書き戻しなし / `date=YYYY-MM-DD` 対象日指定 / `force=1` チェック済みも再チェック /
+  `always=1` 正常時もサマリを投稿＝動作確認・死活監視用）
+- 拡張: 新ツールは (1) 実行時に `createRunLog`/`updateRunLog` で記録 (2) `src/check/checkers.ts` の
+  `CHECKERS` にチェッカーを1つ追加、の2点で翌朝チェックの対象になる。
