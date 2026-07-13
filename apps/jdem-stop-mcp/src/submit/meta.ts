@@ -117,6 +117,49 @@ export async function getSourceCreativeSpec(adId: string, token: string): Promis
 }
 
 /**
+ * コピー元creativeから video_data 形式の object_story_spec を得る（BUG-55）。
+ * - 通常の動画広告: object_story_spec.video_data をそのまま使う。
+ * - asset_feed_spec形式（Advantage+/フレキシブル広告）: video_dataが無いので、
+ *   asset_feed_spec からテキスト/見出し/説明/リンク/CTAを抽出して video_data を再構成する。
+ *   （手動クイック複製はこの形式からでも動くため、それに合わせる）
+ * どちらでもない（画像のみ等）場合は分かりやすいエラーにする。
+ */
+function buildStorySpec_(source: any): any {
+  const oss = source.object_story_spec ? JSON.parse(JSON.stringify(source.object_story_spec)) : {};
+  if (oss.video_data) return oss; // 通常の動画広告
+
+  const afs = source.asset_feed_spec;
+  if (afs) {
+    const pageId = oss.page_id;
+    if (!pageId) {
+      throw new Error(
+        "コピー元がasset_feed形式でpage_idが取得できません（別の動画広告をコピー元にしてください）"
+      );
+    }
+    const link = afs.link_urls?.[0]?.website_url || afs.link_urls?.[0]?.deeplink_url;
+    const ctaType = (afs.call_to_action_types && afs.call_to_action_types[0]) || "LEARN_MORE";
+    const story: any = {
+      page_id: pageId,
+      video_data: {
+        message: afs.bodies?.[0]?.text || "",
+        title: afs.titles?.[0]?.text,
+        link_description: afs.descriptions?.[0]?.text,
+        call_to_action: link ? { type: ctaType, value: { link } } : undefined,
+      },
+    };
+    // 空フィールドは送らない（Metaがバリデーションエラーにする場合がある）
+    if (story.video_data.title === undefined) delete story.video_data.title;
+    if (story.video_data.link_description === undefined) delete story.video_data.link_description;
+    if (!story.video_data.call_to_action) delete story.video_data.call_to_action;
+    return story;
+  }
+
+  throw new Error(
+    "コピー元広告が動画広告ではありません（画像広告など未対応の形式）。コピー元に動画広告を選んでください"
+  );
+}
+
+/**
  * コピー元 creative spec をベースに、新しい video_id・広告名・テキスト類を差し替えた
  * adcreatives 作成パラメータを組み立てる。
  * - エンハンス（standard_enhancements）と関連メディア（contextual_multi_ads）は明示的にOFF固定
@@ -135,13 +178,9 @@ export function buildCreativeParams(
     instagramActorId?: string;
   }
 ): Record<string, string> {
-  const story = JSON.parse(JSON.stringify(source.object_story_spec || {}));
+  // 通常の動画広告はそのまま、asset_feed形式はvideo_dataへ再構成（BUG-55）
+  const story = buildStorySpec_(source);
   const video = story.video_data;
-  if (!video) {
-    throw new Error(
-      "コピー元広告が video_data 形式ではありません（画像広告・asset_feed形式は未対応。コピー元に動画広告を選んでください）"
-    );
-  }
 
   // IG名義はFacebookページ由来（PBIA）を使う。この運用では手動入稿分も
   // ページ名義（例: hotbeauty）で配信されており（2026-07-04 山田確認）、
@@ -290,7 +329,8 @@ export async function listAdsetCandidates(
   const [res, spendMap] = await Promise.all([
     graphGet(
       `act_${accountId}/adsets?fields=${encodeURIComponent(
-        "id,name,effective_status,campaign{name},ads.limit(50){id,name,created_time}"
+        // creative{video_id,object_type} も取り、コピー元は動画広告を優先選ぶ（BUG-55）
+        "id,name,effective_status,campaign{name},ads.limit(50){id,name,created_time,creative{video_id,object_type}}"
       )}&limit=50`,
       token
     ),
@@ -304,14 +344,18 @@ export async function listAdsetCandidates(
     const crAds = ads
       .filter((a) => /cr\d/i.test(a.name))
       .sort((a, b) => String(b.created_time).localeCompare(String(a.created_time)));
+    // コピー元は「動画広告」を優先（BUG-55: 直近が画像/SHARE広告だと video_data 化できず失敗）。
+    // 動画cr広告が無ければ従来どおり直近cr広告（buildStorySpec_のasset_feedフォールバックに委ねる）
+    const isVideoAd = (a: any) => !!(a.creative && a.creative.video_id);
+    const src = crAds.find(isVideoAd) || crAds[0];
     all.push({
       id: s.id,
       name: s.name,
       campaignName: s.campaign?.name || "",
       effectiveStatus: s.effective_status,
       spend7d: spendMap ? spendMap.get(s.id) || 0 : null,
-      latestAd: crAds[0]
-        ? { id: crAds[0].id, name: crAds[0].name, createdTime: crAds[0].created_time }
+      latestAd: src
+        ? { id: src.id, name: src.name, createdTime: src.created_time }
         : undefined,
     });
   }
