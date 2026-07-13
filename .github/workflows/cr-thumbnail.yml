@@ -41,10 +41,16 @@ jobs:
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           SUBMIT_GAS_URL: ${{ secrets.SUBMIT_GAS_URL }}
+          # inputsはshellの引数に直接展開するとJSON内の " がshellに食われて壊れる
+          # （--jobs "[{"id":...}]" → [{id:...] になりJSON.parse失敗）。env経由で安全に渡す
+          IN_SHEET: ${{ github.event.inputs.sheet }}
+          IN_TAB: ${{ github.event.inputs.tab }}
+          IN_SEC: ${{ github.event.inputs.sec }}
+          IN_JOBS: ${{ github.event.inputs.jobs }}
         run: |
           node extract_thumbnail.mjs \
-            --sheet "${{ github.event.inputs.sheet }}" \
-            --tab "${{ github.event.inputs.tab }}" \
+            --sheet "$IN_SHEET" \
+            --tab "$IN_TAB" \
             --gas "$SUBMIT_GAS_URL" \
-            --sec "${{ github.event.inputs.sec }}" \
-            --jobs "${{ github.event.inputs.jobs }}"
+            --sec "$IN_SEC" \
+            --jobs "$IN_JOBS"
