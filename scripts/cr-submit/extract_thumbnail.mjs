@@ -1,11 +1,14 @@
-// crの冒頭サムネ（0:01フレーム）抽出→Driveアップロード→集計表セルへ挿入（BUG-34）
+// crの冒頭サムネ（0:01フレーム）抽出→集計表セルへ挿入（BUG-34）
 // ------------------------------------------------------------
 // cr入稿くん実行環境（Cloudflare Worker / GAS）は動画デコードができないため、
 // ffmpeg が使える GitHub Actions 上でフレーム抽出を行う「基盤」。
 //   1. Drive から対象動画をダウンロード（サービスアカウント）
 //   2. ffmpeg で 00:00:01 の1フレームを JPG 抽出（0:00はテロップ未表示のため0:01。山田要望）
-//   3. JPG を Drive にアップロードし「リンクを知る全員=閲覧可」に（=IMAGE/セル内画像で参照可能に）
-//   4. 共通GAS insertCrThumbnail を呼び、該当ブロックの結合セルにセル内画像として挿入
+//   3. JPG を base64 で共通GAS insertCrThumbnail に渡し、該当ブロックの結合セルに
+//      セル内画像として挿入（GAS側で data:URL から CellImage を構築）
+//   ※旧設計の「JPGをDriveへアップロードして公開URL化」はサービスアカウントに
+//     ストレージ容量が無く files.create が失敗する（Service Accounts do not have
+//     storage quota）ため廃止した。
 //
 // 使い方（GitHub Actions workflow_dispatch から呼ぶ）:
 //   node extract_thumbnail.mjs --sheet <spreadsheetId> --tab <タブ名> \
@@ -18,7 +21,7 @@
 
 import { google } from "googleapis";
 import { execFileSync } from "node:child_process";
-import { writeFileSync, readFileSync, createReadStream, mkdtempSync } from "node:fs";
+import { writeFileSync, readFileSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -71,34 +74,27 @@ for (const job of jobs) {
     const res = await drive.files.get({ fileId, alt: "media" }, { responseType: "arraybuffer" });
     writeFileSync(videoPath, Buffer.from(res.data));
 
-    // 2. ffmpegで 0:SEC の1フレームをJPG抽出（-ss を -i の前に置いて高速シーク）
+    // 2. ffmpegで 0:SEC の1フレームをJPG抽出（-ss を -i の前に置いて高速シーク）。
+    //    -update 1: 出力が連番パターンでない単一画像であることを明示（ffmpeg6+の警告対策）
     const jpgPath = join(tmp, `${sanitize(id)}_thumb.jpg`);
-    execFileSync("ffmpeg", ["-y", "-ss", String(SEC), "-i", videoPath, "-frames:v", "1", "-q:v", "3", jpgPath], {
-      stdio: ["ignore", "ignore", "inherit"],
-    });
+    execFileSync(
+      "ffmpeg",
+      ["-y", "-ss", String(SEC), "-i", videoPath, "-frames:v", "1", "-q:v", "3", "-update", "1", jpgPath],
+      { stdio: ["ignore", "ignore", "inherit"] }
+    );
 
-    // 3. JPGを動画と同じフォルダにアップロードし、リンク公開
-    const parents = await getParents(fileId);
-    const up = await drive.files.create({
-      requestBody: { name: `${id}_thumb01.jpg`, parents: parents.length ? [parents[0]] : undefined },
-      media: { mimeType: "image/jpeg", body: createReadStream(jpgPath) },
-      fields: "id",
-    });
-    const imgId = up.data.id;
-    await drive.permissions.create({ fileId: imgId, requestBody: { role: "reader", type: "anyone" } });
-    // Sheetsのセル内画像/ IMAGE() が参照できる公開サムネURL
-    const imageUrl = `https://drive.google.com/thumbnail?id=${imgId}&sz=w1000`;
-
-    // 4. GASでセル内画像として挿入
+    // 3. JPGをbase64でGASへ渡し、セル内画像として挿入（GASがdata:URLでCellImageを構築）
+    const imageBase64 = readFileSync(jpgPath).toString("base64");
     const gasRes = await postGas(GAS_URL, {
       action: "insertCrThumbnail",
       spreadsheetId: SPREADSHEET_ID,
       sheetName: SHEET_NAME || undefined,
       id,
-      imageUrl,
+      imageBase64,
+      mimeType: "image/jpeg",
     });
     if (gasRes && gasRes.ok) {
-      console.log(`✅ ${id}: ${gasRes.cell} に挿入（merged=${gasRes.merged}） img=${imgId}`);
+      console.log(`✅ ${id}: ${gasRes.cell} に挿入（merged=${gasRes.merged}）`);
       ok++;
     } else {
       console.log(`❌ ${id}: GAS挿入失敗: ${gasRes && gasRes.error}`);
@@ -113,15 +109,6 @@ console.log(`\n# 完了: 成功 ${ok} / 失敗 ${ng}`);
 if (ng > 0) process.exit(1);
 
 // ------------------------------------------------------------
-async function getParents(fileId) {
-  try {
-    const r = await drive.files.get({ fileId, fields: "parents" });
-    return r.data.parents || [];
-  } catch {
-    return [];
-  }
-}
-
 // GASはPOST→302→GET で結果が返る（既存 callGas と同じ挙動）
 async function postGas(url, payload) {
   const res = await fetch(url, {

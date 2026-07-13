@@ -184,16 +184,19 @@ function handleSubmitCreative(req) {
 
 // ------------------------------------------------------------
 // crの冒頭サムネ（0:01フレーム）を該当ブロックのセルに「セル内画像」で挿入する（BUG-34）。
-// 画像URLは外部（GitHub Actions + ffmpeg）で生成した公開URLを渡す。
+// 画像は imageBase64（推奨。GitHub Actions + ffmpeg が抽出したJPGのbase64）か、
+// imageUrl（公開URL）のどちらかで渡す。base64は data:URL にして CellImage を構築する
+// （サービスアカウントはDriveストレージ容量を持たず公開URL化ができないため、
+//  base64直渡し方式を正とする）。
 // 挿入先は「cr名(ID)セルの右にある結合セル（サムネ表示用に拡大結合されている）」。
 // 案件により列位置が異なるため、ブロック内のcr名より右で最大面積の結合セルを自動選択する。
-// req: { spreadsheetId, sheetName?, id, imageUrl }
+// req: { spreadsheetId, sheetName?, id, imageBase64?, mimeType?, imageUrl? }
 // ------------------------------------------------------------
 function handleInsertCrThumbnail(req) {
   try {
     var id = String(req.id || '').trim();
     if (!id) return { ok: false, error: 'id が必要です' };
-    if (!req.imageUrl) return { ok: false, error: 'imageUrl が必要です' };
+    if (!req.imageBase64 && !req.imageUrl) return { ok: false, error: 'imageBase64 か imageUrl が必要です' };
     var ss = SpreadsheetApp.openById(req.spreadsheetId);
     var sheet = submitResolveSheet_(ss, req.sheetName);
     var lay = submitLayout_(sheet);
@@ -216,8 +219,12 @@ function handleInsertCrThumbnail(req) {
       ? sheet.getRange(best.getRow(), best.getColumn())
       : sheet.getRange(lay.idRow, Math.min(idCol + 1 + 10, sheet.getMaxColumns())); // 結合セルが無ければ10列右にフォールバック
 
+    // base64直渡し（推奨）は data:URL、公開URL渡しはそのまま setSourceUrl に渡す
+    var srcUrl = req.imageBase64
+      ? 'data:' + (req.mimeType || 'image/jpeg') + ';base64,' + String(req.imageBase64)
+      : String(req.imageUrl);
     var img = SpreadsheetApp.newCellImage()
-      .setSourceUrl(String(req.imageUrl))
+      .setSourceUrl(srcUrl)
       .setAltTextTitle(id + ' 冒頭サムネ(0:01)')
       .build();
     target.setValue(img);
