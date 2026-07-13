@@ -29,6 +29,7 @@ import {
   createAd,
   setEntityStatus,
   getAdsetParentStatus,
+  getAdsetAdsByName,
 } from "./meta";
 import { callSheetSubmit } from "./gasClient";
 import { markSubmitted } from "./notion";
@@ -163,9 +164,38 @@ async function runHop(
             ? `🛠️ 広告を作成中…（${targets.length}セットに入稿: ${targets.map((t) => t.adsetName).join(" / ")}）`
             : `🛠️ 広告を作成中…（コピー元: ${plan.sourceAdName}）`
         );
-        // サムネイルは動画ごとに1回だけ取得してターゲット間で使い回す
+        // 再実行時の二重作成防止（BUG-57）: 各入稿先の既存広告(name→id)を取得し、
+        // 同名広告が既にあれば「作成済み」として adIdsByAdset に反映しておく。
+        // continuationのstateは1連鎖内しか覚えていないため、別コマンドで再実行すると
+        // 同名広告をMetaに重複作成していた（エラー時の再実行案内と挙動が矛盾していた）。
+        for (const t of targets) {
+          let existing: Map<string, string>;
+          try {
+            existing = await getAdsetAdsByName(t.adsetId, metaToken);
+          } catch {
+            existing = new Map(); // 取得失敗時は従来どおり（重複作成のリスクは残るが処理は続行）
+          }
+          for (const v of plan.videos) {
+            v.adIdsByAdset = v.adIdsByAdset || {};
+            const hit = existing.get(v.adName);
+            if (hit && !v.adIdsByAdset[t.adsetId]) {
+              v.adIdsByAdset[t.adsetId] = hit;
+              if (!v.adId) v.adId = hit;
+            }
+          }
+        }
+        // サムネイルは動画ごとに1回だけ取得してターゲット間で使い回す。
+        // 作成が必要な(video,adset)ペアが1つも無い動画はサムネ取得も不要（既存スキップ時に
+        // サムネ未生成で無駄に失敗しないようにする）。
+        const needThumb = new Set<string>();
+        for (const t of targets) {
+          for (const v of plan.videos) {
+            if (!v.adIdsByAdset || !v.adIdsByAdset[t.adsetId]) needThumb.add(v.videoId!);
+          }
+        }
         const thumbs = new Map<string, string>();
         for (const v of plan.videos) {
+          if (!needThumb.has(v.videoId!)) continue;
           const thumbnailUrl = await getVideoThumbnailUrl(v.videoId!, metaToken);
           if (!thumbnailUrl) {
             throw new Error(`動画 ${v.adName} のサムネイルがまだ生成されていません（video_id=${v.videoId}）。少し待って同じ /cr-in を再実行してください`);
@@ -174,6 +204,8 @@ async function runHop(
         }
         let igActorId: string | undefined; // 1815199リトライで解決したPBIAを2本目以降にも使い回す
         for (const t of targets) {
+          // この入稿先で作成が必要な動画が無ければ（全て既存でスキップ）spec取得も省く
+          if (plan.videos.every((v) => v.adIdsByAdset && v.adIdsByAdset[t.adsetId])) continue;
           // テキスト類は「そのセットの直近cr広告」からコピー（セットごとにspec取得）
           const source = await getSourceCreativeSpec(t.sourceAdId, metaToken);
           for (const v of plan.videos) {

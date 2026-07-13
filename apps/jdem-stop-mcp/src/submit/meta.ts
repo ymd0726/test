@@ -196,7 +196,10 @@ export function buildCreativeParams(
   video.image_url = opts.thumbnailUrl;
 
   if (opts.overrides.message) video.message = opts.overrides.message;
-  if (opts.overrides.title && video.title !== undefined) video.title = opts.overrides.title;
+  // 見出し: Notionに指定があれば必ず上書きする。コピー元のvideo_dataにtitleが
+  // 無い場合でも、ユーザーがNotionで見出しを指定した意図を優先する（BUG-57:
+  // 以前は video.title が未定義だと上書きされず、Notion指定の見出しが無視されていた）。
+  if (opts.overrides.title) video.title = opts.overrides.title;
 
   // 遷移先URL: call_to_action.value.link 置換 + cr=パラメータ更新
   const cta = video.call_to_action;
@@ -380,6 +383,22 @@ async function getAdsetSpend7d(
   } catch {
     return null;
   }
+}
+
+/**
+ * 指定広告セット内の既存広告 name→id（ARCHIVED/DELETED除く）。
+ * 再実行時の二重作成防止（BUG-57）。continuationのstateは1連鎖内でしか
+ * 作成済みペアを覚えていないため、別コマンドで再実行すると同名広告を重複作成していた。
+ * create_ads開始時にこれを参照し、同名広告が既にあれば再利用してスキップする。
+ */
+export async function getAdsetAdsByName(adsetId: string, token: string): Promise<Map<string, string>> {
+  const res = await graphGet(`${adsetId}/ads?fields=${encodeURIComponent("name,effective_status")}&limit=200`, token);
+  const m = new Map<string, string>();
+  for (const a of res.data || []) {
+    if (a.effective_status === "DELETED" || a.effective_status === "ARCHIVED") continue;
+    if (a.name && !m.has(a.name)) m.set(a.name, a.id);
+  }
+  return m;
 }
 
 /** 同名広告の存在チェック（冪等性: 二重入稿防止） */
