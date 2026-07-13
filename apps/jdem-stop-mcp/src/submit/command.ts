@@ -352,7 +352,8 @@ async function confirmAndRun(
         userId: interaction.user?.id,
         responseUrl,
       },
-      `❌ 実行開始に失敗しました: ${e.message}`
+      `❌ 実行開始に失敗しました: ${e.message}`,
+      true
     );
   }
 }

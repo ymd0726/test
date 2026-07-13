@@ -353,9 +353,10 @@ async function runHop(
         if (!plan.runLogPageId && env.NOTION_TOKEN) {
           lines.push(":warning: 実行ログの記録に失敗（翌日自動チェックの対象外になります）");
         }
-        // 完了通知はチャンネル向け1通のみ（BUG-24）。public投稿に失敗した場合だけephemeralで代替する。
+        // 完了通知はチャンネル向け1通のみ（BUG-24）。public投稿に失敗した場合だけephemeral/
+        // response_urlで代替する（完了通知だけは response_url 枠を使ってよい＝BUG-49）。
         const posted = await postPublic(env, plan.channelId, lines.join("\n"));
-        if (!posted) await postProgress(env, plan, lines.join("\n"));
+        if (!posted) await postProgress(env, plan, lines.join("\n"), true);
         // OFF親があれば、操作者にだけ「ONにするか」の確認ボタンを出す（勝手にONにしない）
         if (offParents.length > 0) {
           await postParentActivatePrompt(env, plan, offParents);
@@ -370,6 +371,7 @@ async function runHop(
       status: "失敗",
       detail: { ...((plan as any)._runDetail || {}), failedStep: state.step, lastError: String(e.message || e).slice(0, 500) },
     });
+    // エラー通知は必ず届けたいので response_url フォールバックを許可（BUG-49）
     await postProgress(
       env,
       plan,
@@ -377,7 +379,8 @@ async function runHop(
         `ここまでの作成物: ${plan.videos
           .filter((v) => v.videoId)
           .map((v) => `${v.adName}(video:${v.videoId}${v.adId ? `, ad:${v.adId}` : ""})`)
-          .join(", ") || "なし"}\n再実行する場合は同じ \`/cr-in\` を実行してください（作成済みはスキップされます）。`
+          .join(", ") || "なし"}\n再実行する場合は同じ \`/cr-in\` を実行してください（作成済みはスキップされます）。`,
+      true
     );
   }
 }
@@ -468,12 +471,18 @@ function sheetParentId(plan: SubmitPlan): string {
 /**
  * 進捗表示。Slackのresponse_urlは「30分以内・5回まで」の制限があり、
  * 進捗が多いと途中から黙って捨てられる（実際に発生）。
- * そのためBotトークンでのephemeral投稿を優先し、失敗時のみresponse_urlに落とす。
+ *
+ * BUG-49: 進捗メッセージがresponse_url枠(5通)を食い潰し、最後の完了通知だけ
+ * ドロップして「止まる」ように見える事象があった（Bot未参加/privateチャンネルで
+ * ephemeralが使えず response_url に落ちる案件で顕著）。対策として、
+ * 進捗(interim)は ephemeral 専用にし response_url には落とさない（届かなくても実害小）。
+ * response_url枠は useResponseUrl=true を渡す完了通知・エラー通知のためだけに温存する。
  */
 export async function postProgress(
   env: { SLACK_BOT_TOKEN?: string },
   to: { channelId?: string; userId?: string; responseUrl: string },
-  text: string
+  text: string,
+  useResponseUrl = false
 ): Promise<void> {
   if (env.SLACK_BOT_TOKEN && to.channelId && to.userId) {
     try {
@@ -486,7 +495,7 @@ export async function postProgress(
       let data = await post();
       if (!data.ok && data.error === "not_in_channel") {
         // Botが未参加のチャンネル（BUG-29: rclで進捗が全滅した）→ 参加を試みて1回だけ再送。
-        // conversations.joinはpublicチャンネルのみ有効。失敗時はresponse_urlへフォールバック
+        // conversations.joinはpublicチャンネルのみ有効。失敗時は（許可されていれば）response_urlへ
         if (await joinChannel(env.SLACK_BOT_TOKEN, to.channelId)) data = await post();
       }
       if (data.ok) return;
@@ -494,6 +503,8 @@ export async function postProgress(
       /* fallthrough */
     }
   }
+  // 進捗(interim)は response_url を使わない＝完了/エラー通知の枠を温存する（BUG-49）
+  if (!useResponseUrl) return;
   try {
     await fetch(to.responseUrl, {
       method: "POST",

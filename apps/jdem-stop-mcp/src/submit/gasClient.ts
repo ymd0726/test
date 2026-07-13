@@ -23,9 +23,11 @@ export interface SheetSubmitResult {
   error?: string;
 }
 
-// hyd等の巨大シート（1400列超）では copyTo+列グループ再作成が25秒を超えることがある
-// （BUG-24のログで実測: The operation was aborted）。hopはwaitUntil内で走るため60秒まで待つ。
-const GAS_TIMEOUT_MS = 60_000;
+// GAS応答待ちの上限。長くしすぎるとCloudflareのhop実行上限手前でkillされ、
+// 完了通知が出ないまま「止まる」ように見える（BUG-49）。25秒で確実にabortさせ、
+// タイムアウト時も後続(notion→done)へ進めて完了通知を必ず出す。
+// ※BUG-32でGAS側の列幅コピーを高速化済みのため、再デプロイ後は25秒に十分収まる。
+const GAS_TIMEOUT_MS = 25_000;
 
 export async function callSheetSubmit(
   gasUrl: string,
