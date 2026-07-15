@@ -314,7 +314,10 @@ async function runHop(
             childIds,
             dryRun: false,
           });
-          results.push(r.ok ? `${t.sheetName || t.spreadsheetId}` : `${t.sheetName || t.spreadsheetId} ❌ ${r.error}`);
+          // GASからの警告（分類プルダウン未反映・判定行未検出等）は完了通知に必ず表示する。
+          // 以前は握りつぶしていたため、集計表側の設定漏れに気づけなかった（BUG-68）
+          const warnSuffix = r.ok && r.warnings?.length ? ` ⚠️ ${r.warnings.join(" / ")}` : "";
+          results.push(r.ok ? `${t.sheetName || t.spreadsheetId}${warnSuffix}` : `${t.sheetName || t.spreadsheetId} ❌ ${r.error}`);
         }
         (plan as any)._sheetResults = results;
         // 実行ログ: 集計表段階の結果

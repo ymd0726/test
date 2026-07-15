@@ -147,9 +147,9 @@ function handleSubmitCreative(req) {
     // 実挿入: 右のゾーンから先に（左に挿入すると右の列番号がずれるため）
     var inserted = [];
     var warnings = [];
-    if (judge.guessed) warnings.push('判定行を自動検出できずフォールバック(' + judge.row + '行目)を使用。要確認');
+    if (judge.guessed) warnings.push('判定行（子にて判定を書く行）を自動検出できませんでした。この案件は判定行が無い構造の可能性があるため「子にて判定」の書込はスキップします');
     plan.slice().sort(function (a, b) { return b.tpl.start - a.tpl.start; }).forEach(function (p) {
-      var r = submitInsert_(sheet, lay, p, judge.row);
+      var r = submitInsert_(sheet, lay, p, judge);
       inserted.forEach(function (rec) { if (rec.startCol >= r.startCol) rec.startCol += r.width; });
       inserted.push({ id: r.id, zone: r.zone, startCol: r.startCol, width: r.width });
       if (r.warn) warnings.push(r.warn);
@@ -165,8 +165,11 @@ function handleSubmitCreative(req) {
           var pTpl = submitUnit_(lay, pc);
           if (pTpl.memoCol >= 0) {
             sheet.getRange(SUBMIT_CLASS_ROW, pTpl.memoCol + 1).setValue('親（子有り）');
-            var pjc = sheet.getRange(judge.row, pTpl.memoCol + 1);
-            if (String(pjc.getValue()).indexOf('子にて判定') < 0) pjc.setValue('子にて判定');
+            // 判定行未検出の案件ではフォールバック行への書込をしない（既存データ破壊防止。BUG-68）
+            if (!judge.guessed) {
+              var pjc = sheet.getRange(judge.row, pTpl.memoCol + 1);
+              if (String(pjc.getValue()).indexOf('子にて判定') < 0) pjc.setValue('子にて判定');
+            }
           }
         }
       } catch (eu) { warnings.push('既存親の分類更新に失敗: ' + eu.message); }
@@ -385,6 +388,7 @@ function submitDetectJudgeRow_(sheet, memoCol0) {
 // ------------------------------------------------------------
 // ブロック挿入（cr00 unit を直右に複製 → ID/分類/判定/グループ化を設定）
 // ------------------------------------------------------------
+/** judgeRow: submitDetectJudgeRow_の戻り値 {row, guessed}。guessed=trueなら子にて判定は書かない */
 function submitInsert_(sheet, lay, p, judgeRow) {
   var tpl = p.tpl, width = tpl.width, maxRows = sheet.getMaxRows(), warn = '';
 
@@ -421,10 +425,23 @@ function submitInsert_(sheet, lay, p, judgeRow) {
   if (tpl.memoCol >= 0) {
     var memoNew = insStart + (tpl.memoCol - tpl.start);
     try {
-      sheet.getRange(SUBMIT_CLASS_ROW, memoNew + 1).setValue(p.cls);
+      var clsCell = sheet.getRange(SUBMIT_CLASS_ROW, memoNew + 1);
+      clsCell.setValue(p.cls);
+      // 読み戻し検証（BUG-68）: 入力規則のreject等で無言で設定されないケースを警告として可視化する
+      var clsGot = String(clsCell.getDisplayValue() || '').trim();
+      if (clsGot !== p.cls) {
+        warn += '分類プルダウン未反映(' + p.id + '): 「' + p.cls + '」を設定したが表示は「' + clsGot + '」。手動確認要 ';
+      }
       if (p.cls === '親（子有り）') {
-        var jc = sheet.getRange(judgeRow, memoNew + 1);
-        if (String(jc.getValue()).indexOf('子にて判定') < 0) jc.setValue('子にて判定');
+        // 判定行が自動検出できなかった案件（nrn等、「子にて判定」行の無い構造）では
+        // フォールバック行に書くと既存データ（通電%等）を壊すため、書き込まない（BUG-68）
+        if (judgeRow && judgeRow.guessed) {
+          warn += '判定行が特定できないため「子にて判定」は未設定(' + p.id + ')。必要なら手動設定を ';
+        } else {
+          var jrow = judgeRow ? judgeRow.row : SUBMIT_JUDGE_ROW_FALLBACK;
+          var jc = sheet.getRange(jrow, memoNew + 1);
+          if (String(jc.getValue()).indexOf('子にて判定') < 0) jc.setValue('子にて判定');
+        }
       }
     } catch (e) { warn += '分類設定失敗(' + p.id + '):' + e.message + ' '; }
   }
