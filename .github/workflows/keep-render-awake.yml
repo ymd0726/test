@@ -28,7 +28,9 @@ jobs:
     steps:
       # ルートURLはBasic認証がかかっており401が返るが、スリープ復帰の起こしには
       # HTTPリクエストが届けば十分なので、非2xx応答でも失敗扱いにしない（-fを付けない）。
+      # Renderのコールドスタートは30〜50秒かかることがあるため、--max-timeは60秒に余裕を持たせる
+      # （BUG-69: 30秒では時々間に合わずcurl exit 28タイムアウトで失敗していた）。
       - name: Ping Render app
         run: |
-          curl -sS --max-time 30 -o /dev/null -w "status=%{http_code} time=%{time_total}s\n" \
+          curl -sS --max-time 60 -o /dev/null -w "status=%{http_code} time=%{time_total}s\n" \
             "https://video-material-matcher.onrender.com/"
