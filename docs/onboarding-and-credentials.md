@@ -133,6 +133,65 @@ Claude / Claude Code・MCP・各種コネクタを従業員と安全に共有す
 
 ---
 
+## 付録A. シークレット再発行の"実"手順（つまずき対策込み）
+
+`SHARED_SECRET` を作り直すとき（定期ローテーション・退職・URL流出時）の、実際にやると詰まりやすいポイントをまとめた手順。初めてでも迷わないように。
+
+### 事前準備（ここでよく詰まる）
+
+- **作業フォルダは Google Drive 同期の外に置く。** Google Drive（`~/Library/CloudStorage/GoogleDrive-.../`）配下だと `node_modules` の実行ファイル（シンボリックリンク）が壊れ、`sh: wrangler: command not found` になる。`~/Downloads` や専用の作業フォルダなど**同期外**で作業する。
+- **Node.js は v22 以上が必要**（Wranglerの要件）。確認：`node -v`。古ければ https://nodejs.org の **LTS** インストーラー（`.pkg`）を入れて**ターミナルを開き直す**。
+- **ターミナルへの貼り付けは1行ずつ**。複数行を一気に貼ると勝手に実行されて出力が混ざる。
+- パスに**スペースや日本語**が含まれる場合は `cd ~/"フォル ダ名"` のように**ダブルクォートで囲む**。
+
+### 手順
+
+1. **新しい値を先に作り、パスワード管理ツールに保存する**（← 今回の最大の教訓。Cloudflareは後から値を見られない）。
+   ```bash
+   openssl rand -hex 16     # 出た値を 1Password/Bitwarden に「Cloudflare SHARED_SECRET (jdem-stop-mcp)」で保存
+   ```
+2. **`wrangler.jsonc` があるフォルダへ移動**（同期外のコピー）。
+   ```bash
+   cd <jdem-stop-mcp のフォルダ>
+   ls                        # wrangler.jsonc と src が見えればOK
+   ```
+3. **`wrangler: command not found` が出たら node_modules を作り直す**。
+   ```bash
+   rm -rf node_modules
+   npm install               # 数分。added XXX packages が出れば完了
+   ```
+4. **Cloudflareにログイン**（初回/期限切れ時のみ）。
+   ```bash
+   npx wrangler login        # ブラウザで承認 → "Successfully logged in."
+   ```
+5. **シークレット登録**（値はコマンドに書かず、隠しプロンプトで貼る）。
+   ```bash
+   npx wrangler secret put SHARED_SECRET
+   # Enter a secret value: ← ここで手順1の値を貼り付け（画面には出ない）
+   ```
+   → `✨ Success! Uploaded secret SHARED_SECRET` が出れば完了。**この瞬間から旧URLは無効。**
+6. **新しいURLを組み立てる**。
+   ```
+   https://jdem-stop-mcp.lead1504.workers.dev/<手順1の値>/sse
+   ```
+   （サブドメインが不明なら Cloudflareダッシュボード → Workers & Pages → `jdem-stop-mcp` で確認）
+7. **各自のコネクタを差し替える**：claude.ai → Settings → Connectors → 対象コネクタのURLを新URLに変更（編集不可なら削除して Add custom connector で再追加）。
+8. **動作確認**：Claudeに「list projects で案件一覧を見せて」→ 承認ダイアログを許可 → 案件一覧が返ればOK。
+9. **古いコネクタを削除**（旧URLは無効なので残すと紛らわしいだけ）。
+
+### やりがちな失敗と対処
+
+| 症状 | 原因 / 対処 |
+|---|---|
+| `wrangler requires at least Node.js v22` | Nodeが古い。LTSインストーラーで更新→ターミナル開き直し |
+| `sh: wrangler: command not found` | Google Drive同期でnode_modules破損。同期外フォルダで `rm -rf node_modules && npm install` |
+| `Required Worker name missing` | `wrangler.jsonc` の無い場所で実行している。正しいフォルダへ `cd` |
+| 値を控え忘れた | Cloudflareからは読めない。再度この手順で作り直す（＝今回の発端） |
+
+> ⏰ 切り替えは**静かな時間帯**に（cr入稿くん実行中や毎朝7:30の自動チェック直前を避ける）。
+
+---
+
 ### 関連ドキュメント
 - `apps/jdem-stop-mcp/README.md` — 自作MCPのセットアップ・接続・`SHARED_SECRET` 再設定・他案件展開（案A/案B）
 - `docs/operations-runbook.md` — ルーチン／コネクタの障害一次対応
