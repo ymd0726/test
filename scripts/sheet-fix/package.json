@@ -1,0 +1,9 @@
+{
+  "name": "sheet-fix-scripts",
+  "private": true,
+  "type": "module",
+  "description": "集計表 セル修正パッチ適用（expectedBefore検証・DRY RUNデフォルト・undoログ付き）",
+  "dependencies": {
+    "googleapis": "^140.0.0"
+  }
+}

@@ -1,0 +1,49 @@
+name: 集計表 セル修正（sheet-fix）
+
+# 手動実行専用。inspect-sheet と同じ GOOGLE_SERVICE_ACCOUNT_JSON シークレットを使い、
+# scripts/sheet-fix/plans/ のパッチプランを検証付きで適用する。
+# mode=dry-run（デフォルト）は書き込みなし。apply 時のみ書き込み、undoログをアーティファクト保存。
+on:
+  workflow_dispatch:
+    inputs:
+      plan:
+        description: "パッチプランのパス（repo相対。例: scripts/sheet-fix/plans/2026-07-19_jdem_判定式修正.json）"
+        required: true
+      mode:
+        description: "dry-run: 検証のみ / apply: 実際に書き込む"
+        required: true
+        type: choice
+        options:
+          - dry-run
+          - apply
+        default: dry-run
+
+jobs:
+  sheet-fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install deps
+        working-directory: scripts/sheet-fix
+        run: npm install --no-audit --no-fund
+      - name: Apply patch plan
+        working-directory: scripts/sheet-fix
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          PLAN_PATH: ${{ github.event.inputs.plan }}
+          MODE: ${{ github.event.inputs.mode }}
+        run: |
+          APPLY_FLAG=""
+          if [ "$MODE" = "apply" ]; then APPLY_FLAG="--apply"; fi
+          node apply.mjs --plan "${GITHUB_WORKSPACE}/${PLAN_PATH}" $APPLY_FLAG --undo-out undo_log.json
+      - name: Upload undo log
+        if: github.event.inputs.mode == 'apply'
+        uses: actions/upload-artifact@v4
+        with:
+          name: undo-log
+          path: scripts/sheet-fix/undo_log.json
+          if-no-files-found: ignore
+          retention-days: 90
