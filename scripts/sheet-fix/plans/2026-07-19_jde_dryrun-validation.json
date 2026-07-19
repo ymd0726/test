@@ -1,0 +1,13 @@
+{
+  "sheet": "1oEK8JCJg2NcseWmnxLtfNFCe5A7XGJ_DJSj7c2EW1sg",
+  "tab": "kk_mak",
+  "note": "sheet-fix導入時の動作検証（同値書き込みの無害テスト。CD6は集計内cr00テンプレのID。構造ダンプrun 29677293911で実測）",
+  "edits": [
+    {
+      "cell": "CD6",
+      "expectedBefore": "cr00",
+      "after": "cr00",
+      "note": "現在値と同じ値を書く無害な全経路テスト（expectedBefore検証→undoログ→書き込み→反映確認）"
+    }
+  ]
+}

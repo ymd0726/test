@@ -1,0 +1,13 @@
+{
+  "sheet": "1oEK8JCJg2NcseWmnxLtfNFCe5A7XGJ_DJSj7c2EW1sg",
+  "tab": "kk_mak",
+  "note": "sheet-fix導入時のガード検証（わざと誤ったexpectedBeforeを指定し、拒否されることを確認する。実行は失敗＝正解）",
+  "edits": [
+    {
+      "cell": "CD6",
+      "expectedBefore": "この値は実際のセルと一致しないはず",
+      "after": "書かれてはいけない値",
+      "note": "expectedBefore不一致→全編集中止になることの確認用"
+    }
+  ]
+}
