@@ -17,6 +17,14 @@ on:
         description: "true で対象タブの非空セルを A1:値 で全ダンプ（tab指定時のみ有効）"
         required: false
         default: "false"
+      formulas:
+        description: "true でダンプを値ではなく数式（FORMULA）で出力（dump=true時のみ有効。判定式のラップ確認用）"
+        required: false
+        default: "false"
+      rows:
+        description: "ダンプ対象行をカンマ区切りで限定（例: 2,3,5。空なら全行）"
+        required: false
+        default: ""
 
 jobs:
   inspect:
@@ -36,8 +44,12 @@ jobs:
         run: |
           DUMP=""
           if [ "${{ github.event.inputs.dump }}" = "true" ]; then DUMP="--dump"; fi
+          FORMULAS=""
+          if [ "${{ github.event.inputs.formulas }}" = "true" ]; then FORMULAS="--formulas"; fi
+          ROWS=""
+          if [ -n "${{ github.event.inputs.rows }}" ]; then ROWS="--rows ${{ github.event.inputs.rows }}"; fi
           if [ -n "${{ github.event.inputs.tab }}" ]; then
-            node inspect_sheet.mjs --sheet "${{ github.event.inputs.sheet }}" --tab "${{ github.event.inputs.tab }}" $DUMP
+            node inspect_sheet.mjs --sheet "${{ github.event.inputs.sheet }}" --tab "${{ github.event.inputs.tab }}" $DUMP $FORMULAS $ROWS
           else
             node inspect_sheet.mjs --sheet "${{ github.event.inputs.sheet }}" --json
           fi

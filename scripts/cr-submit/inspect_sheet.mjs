@@ -80,13 +80,27 @@ for (const sheet of targets) {
   printTab(info);
 
   // --dump: 対象タブの1〜ID行の非空セルを A1:値 で全出力（実構造の目視確認用）
+  // --formulas: 値ではなく数式（FORMULA）を出力（判定式のラップ有無の確認用）。数式は長いので省略しない
+  // --rows 2,3,5: 出力対象の行を限定（判定行・親子行だけ見たいとき）
   if (args.tab && args.dump) {
-    console.log(`\n--- ${p.title} 非空セルダンプ（1〜${rows.length}行 / A1:値）---`);
-    for (let r = 0; r < rows.length; r++) {
+    let dumpRows = rows;
+    if (args.formulas) {
+      const fres = await sheets.spreadsheets.values.get({
+        spreadsheetId: SPREADSHEET_ID,
+        range,
+        valueRenderOption: "FORMULA",
+      });
+      dumpRows = fres.data.values || [];
+    }
+    const rowFilter = args.rows ? new Set(args.rows.split(",").map((x) => Number(x.trim()))) : null;
+    const label = args.formulas ? "数式" : "値";
+    console.log(`\n--- ${p.title} 非空セルダンプ（1〜${dumpRows.length}行 / A1:${label}）---`);
+    for (let r = 0; r < dumpRows.length; r++) {
+      if (rowFilter && !rowFilter.has(r + 1)) continue;
       const cells = [];
-      for (let c = 0; c < (rows[r] || []).length; c++) {
-        const v = String(rows[r][c] ?? "").trim();
-        if (v) cells.push(`${colToA1(c)}${r + 1}=${v.slice(0, 30)}`);
+      for (let c = 0; c < (dumpRows[r] || []).length; c++) {
+        const v = String(dumpRows[r][c] ?? "").trim();
+        if (v) cells.push(`${colToA1(c)}${r + 1}=${args.formulas ? v : v.slice(0, 30)}`);
       }
       if (cells.length) console.log(`[行${r + 1}] ${cells.join(" | ")}`);
     }
@@ -203,6 +217,8 @@ function parseArgs(argv) {
     else if (argv[i] === "--tab") out.tab = argv[++i];
     else if (argv[i] === "--json") out.json = true;
     else if (argv[i] === "--dump") out.dump = true;
+    else if (argv[i] === "--formulas") out.formulas = true;
+    else if (argv[i] === "--rows") out.rows = argv[++i];
   }
   return out;
 }
