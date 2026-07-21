@@ -33,13 +33,38 @@ export async function callSheetSubmit(
   gasUrl: string,
   req: SheetSubmitRequest
 ): Promise<SheetSubmitResult> {
+  return (await callGasJson(gasUrl, req, GAS_TIMEOUT_MS)) as SheetSubmitResult;
+}
+
+/**
+ * 集計表への反映確認（BUG-95）。submitCreativeがタイムアウトした後に、
+ * ID行に親/子crが実際に現れたかを読み取り専用で軽量チェックする。
+ * GAS側 action=submitCheck（v1.23〜）。
+ */
+export interface SheetCheckResult {
+  ok: boolean;
+  existing?: string[];
+  missing?: string[];
+  error?: string;
+}
+
+const GAS_CHECK_TIMEOUT_MS = 20_000;
+
+export async function callSheetCheck(
+  gasUrl: string,
+  req: { spreadsheetId: string; sheetName?: string; ids: string[] }
+): Promise<SheetCheckResult> {
+  return (await callGasJson(gasUrl, { action: "submitCheck", ...req }, GAS_CHECK_TIMEOUT_MS)) as SheetCheckResult;
+}
+
+async function callGasJson(gasUrl: string, body: unknown, timeoutMs: number): Promise<{ ok: boolean; error?: string }> {
   const ctl = new AbortController();
-  const t = setTimeout(() => ctl.abort(), GAS_TIMEOUT_MS);
+  const t = setTimeout(() => ctl.abort(), timeoutMs);
   try {
     const res = await fetch(gasUrl, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(req),
+      body: JSON.stringify(body),
       redirect: "manual",
       signal: ctl.signal,
     });
@@ -47,16 +72,16 @@ export async function callSheetSubmit(
       const loc = res.headers.get("location");
       if (!loc) throw new Error("GAS 302にLocationがありません");
       const res2 = await fetch(loc, { signal: ctl.signal });
-      return (await res2.json()) as SheetSubmitResult;
+      return (await res2.json()) as any;
     }
-    return (await res.json()) as SheetSubmitResult;
+    return (await res.json()) as any;
   } catch (e: any) {
     // タイムアウト中断の場合、GAS側の処理はサーバー側で継続している可能性がある
     // （クライアント切断ではGAS実行は止まらない）。再実行は同名CRの冪等ガードで安全。
     if (e.name === "AbortError" || /abort/i.test(String(e.message))) {
       return {
         ok: false,
-        error: `GAS応答待ちタイムアウト（${GAS_TIMEOUT_MS / 1000}秒）。処理自体は完了している可能性があるため集計表を確認してください`,
+        error: `GAS応答待ちタイムアウト（${timeoutMs / 1000}秒）。処理自体は完了している可能性があるため集計表を確認してください`,
       };
     }
     return { ok: false, error: `GAS呼び出し失敗: ${e.message}` };

@@ -48,6 +48,7 @@ function doPost(e) {
     }
     if (action === 'submitUndo') return jsonOut(handleSubmitUndo(params));
     if (action === 'insertCrThumbnail') return jsonOut(handleInsertCrThumbnail(params));
+    if (action === 'submitCheck') return jsonOut(handleSubmitCheck(params)); // 読み取り専用（ロック不要）
     return jsonOut({ ok: false, error: '不明なaction: ' + action });
   } catch (err) {
     return jsonOut({ ok: false, error: 'エラー: ' + err });
@@ -232,6 +233,30 @@ function handleInsertCrThumbnail(req) {
       .build();
     target.setValue(img);
     return { ok: true, id: id, cell: submitColA1_(target.getColumn() - 1) + target.getRow(), merged: !!best };
+  } catch (e) {
+    return { ok: false, error: String(e && e.message ? e.message : e) };
+  }
+}
+
+// ------------------------------------------------------------
+// 集計表への反映確認（BUG-95）。submitCreativeがWorker側でタイムアウトした後に、
+// ID行に指定crが実際に現れたかを読み取り専用でチェックする（挿入はしない）。
+// 巨大シートではsubmitCreativeが25秒を超えても正常完了するため、Workerはこれを
+// ポーリングして「成功」を確定させる。ロックは取らない（実行中のsubmitと並行可）。
+// req: { spreadsheetId, sheetName?, ids: ["cr83","cr83_01",...] }
+// ------------------------------------------------------------
+function handleSubmitCheck(req) {
+  try {
+    var ids = (req.ids || []).map(function (s) { return String(s).trim(); }).filter(String);
+    if (!ids.length) return { ok: false, error: 'ids が必要です' };
+    var ss = SpreadsheetApp.openById(req.spreadsheetId);
+    var sheet = submitResolveSheet_(ss, req.sheetName);
+    var lay = submitLayout_(sheet);
+    var have = {};
+    lay.idCells.forEach(function (c) { have[c.id.toLowerCase()] = true; });
+    var existing = [], missing = [];
+    ids.forEach(function (id) { (have[id.toLowerCase()] ? existing : missing).push(id); });
+    return { ok: true, existing: existing, missing: missing };
   } catch (e) {
     return { ok: false, error: String(e && e.message ? e.message : e) };
   }

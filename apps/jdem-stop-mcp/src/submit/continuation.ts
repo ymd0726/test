@@ -31,7 +31,7 @@ import {
   getAdsetParentStatus,
   getAdsetAdsByName,
 } from "./meta";
-import { callSheetSubmit } from "./gasClient";
+import { callSheetSubmit, callSheetCheck } from "./gasClient";
 import { markSubmitted } from "./notion";
 import { createRunLog, updateRunLog } from "../check/runlog";
 
@@ -305,6 +305,7 @@ async function runHop(
         const parentSheetId = sheetParentId(plan);
         const childIds = plan.videos.map((v) => v.sheetId).filter((sid) => /cr\d+_\d{2}/i.test(sid));
         const results: string[] = [];
+        const pending: { idx: number; spreadsheetId: string; sheetName?: string; label: string }[] = [];
         for (const t of gasTargets) {
           const r = await callSheetSubmit(env.SUBMIT_GAS_URL || env.COMMON_GAS_URL, {
             action: "submitCreative",
@@ -314,15 +315,81 @@ async function runHop(
             childIds,
             dryRun: false,
           });
+          const label = t.sheetName || t.spreadsheetId;
           // GASからの警告（分類プルダウン未反映・判定行未検出等）は完了通知に必ず表示する。
           // 以前は握りつぶしていたため、集計表側の設定漏れに気づけなかった（BUG-68）
           const warnSuffix = r.ok && r.warnings?.length ? ` ⚠️ ${r.warnings.join(" / ")}` : "";
-          results.push(r.ok ? `${t.sheetName || t.spreadsheetId}${warnSuffix}` : `${t.sheetName || t.spreadsheetId} ❌ ${r.error}`);
+          if (r.ok) {
+            results.push(`${label}${warnSuffix}`);
+          } else if (/タイムアウト/.test(r.error || "")) {
+            // タイムアウトはGAS側で処理継続中の可能性が高い（クライアント切断ではGASは止まらない）。
+            // 巨大シート(kk_kou等)ではほぼ毎回25秒を超え、実際は成功しているのに❌表示になっていた
+            // （BUG-95）。失敗と断定せず、sheet_verifyでID行への反映を確認してから結果を出す。
+            results.push(`${label}（確認中）`);
+            pending.push({ idx: results.length - 1, spreadsheetId: t.spreadsheetId, sheetName: t.sheetName, label });
+          } else {
+            results.push(`${label} ❌ ${r.error}`);
+          }
         }
         (plan as any)._sheetResults = results;
+        if (pending.length > 0) {
+          (plan as any)._sheetPending = pending;
+          (plan as any)._sheetCheckIds = [parentSheetId, ...childIds];
+          state.step = "sheet_verify";
+          state.attempts = 0;
+          break;
+        }
         // 実行ログ: 集計表段階の結果
         await updateRunLog(env.NOTION_TOKEN, plan.runLogPageId, {
           sheetResult: results.some((r) => r.includes("❌")) ? "失敗" : "成功",
+          sheetTabs: gasTargets.map((t) => t.sheetName || "").filter(Boolean),
+        });
+        state.step = "notion";
+        break;
+      }
+
+      case "sheet_verify": {
+        // GASタイムアウト後の反映確認（BUG-95）: 集計表のID行に親/子crが現れたかを
+        // 読み取り専用のsubmitCheckで軽量確認する。確認できたら通常の成功表記にする。
+        // GAS本体の実行はサーバー側で続いているため、5秒間隔で最大12ホップ（約1〜1.5分）待つ。
+        const ids: string[] = (plan as any)._sheetCheckIds || [];
+        const results: string[] = (plan as any)._sheetResults || [];
+        const pending: { idx: number; spreadsheetId: string; sheetName?: string; label: string }[] =
+          (plan as any)._sheetPending || [];
+        if (state.attempts === 0) {
+          await postProgress(env, plan, "📊 GASの応答が遅いため、集計表への反映を確認しています…（最大1分半）");
+        }
+        const MAX_SHEET_VERIFY_ATTEMPTS = 12;
+        const still: typeof pending = [];
+        for (const p of pending) {
+          const r = await callSheetCheck(env.SUBMIT_GAS_URL || env.COMMON_GAS_URL, {
+            spreadsheetId: p.spreadsheetId,
+            sheetName: p.sheetName,
+            ids,
+          });
+          if (r.ok && (r.missing || []).length === 0) {
+            results[p.idx] = p.label; // 反映を確認できた＝通常の成功表記
+          } else if (!r.ok && /不明なaction/.test(r.error || "")) {
+            // 入稿GASが旧版（submitCheck未実装）→ ポーリングしても無駄なので即確定
+            results[p.idx] = `${p.label} ⚠️ GAS応答待ちタイムアウト（入稿GASが旧版のため自動確認不可。GAS再デプロイ後は自動確認されます）。集計表を目視確認してください`;
+          } else {
+            still.push(p);
+          }
+        }
+        state.attempts += 1;
+        if (still.length > 0 && state.attempts < MAX_SHEET_VERIFY_ATTEMPTS) {
+          (plan as any)._sheetPending = still;
+          (plan as any)._sheetResults = results;
+          await sleep(5000);
+          break; // chainNextで次ホップへ（確認を継続）
+        }
+        for (const p of still) {
+          results[p.idx] = `${p.label} ⚠️ GAS応答待ちタイムアウト後、約1分半待っても反映を確認できませんでした。集計表を確認し、無ければ同じ /cr-in を再実行してください（作成済みはスキップされます）`;
+        }
+        (plan as any)._sheetResults = results;
+        (plan as any)._sheetPending = [];
+        await updateRunLog(env.NOTION_TOKEN, plan.runLogPageId, {
+          sheetResult: results.some((r) => r.includes("❌") || r.includes("確認できませんでした")) ? "失敗" : "成功",
           sheetTabs: gasTargets.map((t) => t.sheetName || "").filter(Boolean),
         });
         state.step = "notion";

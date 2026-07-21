@@ -132,7 +132,7 @@ export interface CreativeTextOverrides {
 
 /** self-chaining continuation の状態 */
 export interface ContinuationState {
-  step: "upload" | "wait_ready" | "create_ads" | "activate" | "sheet" | "notion" | "done";
+  step: "upload" | "wait_ready" | "create_ads" | "activate" | "sheet" | "sheet_verify" | "notion" | "done";
   /** videos[] のうち現在処理中のindex（upload/wait_ready用） */
   index: number;
   /** wait_ready の試行回数（バックオフ・上限用） */
