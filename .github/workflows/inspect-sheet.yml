@@ -25,6 +25,10 @@ on:
         description: "ダンプ対象行をカンマ区切りで限定（例: 2,3,5。空なら全行）"
         required: false
         default: ""
+      cells:
+        description: "任意セルをカンマ区切りで値/式読取（例: AI1100,AU1100。tab必須。指定時はこれのみ実行）"
+        required: false
+        default: ""
 
 jobs:
   inspect:
@@ -48,8 +52,10 @@ jobs:
           if [ "${{ github.event.inputs.formulas }}" = "true" ]; then FORMULAS="--formulas"; fi
           ROWS=""
           if [ -n "${{ github.event.inputs.rows }}" ]; then ROWS="--rows ${{ github.event.inputs.rows }}"; fi
+          CELLS=""
+          if [ -n "${{ github.event.inputs.cells }}" ]; then CELLS="--cells ${{ github.event.inputs.cells }}"; fi
           if [ -n "${{ github.event.inputs.tab }}" ]; then
-            node inspect_sheet.mjs --sheet "${{ github.event.inputs.sheet }}" --tab "${{ github.event.inputs.tab }}" $DUMP $FORMULAS $ROWS
+            node inspect_sheet.mjs --sheet "${{ github.event.inputs.sheet }}" --tab "${{ github.event.inputs.tab }}" $DUMP $FORMULAS $ROWS $CELLS
           else
             node inspect_sheet.mjs --sheet "${{ github.event.inputs.sheet }}" --json
           fi

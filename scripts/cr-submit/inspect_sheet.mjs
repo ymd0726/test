@@ -37,6 +37,28 @@ const auth = new google.auth.GoogleAuth({
 });
 const sheets = google.sheets({ version: "v4", auth });
 
+// --- --cells: 任意セルの値/数式をピンポイント読取（較正・値確認用、読み取り専用） ---
+if (args.cells) {
+  if (!args.tab) {
+    console.error("ERROR: --cells は --tab と併用してください。");
+    process.exit(1);
+  }
+  const cellList = args.cells.split(",").map((s) => s.trim()).filter(Boolean);
+  const ranges = cellList.map((c) => `'${args.tab}'!${c}`);
+  const [fv, fm] = await Promise.all([
+    sheets.spreadsheets.values.batchGet({ spreadsheetId: SPREADSHEET_ID, ranges, valueRenderOption: "FORMATTED_VALUE" }),
+    sheets.spreadsheets.values.batchGet({ spreadsheetId: SPREADSHEET_ID, ranges, valueRenderOption: "FORMULA" }),
+  ]);
+  console.log(`# セル読取: ${args.tab}`);
+  for (let i = 0; i < cellList.length; i++) {
+    const v = fv.data.valueRanges[i]?.values?.[0]?.[0] ?? "";
+    const f = fm.data.valueRanges[i]?.values?.[0]?.[0] ?? "";
+    const shownF = String(f) !== String(v) ? ` （式: ${f}）` : "";
+    console.log(`${cellList[i]} = ${JSON.stringify(String(v))}${shownF}`);
+  }
+  process.exit(0);
+}
+
 // --- タブ一覧＋列グループ化メタデータ ---
 const meta = await sheets.spreadsheets.get({
   spreadsheetId: SPREADSHEET_ID,
@@ -219,6 +241,7 @@ function parseArgs(argv) {
     else if (argv[i] === "--dump") out.dump = true;
     else if (argv[i] === "--formulas") out.formulas = true;
     else if (argv[i] === "--rows") out.rows = argv[++i];
+    else if (argv[i] === "--cells") out.cells = argv[++i];
   }
   return out;
 }
