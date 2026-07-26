@@ -1,6 +1,7 @@
-name: 集計表 当たりの狼煙（noroshi）
+name: 集計表 当たり予備軍/候補（noroshi）
 
-# 手動実行専用。CPAが目標を下回る「当たり予備軍」を消化金額列の別行に表示専用で点灯させる。
+# 手動実行専用。CPAが目標を下回る「当たり予備軍🌱/当たり候補🔥」を消化金額列の別行に表示専用で点灯させる。
+# 親（子有り）は自身の指標が使えないため配下の子バッジを OR 集約する。
 # inspect-sheet と同じ GOOGLE_SERVICE_ACCOUNT_JSON を使用。
 # mode=dry-run（デフォルト）は書き込みなし＋実データで点灯予測。apply 時のみ書き込み・undoログ保存。
 on:
@@ -25,9 +26,13 @@ on:
         required: true
         default: "1100"
       noroshi_row:
-        description: "のろしを書く行（当たりプルダウンと同じ列の空き行。例: 7）"
+        description: "当たり判定を書く行（消化金額列。例: 2＝親子判定行のプレースホルダ上）"
         required: true
-        default: "7"
+        default: "2"
+      clear_old_row:
+        description: "行移動時に旧行の当たり式を空にする（例: 7。空なら掃除しない）"
+        required: false
+        default: ""
       id_row:
         description: "cr識別子の行（例: 6）"
         required: true
@@ -66,16 +71,19 @@ jobs:
           SPENDLINE_CELL: ${{ github.event.inputs.spendline_cell }}
           METRIC_ROW: ${{ github.event.inputs.metric_row }}
           NOROSHI_ROW: ${{ github.event.inputs.noroshi_row }}
+          CLEAR_OLD_ROW: ${{ github.event.inputs.clear_old_row }}
           ID_ROW: ${{ github.event.inputs.id_row }}
           SETTINGS_TAB: ${{ github.event.inputs.settings_tab }}
           MODE: ${{ github.event.inputs.mode }}
         run: |
           APPLY_FLAG=""
           if [ "$MODE" = "apply" ]; then APPLY_FLAG="--apply"; fi
+          CLEAR_FLAG=""
+          if [ -n "$CLEAR_OLD_ROW" ]; then CLEAR_FLAG="--clear-old-row $CLEAR_OLD_ROW"; fi
           node noroshi.mjs --sheet "$SHEET" --tab "$TAB" \
             --target-cell "$TARGET_CELL" --spendline-cell "$SPENDLINE_CELL" \
             --metric-row "$METRIC_ROW" --noroshi-row "$NOROSHI_ROW" --id-row "$ID_ROW" \
-            --settings-tab "$SETTINGS_TAB" $APPLY_FLAG --undo-out undo_log.json
+            --settings-tab "$SETTINGS_TAB" $CLEAR_FLAG $APPLY_FLAG --undo-out undo_log.json
       - name: Upload undo log
         if: github.event.inputs.mode == 'apply'
         uses: actions/upload-artifact@v4
