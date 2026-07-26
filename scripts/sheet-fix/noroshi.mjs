@@ -113,11 +113,15 @@ if (skipped.length) {
 }
 
 // 書き込み先が空でないブロックは除外（既存内容を壊さない）
-const writable = blocks.filter((b) => b.current === "");
-const occupied = blocks.filter((b) => b.current !== "");
-if (occupied.length) {
-  console.log(`\n⚠ ${NOROSHI_ROW}行目が空でないため除外: ${occupied.length} 件（既存内容を壊さない）`);
-  for (const b of occupied.slice(0, 10)) console.log(`  - ${b.cell} ${b.id}: 現在値=${JSON.stringify(b.current)}`);
+// 空セル or 既存のろし式（LABEL を含む）＝書き込み/更新可。外部の内容は保護して除外。
+const isOurs = (v) => v.includes(LABEL);
+const writable = blocks.filter((b) => b.current === "" || isOurs(b.current));
+const foreign = blocks.filter((b) => b.current !== "" && !isOurs(b.current));
+const updateCount = writable.filter((b) => b.current !== "").length;
+if (updateCount) console.log(`（うち ${updateCount} 件は既存のろし式の更新）`);
+if (foreign.length) {
+  console.log(`\n⚠ ${NOROSHI_ROW}行目に外部の内容があるため除外: ${foreign.length} 件（既存内容を壊さない）`);
+  for (const b of foreign.slice(0, 10)) console.log(`  - ${b.cell} ${b.id}: 現在値=${JSON.stringify(b.current)}`);
 }
 if (writable.length === 0) { console.log("\n書き込み可能なブロックがありません。終了します。"); process.exit(0); }
 
@@ -167,7 +171,7 @@ const undoLog = {
   spreadsheetId: SPREADSHEET_ID, title: meta.data.properties.title, tab: TAB,
   noroshiRow: NOROSHI_ROW, metricRow: METRIC_ROW, targetCell: TARGET, spendlineCell: SPENDLINE,
   cpaFactor: CPA_FACTOR, cvMin: CV_MIN, appliedAt: new Date().toISOString(), serviceAccount: creds.client_email,
-  edits: writable.map((b) => ({ cell: b.cell, before: "", after: b.formula })),
+  edits: writable.map((b) => ({ cell: b.cell, before: b.current, after: b.formula })),
 };
 writeFileSync(UNDO_OUT, JSON.stringify(undoLog, null, 2));
 console.log(`\n# undo ログを保存: ${UNDO_OUT}（before は空。取り消すには対象セルを空にすればよい）`);
