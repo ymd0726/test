@@ -32,14 +32,10 @@ on:
         description: "cr識別子の行（例: 6）"
         required: true
         default: "6"
-      cv_min:
-        description: "実質cvの最小件数（既定3）"
+      settings_tab:
+        description: "のろし基準の設定シート名（既定 data。基準値は data!S2:S5 を編集）"
         required: true
-        default: "3"
-      cpa_factor:
-        description: "CPAしきい係数（目標CPA×係数。1.0=目標以下、0.8=目標の8割以下）"
-        required: true
-        default: "1.0"
+        default: "data"
       mode:
         description: "dry-run: 点灯予測のみ / apply: 実際に式を書き込む"
         required: true
@@ -71,8 +67,7 @@ jobs:
           METRIC_ROW: ${{ github.event.inputs.metric_row }}
           NOROSHI_ROW: ${{ github.event.inputs.noroshi_row }}
           ID_ROW: ${{ github.event.inputs.id_row }}
-          CV_MIN: ${{ github.event.inputs.cv_min }}
-          CPA_FACTOR: ${{ github.event.inputs.cpa_factor }}
+          SETTINGS_TAB: ${{ github.event.inputs.settings_tab }}
           MODE: ${{ github.event.inputs.mode }}
         run: |
           APPLY_FLAG=""
@@ -80,7 +75,7 @@ jobs:
           node noroshi.mjs --sheet "$SHEET" --tab "$TAB" \
             --target-cell "$TARGET_CELL" --spendline-cell "$SPENDLINE_CELL" \
             --metric-row "$METRIC_ROW" --noroshi-row "$NOROSHI_ROW" --id-row "$ID_ROW" \
-            --cv-min "$CV_MIN" --cpa-factor "$CPA_FACTOR" $APPLY_FLAG --undo-out undo_log.json
+            --settings-tab "$SETTINGS_TAB" $APPLY_FLAG --undo-out undo_log.json
       - name: Upload undo log
         if: github.event.inputs.mode == 'apply'
         uses: actions/upload-artifact@v4
