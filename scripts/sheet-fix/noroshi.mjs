@@ -1,14 +1,15 @@
-// 集計表 当たり予備軍🌱／当たり候補🔥 自動判定セル生成（sheet-fix / noroshi）
+// 集計表 当たり候補🌱／当たり候補🌱🌱 自動判定セル生成（sheet-fix / noroshi）
 // ------------------------------------------------------------
-// CR停止判定（ネガ側）のポジ版として、「CPAが目標を下回る＝当たり予備軍/候補」を
+// CR停止判定（ネガ側）のポジ版として、「CPAが目標を下回る＝当たり候補」を
 // 当たり判定プルダウンと同じ列（消化金額列）の別行（既定2行目）に、表示専用の式で点灯させる。
+// 段階は新芽の数で表現（🌱=1段階目 / 🌱🌱=2段階目・高角度）。
 //
 // 点灯条件（CPA効率重視。量型は対象外）:
 //   AND(
 //     消化{metricRow}      >= {targetCell} * {spendlineCell},   … 十分な消化（データ量ゲート）
 //     ISNUMBER(CPA{metricRow}) AND CPA{metricRow} <= {targetCell} * {cpaFactor},  … CPAが目標を下回る
 //     実質cv{metricRow}    >= {cvMin}                            … 実数の裏付け
-//   ) → "当たり候補🔥"（高角度）/ "当たり予備軍🌱"（予備軍）/ else ""
+//   ) → "当たり候補🌱🌱"（高角度）/ "当たり候補🌱"（1段階目）/ else ""
 //
 // 親子対応（この改修の肝）:
 //   - 各ブロックのメモ列（ラベル「メモ」）の判定行（既定2行目）に親子区分がある
@@ -67,8 +68,8 @@ const CAND_CV_ROW = 5;   // 候補🔥 実質cv下限
 const APPLY = args.apply || process.env.APPLY === "1";
 const UNDO_OUT = args.undoOut || "undo_log.json";
 const HEADER_ROWS = Math.max(ID_ROW, LABEL_ROW, NOROSHI_ROW, DESIG_ROW, CLEAR_OLD_ROW || 0, 8);
-const LABEL_PRE = "当たり予備軍🌱";   // 予備軍
-const LABEL_CAND = "当たり候補🔥";     // 高角度
+const LABEL_PRE = "当たり候補🌱";     // 1段階目（新芽1つ）
+const LABEL_CAND = "当たり候補🌱🌱";  // 2段階目・高角度（新芽2つ）
 const MEMO_LABEL = args.memoLabel || "メモ";
 const PARENT_MARK = "親（子有り）";   // メモ列の親子区分がこれなら子集約
 // 上書き可能なプレースホルダ（意味を持たない仮置き）
@@ -84,8 +85,8 @@ console.log(`# 実行中のサービスアカウント: ${creds.client_email}`);
 console.log(`# モード: ${APPLY ? "APPLY（書き込みあり）" : "DRY RUN（書き込みなし）"}`);
 console.log(`# 対象: ${TAB} / ラベル行=${LABEL_ROW} / ID行=${ID_ROW} / 当たり判定行=${NOROSHI_ROW} / 親子区分行=${DESIG_ROW} / 指標行=${METRIC_ROW}${CLEAR_OLD_ROW ? ` / 旧行掃除=${CLEAR_OLD_ROW}` : ""}`);
 console.log(`# 消化ゲート: 消化>=${TARGET}*${SPENDLINE}`);
-console.log(`# 🔥候補: CPA<=${TARGET}*${CAND_CPA} かつ 実質cv>=${CAND_CV}`);
-console.log(`# 🌱予備軍: CPA<=${TARGET}*${PRE_CPA} かつ 実質cv>=${PRE_CV}`);
+console.log(`# ${LABEL_CAND}: CPA<=${TARGET}*${CAND_CPA} かつ 実質cv>=${CAND_CV}`);
+console.log(`# ${LABEL_PRE}: CPA<=${TARGET}*${PRE_CPA} かつ 実質cv>=${PRE_CV}`);
 console.log(`# 親（子有り）は配下の子バッジを OR 集約（自身の指標は使わない）`);
 
 const auth = new google.auth.GoogleAuth({
@@ -241,11 +242,11 @@ if (!APPLY) {
   }
   const cands = writable.filter((b) => b._eval?.tier === "cand");
   const pres = writable.filter((b) => b._eval?.tier === "pre");
-  console.log(`\n# data設定: 予備軍CPA係数=${preCpaF} cv下限=${preCvMin} / 候補CPA係数=${candCpaF} cv下限=${candCvMin}`);
+  console.log(`\n# data設定: ${LABEL_PRE} CPA係数=${preCpaF} cv下限=${preCvMin} / ${LABEL_CAND} CPA係数=${candCpaF} cv下限=${candCvMin}`);
   console.log(`（目標CPA=${target} / 消化ゲート=${target * spend}）`);
-  console.log(`\n===== 点灯予測: 🔥候補 ${cands.length}件 / 🌱予備軍 ${pres.length}件 （対象 ${writable.length}）=====`);
-  for (const b of cands) console.log(`  🔥 ${b.cell} ${b.id}: ${fmtEval(b)}`);
-  for (const b of pres) console.log(`  🌱 ${b.cell} ${b.id}: ${fmtEval(b)}`);
+  console.log(`\n===== 点灯予測: ${LABEL_CAND} ${cands.length}件 / ${LABEL_PRE} ${pres.length}件 （対象 ${writable.length}）=====`);
+  for (const b of cands) console.log(`  ${LABEL_CAND} ${b.cell} ${b.id}: ${fmtEval(b)}`);
+  for (const b of pres) console.log(`  ${LABEL_PRE} ${b.cell} ${b.id}: ${fmtEval(b)}`);
   console.log(`\n----- 生成する式のサンプル -----`);
   const sampleSelf = writable.find((b) => !b.aggregated);
   const sampleParent = writable.find((b) => b.aggregated);

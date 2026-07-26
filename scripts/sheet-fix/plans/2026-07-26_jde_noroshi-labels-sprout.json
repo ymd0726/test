@@ -1,0 +1,12 @@
+{
+  "sheet": "1oEK8JCJg2NcseWmnxLtfNFCe5A7XGJ_DJSj7c2EW1sg",
+  "tab": "data",
+  "note": "当たり候補の基準ラベルを新芽表記に統一（予備軍/🔥 を廃止し、段階は新芽の数で表現）。S列の数値は変更しない",
+  "edits": [
+    { "cell": "R1", "expectedBefore": "🌱🔥当たりのろし設定（S列の数値を編集）", "after": "🌱当たり候補 判定設定（S列の数値を編集）", "note": "見出し" },
+    { "cell": "R2", "expectedBefore": "予備軍🌱 CPA係数(目標CPA×)", "after": "当たり候補🌱 CPA係数(目標CPA×)", "note": "1段階目" },
+    { "cell": "R3", "expectedBefore": "予備軍🌱 実質cv下限", "after": "当たり候補🌱 実質cv下限", "note": "1段階目" },
+    { "cell": "R4", "expectedBefore": "候補🔥 CPA係数(目標CPA×)", "after": "当たり候補🌱🌱 CPA係数(目標CPA×)", "note": "2段階目" },
+    { "cell": "R5", "expectedBefore": "候補🔥 実質cv下限", "after": "当たり候補🌱🌱 実質cv下限", "note": "2段階目" }
+  ]
+}
