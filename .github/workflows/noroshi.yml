@@ -29,6 +29,10 @@ on:
         description: "当たり判定を書く行（消化金額列。例: 2＝親子判定行のプレースホルダ上）"
         required: true
         default: "2"
+      tier_row:
+        description: "中間行（0/1/2の判定コードを置く空き行。例: 1103。循環参照回避のため表示行とは別行）"
+        required: true
+        default: "1103"
       clear_old_row:
         description: "行移動時に旧行の当たり式を空にする（例: 7。空なら掃除しない）"
         required: false
@@ -71,6 +75,7 @@ jobs:
           SPENDLINE_CELL: ${{ github.event.inputs.spendline_cell }}
           METRIC_ROW: ${{ github.event.inputs.metric_row }}
           NOROSHI_ROW: ${{ github.event.inputs.noroshi_row }}
+          TIER_ROW: ${{ github.event.inputs.tier_row }}
           CLEAR_OLD_ROW: ${{ github.event.inputs.clear_old_row }}
           ID_ROW: ${{ github.event.inputs.id_row }}
           SETTINGS_TAB: ${{ github.event.inputs.settings_tab }}
@@ -82,7 +87,7 @@ jobs:
           if [ -n "$CLEAR_OLD_ROW" ]; then CLEAR_FLAG="--clear-old-row $CLEAR_OLD_ROW"; fi
           node noroshi.mjs --sheet "$SHEET" --tab "$TAB" \
             --target-cell "$TARGET_CELL" --spendline-cell "$SPENDLINE_CELL" \
-            --metric-row "$METRIC_ROW" --noroshi-row "$NOROSHI_ROW" --id-row "$ID_ROW" \
+            --metric-row "$METRIC_ROW" --noroshi-row "$NOROSHI_ROW" --tier-row "$TIER_ROW" --id-row "$ID_ROW" \
             --settings-tab "$SETTINGS_TAB" $CLEAR_FLAG $APPLY_FLAG --undo-out undo_log.json
       - name: Upload undo log
         if: github.event.inputs.mode == 'apply'
