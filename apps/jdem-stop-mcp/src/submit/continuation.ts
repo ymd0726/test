@@ -435,6 +435,21 @@ async function runHop(
           notionLine,
         ];
         if (activateWarn) lines.push(`:warning: ${activateWarn}`);
+        // crサムネ（0:01フレーム）を集計表セルに自動挿入（BUG-103）。ffmpegが要るためWorker/GASでは
+        // デコードできず、GitHub Actions(cr-thumbnail.yml)へworkflow_dispatchで委譲する。
+        // 集計表にブロックが入った後（=このdone時点）に起動し、Actions側でDrive→ffmpeg→GAS挿入する。
+        if (!sheetNames.includes("❌")) {
+          try {
+            const tr = await triggerThumbnailWorkflow(env, plan, gasTargets);
+            if (tr === "ok") {
+              lines.push(":frame_with_picture: サムネ： 集計表へ0:01フレームを自動挿入中（30秒〜1分半後に反映されます）");
+            } else if (tr === "no-token") {
+              lines.push(":information_source: サムネ： 自動挿入は未設定（GitHubトークン未登録）。手動Actionsで挿入できます");
+            }
+          } catch (e: any) {
+            lines.push(`:warning: サムネ自動挿入の起動に失敗: ${e.message}`);
+          }
+        }
         if (offParents.length === 0) {
           lines.push("", ":rocket: 広告はONにしました。配信が開始されます（最終確認をお願いします）。");
         } else {
@@ -485,6 +500,60 @@ async function runHop(
       true
     );
   }
+}
+
+/**
+ * crサムネ（0:01フレーム）を集計表へ自動挿入するため、GitHub Actions cr-thumbnail.yml を
+ * workflow_dispatch で起動する（BUG-103）。Worker/GASは動画デコード不可のためActionsに委譲。
+ * jobs = 各cr(集計表ID) → 動画DriveファイルID。親ブロックは _01（無ければ最小番号）のフレームを使う。
+ * トークン未設定なら "no-token" を返し、呼び出し側は従来どおり手動運用の案内にする。
+ */
+async function triggerThumbnailWorkflow(
+  env: SubmitEnv,
+  plan: SubmitPlan,
+  gasTargets: { spreadsheetId: string; sheetName?: string }[]
+): Promise<"ok" | "no-token" | "skip"> {
+  if (!env.GITHUB_DISPATCH_TOKEN) return "no-token";
+  const parentId = sheetParentId(plan);
+  const childVids = plan.videos.filter((v) => /cr\d+_\d{2}/i.test(v.sheetId) && v.driveFileId);
+  const jobs: { id: string; fileId: string }[] = [];
+  if (childVids.length > 0) {
+    // 親ブロックは _01 のフレーム（「親は01」運用）。今回の入稿に _01 が含まれるときだけ親を更新する。
+    // 例: /cr-in cr47_07 08 のような部分入稿では親(cr47)の既存01サムネを非01で上書きしない。
+    const rep01 = childVids.find((v) => /_01$/i.test(v.sheetId));
+    if (rep01) jobs.push({ id: parentId, fileId: rep01.driveFileId });
+    for (const v of childVids) jobs.push({ id: v.sheetId, fileId: v.driveFileId });
+  } else if (plan.videos[0]?.driveFileId) {
+    // 単独cr（パターン無し）: 親ブロックにその動画のフレームを入れる
+    jobs.push({ id: parentId, fileId: plan.videos[0].driveFileId });
+  }
+  if (jobs.length === 0) return "skip";
+
+  const repo = env.GITHUB_REPO || "ymd0726/test";
+  const ref = env.GITHUB_WORKFLOW_REF || "claude/creative-submission-tool-z5vq8t";
+  let dispatched = false;
+  for (const t of gasTargets) {
+    const res = await fetch(
+      `https://api.github.com/repos/${repo}/actions/workflows/cr-thumbnail.yml/dispatches`,
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${env.GITHUB_DISPATCH_TOKEN}`,
+          accept: "application/vnd.github+json",
+          "content-type": "application/json",
+          "user-agent": "cr-nyukoukun",
+        },
+        body: JSON.stringify({
+          ref,
+          inputs: { sheet: t.spreadsheetId, tab: t.sheetName || "", sec: "1", jobs: JSON.stringify(jobs) },
+        }),
+      }
+    );
+    // 204 No Content が成功。それ以外はエラー本文を投げて呼び出し側で通知
+    if (res.status === 204) dispatched = true;
+    else throw new Error(`workflow_dispatch失敗 (${res.status}): ${(await res.text()).slice(0, 200)}`);
+  }
+  return dispatched ? "ok" : "skip";
 }
 
 /**

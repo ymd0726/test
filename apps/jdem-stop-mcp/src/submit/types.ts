@@ -159,6 +159,13 @@ export interface SubmitEnv {
   SELF_URL: string;
   /** 自分自身へのService Binding（wrangler.jsonc services）。公開URL経由の自己fetchはCloudflareが404にするため必須 */
   SELF_WORKER?: { fetch: (input: Request | string, init?: RequestInit) => Promise<Response> };
+  /** crサムネ自動挿入用（BUG-103）。GitHub Actions cr-thumbnail.yml を workflow_dispatch する
+   * PAT/ファイングレインドトークン（actions:write）。未設定ならサムネ自動挿入はスキップ（従来どおり手動） */
+  GITHUB_DISPATCH_TOKEN?: string;
+  /** サムネworkflowのあるリポジトリ。既定 "ymd0726/test" */
+  GITHUB_REPO?: string;
+  /** サムネworkflowを動かすref（ブランチ）。既定はcr入稿くんのブランチ */
+  GITHUB_WORKFLOW_REF?: string;
 }
 
 export const GRAPH = "https://graph.facebook.com/v21.0";
