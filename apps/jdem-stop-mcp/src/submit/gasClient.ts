@@ -57,6 +57,27 @@ export async function callSheetCheck(
   return (await callGasJson(gasUrl, { action: "submitCheck", ...req }, GAS_CHECK_TIMEOUT_MS)) as SheetCheckResult;
 }
 
+/**
+ * crサムネをセル内画像として挿入（BUG-104のゼロ設定サムネ挿入）。
+ * GAS action=insertCrThumbnail（imageBase64 or imageUrl）。GitHubトークン無しでも
+ * Metaの自動サムネをWorkerがbase64で渡して集計表に入れられるようにする。
+ */
+export interface SheetThumbnailResult {
+  ok: boolean;
+  cell?: string;
+  merged?: boolean;
+  error?: string;
+}
+
+const GAS_THUMB_TIMEOUT_MS = 25_000;
+
+export async function callSheetThumbnail(
+  gasUrl: string,
+  req: { spreadsheetId: string; sheetName?: string; id: string; imageBase64?: string; imageUrl?: string; mimeType?: string }
+): Promise<SheetThumbnailResult> {
+  return (await callGasJson(gasUrl, { action: "insertCrThumbnail", ...req }, GAS_THUMB_TIMEOUT_MS)) as SheetThumbnailResult;
+}
+
 async function callGasJson(gasUrl: string, body: unknown, timeoutMs: number): Promise<{ ok: boolean; error?: string }> {
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), timeoutMs);

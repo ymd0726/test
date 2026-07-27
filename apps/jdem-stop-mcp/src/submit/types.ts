@@ -120,6 +120,8 @@ export interface PlannedVideo {
   videoId?: string;
   creativeId?: string;
   adId?: string;
+  /** Meta自動生成サムネのURL（BUG-104のゼロ設定サムネ挿入で使う。create_adsで取得済み） */
+  thumbUrl?: string;
   /** 複数広告セット入稿時: adsetId → 作成済みadId（再実行時のスキップ判定に使う） */
   adIdsByAdset?: Record<string, string>;
 }

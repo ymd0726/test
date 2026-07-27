@@ -31,7 +31,7 @@ import {
   getAdsetParentStatus,
   getAdsetAdsByName,
 } from "./meta";
-import { callSheetSubmit, callSheetCheck } from "./gasClient";
+import { callSheetSubmit, callSheetCheck, callSheetThumbnail } from "./gasClient";
 import { markSubmitted } from "./notion";
 import { createRunLog, updateRunLog } from "../check/runlog";
 
@@ -201,6 +201,7 @@ async function runHop(
             throw new Error(`動画 ${v.adName} のサムネイルがまだ生成されていません（video_id=${v.videoId}）。少し待って同じ /cr-in を再実行してください`);
           }
           thumbs.set(v.videoId!, thumbnailUrl);
+          v.thumbUrl = thumbnailUrl; // ゼロ設定サムネ挿入（BUG-104）で done から使う
         }
         let igActorId: string | undefined; // 1815199リトライで解決したPBIAを2本目以降にも使い回す
         for (const t of targets) {
@@ -440,14 +441,17 @@ async function runHop(
         // 集計表にブロックが入った後（=このdone時点）に起動し、Actions側でDrive→ffmpeg→GAS挿入する。
         if (!sheetNames.includes("❌")) {
           try {
-            const tr = await triggerThumbnailWorkflow(env, plan, gasTargets);
-            if (tr === "ok") {
-              lines.push(":frame_with_picture: サムネ： 集計表へ0:01フレームを自動挿入中（30秒〜1分半後に反映されます）");
-            } else if (tr === "no-token") {
-              lines.push(":information_source: サムネ： 自動挿入は未設定（GitHubトークン未登録）。手動Actionsで挿入できます");
+            if (env.GITHUB_DISPATCH_TOKEN) {
+              // トークンあり: ffmpegで正確な0:01フレームを抽出（Actions委譲）
+              const tr = await triggerThumbnailWorkflow(env, plan, gasTargets);
+              if (tr === "ok") lines.push(":frame_with_picture: サムネ： 集計表へ0:01フレームを自動挿入中（30秒〜1分半後に反映されます）");
+            } else {
+              // トークン無し（ゼロ設定）: Metaの自動生成サムネをWorkerが取得しbase64でセル挿入（BUG-104）
+              const n = await insertMetaThumbnails(env, plan, metaToken, gasTargets);
+              if (n > 0) lines.push(`:frame_with_picture: サムネ： 集計表に挿入しました（${n}件）`);
             }
           } catch (e: any) {
-            lines.push(`:warning: サムネ自動挿入の起動に失敗: ${e.message}`);
+            lines.push(`:warning: サムネ挿入に失敗: ${e.message}（集計表のサムネは後で手動でも入れられます）`);
           }
         }
         if (offParents.length === 0) {
@@ -500,6 +504,77 @@ async function runHop(
       true
     );
   }
+}
+
+/**
+ * ゼロ設定サムネ挿入（BUG-104）。GitHubトークンが無くても、Metaが動画アップロード時に
+ * 自動生成したサムネ画像をWorkerが取得→base64化→GAS insertCrThumbnailでセル内画像として
+ * 挿入する。ffmpeg不要・GitHubトークン不要・ユーザー作業ゼロ。フレームはMetaの自動選択
+ * （厳密な0:01ではない）だが、base64埋め込みなのでURL失効の心配はなく恒久的。
+ * 「親は01」運用に合わせ、親ブロックは _01 の動画サムネを使う（_01が今回に無ければ親はスキップ）。
+ * 戻り値: 挿入できたセル数。
+ */
+async function insertMetaThumbnails(
+  env: SubmitEnv,
+  plan: SubmitPlan,
+  metaToken: string,
+  gasTargets: { spreadsheetId: string; sheetName?: string }[]
+): Promise<number> {
+  const parentId = sheetParentId(plan);
+  const childVids = plan.videos.filter((v) => /cr\d+_\d{2}/i.test(v.sheetId) && v.videoId);
+  // (集計表ID, 動画) のペアを作る
+  const items: { id: string; videoId: string; thumbUrl?: string }[] = [];
+  if (childVids.length > 0) {
+    const rep01 = childVids.find((v) => /_01$/i.test(v.sheetId));
+    if (rep01) items.push({ id: parentId, videoId: rep01.videoId!, thumbUrl: rep01.thumbUrl });
+    for (const v of childVids) items.push({ id: v.sheetId, videoId: v.videoId!, thumbUrl: v.thumbUrl });
+  } else if (plan.videos[0]?.videoId) {
+    items.push({ id: parentId, videoId: plan.videos[0].videoId!, thumbUrl: plan.videos[0].thumbUrl });
+  }
+  if (items.length === 0) return 0;
+
+  const gasUrl = env.SUBMIT_GAS_URL || env.COMMON_GAS_URL;
+  let inserted = 0;
+  for (const it of items) {
+    // サムネURL（create_adsで取得済み。再実行等で未取得なら取り直す）
+    let url = it.thumbUrl;
+    if (!url) url = (await getVideoThumbnailUrl(it.videoId, metaToken)) || undefined;
+    if (!url) continue;
+    // Metaサムネ画像のバイトを取得しbase64化（数十KB程度のJPEG）
+    let b64 = "";
+    let mime = "image/jpeg";
+    try {
+      const r = await fetch(url);
+      if (!r.ok) continue;
+      mime = r.headers.get("content-type") || "image/jpeg";
+      b64 = abToBase64(await r.arrayBuffer());
+    } catch {
+      continue;
+    }
+    if (!b64) continue;
+    for (const t of gasTargets) {
+      const res = await callSheetThumbnail(gasUrl, {
+        spreadsheetId: t.spreadsheetId,
+        sheetName: t.sheetName,
+        id: it.id,
+        imageBase64: b64,
+        mimeType: mime,
+      });
+      if (res.ok) inserted++;
+    }
+  }
+  return inserted;
+}
+
+/** ArrayBuffer → base64（Meta自動サムネは小さいので単純ループで十分） */
+function abToBase64(buf: ArrayBuffer): string {
+  const bytes = new Uint8Array(buf);
+  let bin = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + CHUNK)) as any);
+  }
+  return btoa(bin);
 }
 
 /**
