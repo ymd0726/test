@@ -47,8 +47,28 @@ export async function resolveSubmit(
   input: ResolveInput
 ): Promise<ResolveOutcome> {
   const warnings: string[] = [];
-  const arg = input.text.trim();
-  if (!arg) throw new Error("使い方: `/cr-in <cr名 または NotionページURL>`（例: `/cr-in cr79`）");
+  // パターン指定（BUG-99）: 「cr47_07」「cr47 06 07」「cr47_06,07」「<NotionURL> 06」の形式で
+  // 入稿対象パターンを絞り込める。省略時は従来どおりDriveで見つかった全パターンを入稿。
+  // （実例: /cr-in hyd_cr47_07 と打ったのに全9パターンがプランに並んだ→_07だけにしたい）
+  const tokens = input.text.trim().split(/[\s,、]+/).filter(Boolean);
+  let arg = tokens[0] || "";
+  if (!arg)
+    throw new Error(
+      "使い方: `/cr-in <cr名 または NotionページURL> [パターン番号…]`（例: `/cr-in cr79` ／ 特定パターンのみ: `/cr-in cr79_06` や `/cr-in cr79 06 07`）"
+    );
+  const selPatterns = new Set<string>();
+  for (const t of tokens.slice(1)) {
+    const pm = t.match(/^_?(\d{1,2})$/);
+    if (pm) selPatterns.add(pm[1].padStart(2, "0"));
+  }
+  if (!/notion\.(so|com)|app\.notion\.com|^[0-9a-f-]{32,36}$/i.test(arg)) {
+    // cr名末尾の _NN はパターン指定として扱い、CRDB検索キーからは外す（cr47_07 / 47_07 両対応）
+    const suf = arg.match(/^(.*?(?:cr)?\d+)_(\d{2})$/i);
+    if (suf) {
+      selPatterns.add(suf[2]);
+      arg = suf[1];
+    }
+  }
 
   // 1. Notion CRページ
   let crPage: CrPageInfo;
@@ -160,7 +180,7 @@ export async function resolveSubmit(
     all = await listCreativeFiles(driveToken, folderId, prefix);
   }
   const childPattern = new RegExp(`${escapeReg(crKey)}_(\\d{2})`, "i");
-  const children = all
+  let children = all
     .filter((f) => childPattern.test(f.name))
     .sort((a, b) => a.name.localeCompare(b.name, "ja"));
   const parent = all.find((f) => !childPattern.test(f.name));
@@ -169,6 +189,24 @@ export async function resolveSubmit(
   }
   if (!parent && children.length === 0) {
     throw new Error(`入稿対象ファイルを特定できません（検出: ${all.map((f) => f.name).join(", ")}）`);
+  }
+  // パターン指定があれば対象を絞り込む（BUG-99）。指定分が見つからなければ誤入稿せず明示エラー
+  if (selPatterns.size > 0) {
+    const want = [...selPatterns].sort();
+    const nnOf = (f: DriveFile) => f.name.match(childPattern)?.[1];
+    const filtered = children.filter((f) => selPatterns.has(nnOf(f) || ""));
+    const foundNN = new Set(filtered.map((f) => nnOf(f)!));
+    const missing = want.filter((n) => !foundNN.has(n));
+    if (missing.length > 0) {
+      throw new Error(
+        `指定パターン（_${missing.join(", _")}）の完成ファイルがDriveに見つかりません` +
+          (children.length
+            ? `。検出済み: ${children.map((f) => f.name).join(", ")}`
+            : `。この crにはパターンファイル（${crKey}_NN）がありません`)
+      );
+    }
+    children = filtered;
+    warnings.push(`ℹ️ パターン指定: _${want.join(", _")} のみを入稿します（他のパターンは対象外）`);
   }
 
   // 3. Meta 広告セット候補
