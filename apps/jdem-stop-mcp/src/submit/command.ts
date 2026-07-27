@@ -72,23 +72,28 @@ async function resolveAndAsk(
         type: "section",
         text: { type: "mrkdwn", text: "入稿先の広告セットを選んでください（コピー元=各セットの直近cr広告）:" },
       });
-      const buttons: any[] = outcome.adsetCandidates.slice(0, 5).map((c, i) => ({
-        type: "button",
-        text: {
-          type: "plain_text",
-          text: truncate(
-            `${c.effectiveStatus === "ACTIVE" ? "🟢" : "⏸"} ${c.campaignName ? `${c.campaignName} / ${c.name}` : c.name}`,
-            74
-          ),
-        },
-        action_id: `crin_exec_${i}`,
-        value: JSON.stringify({ a: payload.text.trim(), ad: c.id, s: c.latestAd!.id }),
-        confirm: confirmDialog(plan.parentName, `${c.campaignName || ""} / ${c.name}`, c.latestAd!.name),
-      }));
+      // キャンペーン名/広告セット名は section の mrkdwn 本文に置いて全文表示する（BUG-100）。
+      // 以前はボタンのlabel（plain_text・1行）に入れていたため、名前が長いとスマホ等で
+      // 見切れていた。sectionのmrkdwnは折り返して全文表示され、ボタンは短い固定ラベルにする。
+      outcome.adsetCandidates.slice(0, 5).forEach((c, i) => {
+        const full = c.campaignName ? `${c.campaignName} / ${c.name}` : c.name;
+        blocks.push({
+          type: "section",
+          text: { type: "mrkdwn", text: `${c.effectiveStatus === "ACTIVE" ? "🟢" : "⏸"} *${full}*` },
+          accessory: {
+            type: "button",
+            text: { type: "plain_text", text: "このセットに入稿", emoji: true },
+            action_id: `crin_exec_${i}`,
+            value: JSON.stringify({ a: payload.text.trim(), ad: c.id, s: c.latestAd!.id }),
+            confirm: confirmDialog(plan.parentName, full, c.latestAd!.name),
+          },
+        });
+      });
       // 表示中の全セットへ同時入稿するボタン（BUG-31）。テキスト類は各セットの直近cr広告からコピー
+      const actionEls: any[] = [];
       if (outcome.adsetCandidates.length >= 2) {
         const allNames = outcome.adsetCandidates.map((c) => c.name).join(" / ");
-        buttons.push({
+        actionEls.push({
           type: "button",
           style: "primary",
           text: { type: "plain_text", text: `🚀 すべてに入稿（${outcome.adsetCandidates.length}セット）` },
@@ -97,7 +102,8 @@ async function resolveAndAsk(
           confirm: confirmDialog(plan.parentName, truncate(allNames, 120), "各セットの直近cr広告"),
         });
       }
-      blocks.push({ type: "actions", elements: [...buttons, cancelButton()] });
+      actionEls.push(cancelButton());
+      blocks.push({ type: "actions", elements: actionEls });
       const filteredBySpend = outcome.adsetCandidates.some((c) => (c.spend7d ?? 0) > 0);
       const notes: string[] = [
         filteredBySpend
@@ -138,16 +144,30 @@ async function resolveAndAsk(
     if (e instanceof CrPageAmbiguousError) {
       // CRDB候補が複数 → エラーで止めず、ページ選択ボタンを出す（BUG-27）。
       // 選択後は pageId で再解決するので、以降は通常フローと同じ。
-      const buttons: any[] = e.candidates.slice(0, 5).map((c, i) => ({
-        type: "button",
-        text: { type: "plain_text", text: truncate(c.name || "(無題)", 74) },
-        action_id: `crin_pick_${i}`,
-        value: JSON.stringify({ p: c.pageId }),
-      }));
+      // ページ名は section の mrkdwn に置いて全文表示（BUG-100。長い名前がボタンlabelで見切れるのを防ぐ）
+      const blocks: any[] = [
+        {
+          type: "section",
+          text: { type: "mrkdwn", text: `🔀 Notion CRDBに \`${payload.text.trim()}\` の候補が複数あります。入稿対象を選んでください:` },
+        },
+      ];
+      e.candidates.slice(0, 5).forEach((c, i) => {
+        blocks.push({
+          type: "section",
+          text: { type: "mrkdwn", text: `*${c.name || "(無題)"}*` },
+          accessory: {
+            type: "button",
+            text: { type: "plain_text", text: "このページ" },
+            action_id: `crin_pick_${i}`,
+            value: JSON.stringify({ p: c.pageId }),
+          },
+        });
+      });
       // 全候補をまとめて入稿したいケース（cr83_01/cr83_02のような兄弟ページ。BUG-31続報）:
       // 各ページの入稿プランを順に表示する。実行ボタンはプランごとに出るので誤爆しない
+      const pickActions: any[] = [];
       if (e.candidates.length >= 2) {
-        buttons.push({
+        pickActions.push({
           type: "button",
           style: "primary",
           text: { type: "plain_text", text: `📤 すべての入稿プランを表示（${Math.min(e.candidates.length, 5)}件）` },
@@ -155,12 +175,9 @@ async function resolveAndAsk(
           value: JSON.stringify({ ps: e.candidates.slice(0, 5).map((c) => c.pageId) }),
         });
       }
-      const blocks: any[] = [
-        {
-          type: "section",
-          text: { type: "mrkdwn", text: `🔀 Notion CRDBに \`${payload.text.trim()}\` の候補が複数あります。入稿対象を選んでください:` },
-        },
-        { type: "actions", elements: [...buttons, cancelButton()] },
+      pickActions.push(cancelButton());
+      blocks.push(
+        { type: "actions", elements: pickActions },
         {
           type: "context",
           elements: [
@@ -172,7 +189,7 @@ async function resolveAndAsk(
             },
           ],
         },
-      ];
+      );
       await respond(payload.response_url, { blocks, response_type: "ephemeral" });
       return;
     }
