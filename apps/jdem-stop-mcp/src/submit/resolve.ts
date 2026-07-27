@@ -16,11 +16,14 @@ import { listAdsetCandidates, findAdsByExactName, AdsetCandidate } from "./meta"
  */
 export class CrPageAmbiguousError extends Error {
   candidates: { pageId: string; name: string }[];
-  constructor(key: string, candidates: { pageId: string; name: string }[]) {
+  /** パターン指定（例 ["07","08"]）。ページ選択後の再解決でも維持するため持ち回る（BUG-101） */
+  patterns: string[];
+  constructor(key: string, candidates: { pageId: string; name: string }[], patterns: string[] = []) {
     super(
       `Notion CRDBに「${key}」の候補が複数あります:\n${candidates.map((c) => `・${c.name}`).join("\n")}`
     );
     this.candidates = candidates;
+    this.patterns = patterns;
   }
 }
 
@@ -115,7 +118,8 @@ export async function resolveSubmit(
       // 候補複数はSlack側でページ選択ボタンを出す（BUG-27）。command.tsがこの型をcatchして分岐
       throw new CrPageAmbiguousError(
         key,
-        submittable.map((h) => ({ pageId: h.pageId, name: h.name }))
+        submittable.map((h) => ({ pageId: h.pageId, name: h.name })),
+        [...selPatterns]
       );
     crPage = submittable[0];
   }

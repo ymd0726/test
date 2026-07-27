@@ -151,15 +151,19 @@ async function resolveAndAsk(
           text: { type: "mrkdwn", text: `🔀 Notion CRDBに \`${payload.text.trim()}\` の候補が複数あります。入稿対象を選んでください:` },
         },
       ];
+      // パターン指定（例 07,08）はページ選択後の再解決でも維持する（BUG-101）。
+      // hydのcr47のようにCRDB候補が複数だと必ずこのpickを通るため、ここで落とすと
+      // /cr-in cr47_07 08 の絞り込みが効かなくなる。ボタンvalueにpatを載せて持ち回る。
+      const pat = e.patterns && e.patterns.length ? e.patterns : undefined;
       e.candidates.slice(0, 5).forEach((c, i) => {
         blocks.push({
           type: "section",
-          text: { type: "mrkdwn", text: `*${c.name || "(無題)"}*` },
+          text: { type: "mrkdwn", text: `*${c.name || "(無題)"}*${pat ? `　（_${pat.join(", _")} のみ）` : ""}` },
           accessory: {
             type: "button",
             text: { type: "plain_text", text: "このページ" },
             action_id: `crin_pick_${i}`,
-            value: JSON.stringify({ p: c.pageId }),
+            value: JSON.stringify({ p: c.pageId, pat }),
           },
         });
       });
@@ -172,7 +176,7 @@ async function resolveAndAsk(
           style: "primary",
           text: { type: "plain_text", text: `📤 すべての入稿プランを表示（${Math.min(e.candidates.length, 5)}件）` },
           action_id: "crin_pick_all",
-          value: JSON.stringify({ ps: e.candidates.slice(0, 5).map((c) => c.pageId) }),
+          value: JSON.stringify({ ps: e.candidates.slice(0, 5).map((c) => c.pageId), pat }),
         });
       }
       pickActions.push(cancelButton());
@@ -257,7 +261,8 @@ export function handleCrInInteraction(
       );
       return new Response("", { status: 200 });
     }
-    const va = JSON.parse(action.value) as { ps: string[] };
+    const va = JSON.parse(action.value) as { ps: string[]; pat?: string[] };
+    const patSuffix = va.pat && va.pat.length ? " " + va.pat.join(" ") : ""; // パターン指定を維持（BUG-101）
     const base = {
       channel_id: interaction.channel?.id || interaction.container?.channel_id || "",
       user_id: interaction.user?.id || "",
@@ -267,7 +272,7 @@ export function handleCrInInteraction(
       (async () => {
         await respond(responseUrl, { text: `🔎 ${va.ps.length}件の入稿プランを順に組み立て中…`, replace_original: true });
         for (const p of va.ps) {
-          await resolveAndAsk({ ...base, text: p }, project, env, metaTokenFor(project));
+          await resolveAndAsk({ ...base, text: p + patSuffix }, project, env, metaTokenFor(project));
         }
       })()
     );
@@ -286,9 +291,12 @@ export function handleCrInInteraction(
       );
       return new Response("", { status: 200 });
     }
-    const v = JSON.parse(action.value) as { p: string };
+    const v = JSON.parse(action.value) as { p: string; pat?: string[] };
+    // pageId の後ろにパターン番号を付けて再解決に渡す（BUG-101）。resolveSubmitは
+    // 先頭トークンをNotionID直指定として扱い、残りトークンをパターン指定として拾う。
+    const pickText = v.p + (v.pat && v.pat.length ? " " + v.pat.join(" ") : "");
     const payload: SlashPayload = {
-      text: v.p, // pageId（resolveSubmitのURL/ID直指定経路に乗る）
+      text: pickText,
       channel_id: interaction.channel?.id || interaction.container?.channel_id || "",
       user_id: interaction.user?.id || "",
       response_url: responseUrl,
