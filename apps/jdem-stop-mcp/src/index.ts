@@ -230,7 +230,9 @@ type GasPayload =
   // BUG-112: 子CR(crN_NN)を停止した直後の親子連動チェック。兄弟の子が全員停止済みなら親(crN)も停止する
   | { action: "cascade_check"; creativeName: string; stopDate: string }
   // BUG-112: 導入前からある「子が全員停止済みなのに親が未停止」を一括検出・停止（dryRun=trueは検出のみ）
-  | { action: "cascade_audit"; stopDate: string; dryRun: boolean };
+  | { action: "cascade_audit"; stopDate: string; dryRun: boolean }
+  // BUG-113: チェックボックスはON(停止済み)なのに背景が未グレー化のCRを検出・再グレー化（dryRun=trueは検出のみ）
+  | { action: "regray_check"; dryRun: boolean };
 
 interface CascadeResult {
   triggered: boolean;
@@ -238,6 +240,14 @@ interface CascadeResult {
   parentId?: string;
   childIds?: string[];
   stopResult?: any;
+}
+
+// BUG-113: 親CR自動停止のSlack通知に「どの子CRが全て停止したから」を明記する
+// （従来は親の番号だけで、何が引き金になったか分からなかった）。
+function cascadeNotifyLine(cascade: CascadeResult | undefined, bold: (s: string) => string): string | null {
+  if (!cascade?.triggered || !cascade.parentId) return null;
+  const children = cascade.childIds?.length ? cascade.childIds.join("、") : "（子CR一覧取得失敗）";
+  return `👨‍👧 親CR ${bold(cascade.parentId)} も自動停止しました（子CR ${children} が全て停止／メモ:「子供が全て停止」）`;
 }
 
 async function callGas(target: SheetTarget, payload: GasPayload): Promise<any> {
@@ -494,7 +504,7 @@ function fmtStop(out: StopResult, creative: string, date: string): string {
     parts.push("Meta未連携");
   }
   parts.push(out.sheet?.success ? `集計表 記録(${date})` : `集計表 失敗:${out.sheet?.message || "?"}`);
-  if (out.cascade?.triggered) parts.push(`👨‍👧親CR「${out.cascade.parentId}」も自動停止（子が全て停止）`);
+  { const line = cascadeNotifyLine(out.cascade, (s) => `「${s}」`); if (line) parts.push(line); }
   return `✅ ${creative} を停止しました｜${parts.join(" / ")}`;
 }
 function fmtUndo(out: any, creative: string, memoMode: string): string {
@@ -517,7 +527,7 @@ function fmtPublicStop(out: StopResult, creative: string, date: string, by: stri
     lines.push("・Meta: 未連携");
   }
   lines.push(out.sheet?.success ? `✅ 集計表: 記録・グレー化（${date}）` : `❌ 集計表: ${out.sheet?.message || "失敗"}`);
-  if (out.cascade?.triggered) lines.push(`👨‍👧 親CR *${out.cascade.parentId}* も自動停止しました（子が全て停止／メモ:「子供が全て停止」）`);
+  { const line = cascadeNotifyLine(out.cascade, (s) => `*${s}*`); if (line) lines.push(line); }
   return lines.join("\n");
 }
 function fmtPublicUndo(out: any, creative: string, memoMode: string, by: string): string {
@@ -921,6 +931,32 @@ export class CreativeStopMCP extends McpAgent<Env> {
         return asText({ project: p.name, dryRun, sheets: perSheet });
       },
     );
+
+    // BUG-113: 「チェックボックスはON(停止済み)なのに集計表がグレー化されていない」CRの調査で判明した、
+    // cr停止くん経由でない（手動チェック等の）過去の停止記録を一括是正するための棚卸しツール。
+    // チェックボックス・メモ文言は一切変更せず、背景色（グレー化）のみを対象範囲に再適用する。
+    this.server.tool(
+      "regray_stopped_creatives",
+      "チェックボックスがON(停止済み)なのに列群が未グレー化のCRを検出し、背景をグレー化する（チェック・メモは変更しない）。dryRun=true(既定)は検出のみ。",
+      {
+        project: z.string().describe("案件名。例: jdek（jde両訴求）/ jdekmak / jdekkou"),
+        dryRun: z.boolean().default(true).describe("true=検出のみ（既定）。false=実際にグレー化する"),
+      },
+      async ({ project, dryRun }) => {
+        const p = projectByName(project);
+        if (!p) return asText({ success: false, message: `案件不明: ${project}` });
+        const perSheet: any[] = [];
+        for (const target of p.sheets) {
+          try {
+            const r = await callGas(target, { action: "regray_check", dryRun });
+            perSheet.push({ sheetName: target.sheetName || r?.sheet || "meta_total", ...r });
+          } catch (e) {
+            perSheet.push({ sheetName: target.sheetName || "meta_total", error: String(e) });
+          }
+        }
+        return asText({ project: p.name, dryRun, sheets: perSheet });
+      },
+    );
   }
 }
 
@@ -1094,7 +1130,7 @@ function stopLines(creative: string, date: string, paused: number, sheet: any, m
   const lines = [`🛑 *${creative}* を停止しました${by ? `　${by}` : ""}`];
   lines.push(!metaOn ? "・Meta: 未連携" : paused > 0 ? `✅ Meta広告: ${paused}件 停止（PAUSE）` : "・Meta広告: 変更なし（集計表のみ）");
   lines.push(sheet?.success ? `✅ 集計表: 記録・グレー化（${date}）` : `❌ 集計表: ${sheet?.message || "失敗"}`);
-  if (cascade?.triggered) lines.push(`👨‍👧 親CR *${cascade.parentId}* も自動停止しました（子が全て停止／メモ:「子供が全て停止」）`);
+  { const line = cascadeNotifyLine(cascade, (s) => `*${s}*`); if (line) lines.push(line); }
   return lines.join("\n");
 }
 function undoLines(creative: string, memoMode: string, resumed: number, sheet: any, metaOn: boolean, by: string): string {
