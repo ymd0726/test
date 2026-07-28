@@ -226,7 +226,19 @@ type GasPayload =
   | { action: "stop"; creativeName: string; stopDate: string }
   | { action: "undo"; creativeName: string; memoMode: "full" | "tag" }
   | { action: "find"; creativeName: string }
-  | { action: "budget_propagate"; targetYear: number; targetMonth: number; requestBudget: number; memoText: string; prevBudget: number | null; dryRun: boolean };
+  | { action: "budget_propagate"; targetYear: number; targetMonth: number; requestBudget: number; memoText: string; prevBudget: number | null; dryRun: boolean }
+  // BUG-112: 子CR(crN_NN)を停止した直後の親子連動チェック。兄弟の子が全員停止済みなら親(crN)も停止する
+  | { action: "cascade_check"; creativeName: string; stopDate: string }
+  // BUG-112: 導入前からある「子が全員停止済みなのに親が未停止」を一括検出・停止（dryRun=trueは検出のみ）
+  | { action: "cascade_audit"; stopDate: string; dryRun: boolean };
+
+interface CascadeResult {
+  triggered: boolean;
+  reason?: string;
+  parentId?: string;
+  childIds?: string[];
+  stopResult?: any;
+}
 
 async function callGas(target: SheetTarget, payload: GasPayload): Promise<any> {
   // ハング防止: 各fetchに25秒タイムアウト（GASが重い/固まっても無限に待たない）
@@ -380,6 +392,35 @@ interface StopResult {
   alreadyStopped?: boolean;
   meta?: { configured: boolean; found: number; paused?: number; adNames?: string[]; adIds?: string[]; errors?: string[] };
   sheet?: any;
+  cascade?: CascadeResult;
+}
+
+// BUG-112: 子CR(crN_NN)の集計表停止が成功した直後に呼ぶ。兄弟の子が全員停止済みになっていれば
+// GAS側が親(crN)も集計表停止する（メモ「子供が全て停止」）。親は「子持ち親はMeta未入稿」が原則だが、
+// 命名規則の例外（実は親にも広告がある）に備え、triggeredの場合はここでMeta側も念のため探して止める。
+async function cascadeCheckAndStopParent(env: Env, p: Project, target: SheetTarget, childCreative: string, date: string): Promise<CascadeResult | undefined> {
+  let cascade: CascadeResult;
+  try {
+    cascade = await callGas(target, { action: "cascade_check", creativeName: childCreative, stopDate: date });
+  } catch (e) {
+    return { triggered: false, reason: `cascade_check失敗: ${e}` };
+  }
+  if (!cascade?.triggered || !cascade.parentId) return cascade;
+
+  const token = metaToken(env, p);
+  if (token && p.metaAdAccountId) {
+    try {
+      const ads = await metaFindAds(token, p.metaAdAccountId, cascade.parentId);
+      const active = ads.filter((a) => a.effective_status !== "PAUSED");
+      if (active.length) {
+        const r = await setAdsStatus(token, active.map((a) => a.id), "PAUSED");
+        (cascade as any).meta = { found: ads.length, paused: r.success, errors: r.errors };
+      }
+    } catch (e) {
+      (cascade as any).meta = { error: String(e) };
+    }
+  }
+  return cascade;
 }
 
 async function doStop(env: Env, p: Project, creative: string, date: string): Promise<StopResult> {
@@ -414,6 +455,11 @@ async function doStop(env: Env, p: Project, creative: string, date: string): Pro
   out.sheet = target
     ? await callGas(target, { action: "stop", creativeName: creative, stopDate: date })
     : { success: false, message: "集計表に該当crが見つかりません(複数対象)" };
+
+  // C. 親子連動チェック（BUG-112）。集計表停止が成功した場合のみ・失敗しても本処理は止めない
+  if (target && out.sheet?.success) {
+    try { out.cascade = await cascadeCheckAndStopParent(env, p, target, creative, date); } catch { /* ベストエフォート */ }
+  }
   return out;
 }
 
@@ -448,6 +494,7 @@ function fmtStop(out: StopResult, creative: string, date: string): string {
     parts.push("Meta未連携");
   }
   parts.push(out.sheet?.success ? `集計表 記録(${date})` : `集計表 失敗:${out.sheet?.message || "?"}`);
+  if (out.cascade?.triggered) parts.push(`👨‍👧親CR「${out.cascade.parentId}」も自動停止（子が全て停止）`);
   return `✅ ${creative} を停止しました｜${parts.join(" / ")}`;
 }
 function fmtUndo(out: any, creative: string, memoMode: string): string {
@@ -470,6 +517,7 @@ function fmtPublicStop(out: StopResult, creative: string, date: string, by: stri
     lines.push("・Meta: 未連携");
   }
   lines.push(out.sheet?.success ? `✅ 集計表: 記録・グレー化（${date}）` : `❌ 集計表: ${out.sheet?.message || "失敗"}`);
+  if (out.cascade?.triggered) lines.push(`👨‍👧 親CR *${out.cascade.parentId}* も自動停止しました（子が全て停止／メモ:「子供が全て停止」）`);
   return lines.join("\n");
 }
 function fmtPublicUndo(out: any, creative: string, memoMode: string, by: string): string {
@@ -824,6 +872,55 @@ export class CreativeStopMCP extends McpAgent<Env> {
     this.server.tool("list_projects", "登録済み案件の一覧", {}, async () =>
       asText(PROJECTS.map((p) => ({ name: p.name, channelId: p.channelId, metaConnected: !!p.metaAdAccountId }))),
     );
+
+    // BUG-112: 「子供のクリエイティブが全て止まった時に親のクリエイティブも停止」を、機能導入前から
+    // 既にその状態になっているデータへ一括適用するための監査ツール。dryRun=trueがデフォルト
+    // （まず検出結果を確認してから dryRun=false で実行する運用を想定。cr停止くん本体は今後、
+    // 子CRを止めるたびにこの判定を自動実行する＝ここでの一括適用は主に既存データの棚卸し用）。
+    this.server.tool(
+      "cascade_audit_parents",
+      "「子CRが全員停止済みなのに親CRが未停止」の組を検出し、該当すれば親も停止（集計表メモ「子供が全て停止」＋Meta実停止を試行）。dryRun=true(既定)は検出のみで書き込みしない。",
+      {
+        project: z.string().describe("案件名。例: jdek（jde両訴求）/ jdekmak / jdekkou"),
+        dryRun: z.boolean().default(true).describe("true=検出のみ（既定）。false=実際に親を停止する"),
+        stopDate: z.string().optional().describe('メモに使う日付"M/D"。省略時は今日（実際にはcustomNote「子供が全て停止」を書くため通常は未使用）'),
+      },
+      async ({ project, dryRun, stopDate }) => {
+        const p = projectByName(project);
+        if (!p) return asText({ success: false, message: `案件不明: ${project}` });
+        const date = stopDate || todayJST();
+        const perSheet: any[] = [];
+        for (const target of p.sheets) {
+          let audit: any;
+          try {
+            audit = await callGas(target, { action: "cascade_audit", stopDate: date, dryRun });
+          } catch (e) {
+            perSheet.push({ sheetName: target.sheetName || "meta_total", error: String(e) });
+            continue;
+          }
+          // dryRun=falseで実際に親が停止された場合、Meta側も念のため探して止める（子持ち親は通常Meta未入稿）
+          if (!dryRun && audit?.results?.length) {
+            const token = metaToken(env, p);
+            for (const r of audit.results) {
+              if (!r?.stopResult?.success || !token || !p.metaAdAccountId) continue;
+              try {
+                const ads = await metaFindAds(token, p.metaAdAccountId, r.parentId);
+                const active = ads.filter((a) => a.effective_status !== "PAUSED");
+                if (active.length) {
+                  const mr = await setAdsStatus(token, active.map((a) => a.id), "PAUSED");
+                  r.meta = { found: ads.length, paused: mr.success, errors: mr.errors };
+                }
+              } catch (e) { r.meta = { error: String(e) }; }
+            }
+            if (audit.results.length) {
+              await notifySlack(env, p.channelId, `👨‍👧 親子連動停止（監査）: ${audit.results.map((r: any) => r.parentId).join(", ")} を「子供が全て停止」で自動停止しました（via Claude）`);
+            }
+          }
+          perSheet.push({ sheetName: target.sheetName || audit?.sheet || "meta_total", ...audit });
+        }
+        return asText({ project: p.name, dryRun, sheets: perSheet });
+      },
+    );
   }
 }
 
@@ -993,10 +1090,11 @@ function simpleUndoConfirm(project: string, creative: string) {
 }
 
 // 実行結果メッセージ（Slack専用・明示ID版）
-function stopLines(creative: string, date: string, paused: number, sheet: any, metaOn: boolean, by: string): string {
+function stopLines(creative: string, date: string, paused: number, sheet: any, metaOn: boolean, by: string, cascade?: CascadeResult): string {
   const lines = [`🛑 *${creative}* を停止しました${by ? `　${by}` : ""}`];
   lines.push(!metaOn ? "・Meta: 未連携" : paused > 0 ? `✅ Meta広告: ${paused}件 停止（PAUSE）` : "・Meta広告: 変更なし（集計表のみ）");
   lines.push(sheet?.success ? `✅ 集計表: 記録・グレー化（${date}）` : `❌ 集計表: ${sheet?.message || "失敗"}`);
+  if (cascade?.triggered) lines.push(`👨‍👧 親CR *${cascade.parentId}* も自動停止しました（子が全て停止／メモ:「子供が全て停止」）`);
   return lines.join("\n");
 }
 function undoLines(creative: string, memoMode: string, resumed: number, sheet: any, metaOn: boolean, by: string): string {
@@ -1128,13 +1226,19 @@ function handleSlackInteract(env: Env, ctx: ExecutionContext, bodyText: string, 
             } catch (e) { metaErr = String(e); metaErrDetail = [String(e)]; }
           }
           const sheet = target ? await callGas(target, { action: "stop", creativeName: v.c, stopDate: v.d }) : { success: false, message: "集計表に該当crなし(複数対象)" };
+          // BUG-112: 子CRの集計表停止が成功したら、兄弟の子が全員停止済みかチェックし、
+          // 該当すれば親CRも自動停止する（失敗しても本処理は止めない）
+          let cascade: CascadeResult | undefined;
+          if (target && sheet?.success) {
+            try { cascade = await cascadeCheckAndStopParent(env, project as Project, target, v.c, v.d); } catch { /* ベストエフォート */ }
+          }
           const extra = (metaErr ? `\n⚠️ Meta停止に失敗（${metaErr}）：${metaErrDetail.join(" / ") || "詳細不明"}` : "");
           let note = extra + runLogWarn;
           if (paused || sheet?.success) {
-            const r = await notifySlack(env, project.channelId, stopLines(v.c, v.d, paused, sheet, metaOn, `by <@${userId}>`) + extra);
+            const r = await notifySlack(env, project.channelId, stopLines(v.c, v.d, paused, sheet, metaOn, `by <@${userId}>`, cascade) + extra);
             if (!r.ok) note += inviteNote(r.error);
           }
-          await postResponse(responseUrl, { replace_original: true, text: stopLines(v.c, v.d, paused, sheet, metaOn, "") + note });
+          await postResponse(responseUrl, { replace_original: true, text: stopLines(v.c, v.d, paused, sheet, metaOn, "", cascade) + note });
           await logToNotion(env, { creative: v.c, user: userName, userId, action: "停止", project: project.name, route: "Slack", metaCount: paused, sheetResult: sheetResultLabel(sheet) });
           await updateRunLog(env.NOTION_TOKEN, runLogId, {
             status: !metaErr && sheetResultLabel(sheet) !== "失敗" ? "完了" : "一部失敗",
@@ -1142,7 +1246,7 @@ function handleSlackInteract(env: Env, ctx: ExecutionContext, bodyText: string, 
             sheetResult: sheetResultLabel(sheet),
             adIds: ids,
             sheetTabs: sheet?.sheet ? [String(sheet.sheet)] : target?.sheetName ? [target.sheetName] : [],
-            detail: metaErrDetail.length ? { metaError: metaErrDetail } : undefined,
+            detail: metaErrDetail.length || cascade?.triggered ? { metaError: metaErrDetail, cascade: cascade?.triggered ? cascade : undefined } : undefined,
           });
         } else {
           let resumed = 0;

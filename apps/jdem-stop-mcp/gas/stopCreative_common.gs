@@ -57,6 +57,10 @@ function doPost(e) {
       result = findCreative(ssId, sheetName, params.creativeName);
     } else if (action === 'budget_propagate') {
       result = budgetPropagate(ssId, sheetName, params);
+    } else if (action === 'cascade_check') {
+      result = cascadeParentStop(ssId, sheetName, params.creativeName, params.stopDate);
+    } else if (action === 'cascade_audit') {
+      result = cascadeAudit(ssId, sheetName, params.stopDate, params.dryRun === true || params.dryRun === 'true');
     } else {
       result = { success: false, message: '不明なaction: ' + action };
     }
@@ -146,26 +150,70 @@ function findCreative(ssId, sheetName, creativeName) {
 }
 
 // ============================================================
-// 停止
+// 列群(消化金額〜メモ)の解決・チェックボックス状態の読み取り
+// stopCreative() と 親子連動停止(cascadeParentStop/cascadeAudit) で共通利用。
 // ============================================================
-function stopCreative(ssId, sheetName, creativeName, stopDate) {
-  var sheet = resolveSheet(openSS(ssId), sheetName);
-  if (!sheet) return { success: false, message: '集計表タブが見つかりません(' + (sheetName || 'meta_total') + ' 等)' };
+function resolveBlockCols(sheet, nameCol) {
   var lastCol = sheet.getLastColumn();
-
-  var nameCol = findNameCol(sheet, creativeName); // 結合セル対応（1〜HEADER_ROW行を走査）
-  if (nameCol === -1) return { success: false, message: 'クリエイティブが見つかりません: ' + creativeName };
-
   var labelValues = sheet.getRange(CONFIG.LABEL_ROW, 1, 1, lastCol).getValues()[0];
   var leftCol = -1;
   for (var c = nameCol; c >= 1; c--) { if (String(labelValues[c - 1]).trim() === CONFIG.LEFT_LABEL) { leftCol = c; break; } }
   var rightCol = -1;
   for (var c = nameCol; c <= labelValues.length; c++) { if (String(labelValues[c - 1]).trim() === CONFIG.RIGHT_LABEL) { rightCol = c; break; } }
-  if (leftCol === -1 || rightCol === -1) return { success: false, message: '列群の範囲(消化金額〜メモ)を特定できません' };
-  var numCols = rightCol - leftCol + 1;
-  var memoCol = rightCol;
+  if (leftCol === -1 || rightCol === -1) return null;
+  return { leftCol: leftCol, rightCol: rightCol, memoCol: rightCol, numCols: rightCol - leftCol + 1 };
+}
 
-  var note = stopDate + CONFIG.MEMO_SUFFIX;
+// CHECKBOX_SEARCH_ROWSを4→5→6の順に走査し、最初に見つかったチェックボックス/真偽値セルの状態を返す。
+// stopCreative()が「停止済みマーク」に使っているのと同じ検出ロジック（見つからなければnull）。
+function readCheckboxState(sheet, memoCol) {
+  for (var i = 0; i < CONFIG.CHECKBOX_SEARCH_ROWS.length; i++) {
+    var row = CONFIG.CHECKBOX_SEARCH_ROWS[i];
+    var cell = sheet.getRange(row, memoCol);
+    var rule = cell.getDataValidation();
+    var isCheckbox = rule && rule.getCriteriaType() === SpreadsheetApp.DataValidationCriteria.CHECKBOX;
+    var val = cell.getValue();
+    if (isCheckbox || val === false || val === 'FALSE' || val === true || val === 'TRUE') {
+      return { row: row, stopped: (val === true || val === 'TRUE') };
+    }
+  }
+  return null;
+}
+
+// ID行(1〜8行のヘッダーブロック)を1回スキャンし、全列の正規化ID(crXX/crXX_NN等)を返す。
+// { 列番号(1-based): 正規化ID } のマップ。空セルの列は含めない。
+function scanAllCreativeIds(sheet) {
+  var lastCol = sheet.getLastColumn();
+  if (lastCol < 1) return {};
+  var nameRows = Math.min(8, sheet.getLastRow());
+  var block = sheet.getRange(1, 1, nameRows, lastCol).getValues();
+  var idByCol = {};
+  for (var c = 0; c < lastCol; c++) {
+    for (var r = 0; r < nameRows; r++) {
+      var n = normCrName(block[r][c]);
+      if (n) { idByCol[c + 1] = n; break; }
+    }
+  }
+  return idByCol;
+}
+
+// ============================================================
+// 停止
+// ============================================================
+// customNote省略時は従来通り stopDate+MEMO_SUFFIX（例 "7/28_停止"）。
+// 親子連動停止(BUG-112)では customNote="子供が全て停止" を渡し、日付ではなくその文言をメモに書く。
+function stopCreative(ssId, sheetName, creativeName, stopDate, customNote) {
+  var sheet = resolveSheet(openSS(ssId), sheetName);
+  if (!sheet) return { success: false, message: '集計表タブが見つかりません(' + (sheetName || 'meta_total') + ' 等)' };
+
+  var nameCol = findNameCol(sheet, creativeName); // 結合セル対応（1〜HEADER_ROW行を走査）
+  if (nameCol === -1) return { success: false, message: 'クリエイティブが見つかりません: ' + creativeName };
+
+  var cols = resolveBlockCols(sheet, nameCol);
+  if (!cols) return { success: false, message: '列群の範囲(消化金額〜メモ)を特定できません' };
+  var leftCol = cols.leftCol, rightCol = cols.rightCol, numCols = cols.numCols, memoCol = cols.memoCol;
+
+  var note = customNote ? String(customNote) : (stopDate + CONFIG.MEMO_SUFFIX);
   var undo = { creativeName: creativeName, sheetName: sheet.getName(), note: note, checkbox: null, paint: null, memoDaily: null, memoMonthly: null };
 
   var checkboxSet = false;
@@ -210,6 +258,102 @@ function stopCreative(ssId, sheetName, creativeName, stopDate) {
 
   return { success: true, message: '停止処理完了: ' + creativeName, creativeName: creativeName, sheet: sheet.getName(),
     columns: columnToLetter(leftCol) + '〜' + columnToLetter(rightCol), checkboxSet: checkboxSet, memoDaily: memoDailyResult, memoMonthly: memoMonthlyResult };
+}
+
+// ============================================================
+// 親子連動停止（BUG-112）
+// 子CR(crN_NN)の停止直後に呼ぶ：兄弟の子が全員停止済みになったら親(crN)も自動停止する。
+// 親は「子持ち親はMeta未入稿」の命名規則（Notion「集計表 構造仕様」§1）のため、
+// ここでは集計表側の停止のみを行う（Meta実停止はWorker側で親IDを対象に別途試行し、
+// 万一実広告があった場合の取りこぼしを防ぐ設計）。
+// ============================================================
+function cascadeParentStop(ssId, sheetName, childCreativeName, stopDate) {
+  var sheet = resolveSheet(openSS(ssId), sheetName);
+  if (!sheet) return { triggered: false, reason: 'シートが見つかりません' };
+
+  var childNorm = normCrName(childCreativeName);
+  var m = childNorm.match(/^(.+)_\d+$/);
+  if (!m) return { triggered: false, reason: '子CR命名(crN_NN)ではないため対象外' };
+  var parentId = m[1];
+
+  var idByCol = scanAllCreativeIds(sheet);
+  var byId = {};
+  for (var c in idByCol) { var id = idByCol[c]; (byId[id] = byId[id] || []).push(Number(c)); }
+
+  if (!byId[parentId]) return { triggered: false, reason: '親CR「' + parentId + '」の列が見つかりません（子のみ運用の可能性）' };
+
+  var childPrefix = parentId + '_';
+  var childIds = [];
+  for (var id in byId) { if (id.indexOf(childPrefix) === 0 && /^\d+$/.test(id.slice(childPrefix.length))) childIds.push(id); }
+  if (childIds.length === 0) return { triggered: false, reason: '子CRが見つかりません' };
+
+  var parentCols = byId[parentId];
+  var parentBlock = resolveBlockCols(sheet, parentCols[0]);
+  if (!parentBlock) return { triggered: false, reason: '親CR「' + parentId + '」の列群(消化金額〜メモ)を特定できません' };
+  var parentState = readCheckboxState(sheet, parentBlock.memoCol);
+  if (parentState && parentState.stopped) return { triggered: false, reason: '親CR「' + parentId + '」は既に停止済み', parentId: parentId };
+
+  var allStopped = true;
+  for (var i = 0; i < childIds.length; i++) {
+    var cols = byId[childIds[i]];
+    for (var j = 0; j < cols.length; j++) {
+      var block = resolveBlockCols(sheet, cols[j]);
+      var st = block ? readCheckboxState(sheet, block.memoCol) : null;
+      if (!st || !st.stopped) { allStopped = false; }
+    }
+  }
+  if (!allStopped) return { triggered: false, reason: '未停止の子が残っています', parentId: parentId, childIds: childIds };
+
+  var result = stopCreative(ssId, sheet.getName(), parentId, stopDate, '子供が全て停止');
+  return { triggered: true, parentId: parentId, childIds: childIds, stopResult: result };
+}
+
+// 既存データの一括監査（BUG-112: n22_jde等、機能導入前から「子が全員停止済みなのに親が未停止」の
+// 状態になっているものを検出・一括停止する）。dryRun=trueは書き込みなしで候補一覧だけ返す。
+function cascadeAudit(ssId, sheetName, stopDate, dryRun) {
+  var sheet = resolveSheet(openSS(ssId), sheetName);
+  if (!sheet) return { success: false, message: 'シートが見つかりません(' + (sheetName || 'meta_total') + ' 等)' };
+
+  var idByCol = scanAllCreativeIds(sheet);
+  var byId = {};
+  for (var c in idByCol) { var id = idByCol[c]; (byId[id] = byId[id] || []).push(Number(c)); }
+
+  var candidates = [];
+  for (var id in byId) {
+    if (/_\d+$/.test(id)) continue; // 子ID自身は親候補から除外
+    var childPrefix = id + '_';
+    var childIds = [];
+    for (var otherId in byId) { if (otherId.indexOf(childPrefix) === 0 && /^\d+$/.test(otherId.slice(childPrefix.length))) childIds.push(otherId); }
+    if (childIds.length === 0) continue; // 子が無い＝単独CR。対象外
+
+    var parentBlock = resolveBlockCols(sheet, byId[id][0]);
+    if (!parentBlock) continue;
+    var parentState = readCheckboxState(sheet, parentBlock.memoCol);
+    if (parentState && parentState.stopped) continue; // 既に停止済み
+
+    var allStopped = true;
+    for (var i = 0; i < childIds.length; i++) {
+      var cols = byId[childIds[i]];
+      for (var j = 0; j < cols.length; j++) {
+        var block = resolveBlockCols(sheet, cols[j]);
+        var st = block ? readCheckboxState(sheet, block.memoCol) : null;
+        if (!st || !st.stopped) { allStopped = false; }
+      }
+    }
+    if (allStopped) candidates.push({ parentId: id, childIds: childIds });
+  }
+
+  var results = [];
+  for (var k = 0; k < candidates.length; k++) {
+    var cand = candidates[k];
+    if (dryRun) {
+      results.push({ parentId: cand.parentId, childIds: cand.childIds, wouldStop: true });
+    } else {
+      var r = stopCreative(ssId, sheet.getName(), cand.parentId, stopDate, '子供が全て停止');
+      results.push({ parentId: cand.parentId, childIds: cand.childIds, stopResult: r });
+    }
+  }
+  return { success: true, dryRun: !!dryRun, sheet: sheet.getName(), candidateCount: candidates.length, results: results };
 }
 
 // ============================================================
