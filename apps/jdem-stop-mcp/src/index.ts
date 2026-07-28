@@ -304,7 +304,11 @@ async function fetchJsonTimeout(url: string, ms: number): Promise<any> {
 async function metaFindAds(token: string, adAccountId: string, creative: string): Promise<MetaAd[]> {
   // ① cr番号だけ(例 cr60_11_01→cr60)で軽く検索（id/name/statusのみ＝速い・重くならない）。
   //    MetaのCONTAINは下線複数の長い文字列で0件を返す癖があるため番号で広く取る。
-  const broad = String(creative).split("_")[0] || creative;
+  //    creativeが案件プレフィックス付き(lcl_cr15_01等、CRDBページ名そのまま)だと、先頭セグメントを
+  //    素朴に取ると案件名側("lcl")を拾ってしまい、CONTAINが広がりすぎて件数の多い案件では
+  //    古い広告が limit=300/500 の取得範囲外に押し出され0件化する（BUG-108）。"cr"+数字のトークンを優先的に抽出する。
+  const crToken = String(creative).match(/cr\d+/i)?.[0];
+  const broad = crToken || String(creative).split("_")[0] || creative;
   const filtering = encodeURIComponent(JSON.stringify([{ field: "name", operator: "CONTAIN", value: broad }]));
   const url = `https://graph.facebook.com/${GRAPH}/act_${adAccountId}/ads?fields=id,name,effective_status&filtering=${filtering}&limit=300&access_token=${encodeURIComponent(token)}`;
   const data = await fetchJsonTimeout(url, 12000);
