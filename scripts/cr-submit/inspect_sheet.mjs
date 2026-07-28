@@ -38,6 +38,8 @@ const auth = new google.auth.GoogleAuth({
 const sheets = google.sheets({ version: "v4", auth });
 
 // --- --cells: 任意セルの値/数式をピンポイント読取（較正・値確認用、読み取り専用） ---
+// --colors 併用時は背景色（effectiveFormat.backgroundColor）も表示する
+// （BUG-113調査用: 「チェックボックスはONなのに背景がグレー化されていない」を切り分けるため追加）。
 if (args.cells) {
   if (!args.tab) {
     console.error("ERROR: --cells は --tab と併用してください。");
@@ -49,14 +51,38 @@ if (args.cells) {
     sheets.spreadsheets.values.batchGet({ spreadsheetId: SPREADSHEET_ID, ranges, valueRenderOption: "FORMATTED_VALUE" }),
     sheets.spreadsheets.values.batchGet({ spreadsheetId: SPREADSHEET_ID, ranges, valueRenderOption: "FORMULA" }),
   ]);
+  let colorBySheetRange = null;
+  if (args.colors) {
+    const cres = await sheets.spreadsheets.get({
+      spreadsheetId: SPREADSHEET_ID,
+      ranges,
+      includeGridData: true,
+      fields: "sheets(data(rowData(values(effectiveFormat.backgroundColor,userEnteredFormat.backgroundColor,dataValidation))))",
+    });
+    colorBySheetRange = cres.data.sheets || [];
+  }
   console.log(`# セル読取: ${args.tab}`);
   for (let i = 0; i < cellList.length; i++) {
     const v = fv.data.valueRanges[i]?.values?.[0]?.[0] ?? "";
     const f = fm.data.valueRanges[i]?.values?.[0]?.[0] ?? "";
     const shownF = String(f) !== String(v) ? ` （式: ${f}）` : "";
-    console.log(`${cellList[i]} = ${JSON.stringify(String(v))}${shownF}`);
+    let colorInfo = "";
+    if (colorBySheetRange) {
+      const cell = colorBySheetRange[i]?.data?.[0]?.rowData?.[0]?.values?.[0] || {};
+      const eff = cell.effectiveFormat?.backgroundColor;
+      const usr = cell.userEnteredFormat?.backgroundColor;
+      const dv = cell.dataValidation?.condition?.type || null;
+      colorInfo = ` [背景(effective)=${rgbToHex(eff)} / 背景(userEntered)=${rgbToHex(usr)}${dv ? ` / dataValidation=${dv}` : ""}]`;
+    }
+    console.log(`${cellList[i]} = ${JSON.stringify(String(v))}${shownF}${colorInfo}`);
   }
   process.exit(0);
+}
+
+function rgbToHex(c) {
+  if (!c) return "(なし/白)";
+  const to255 = (x) => Math.round((x || 0) * 255);
+  return `#${[to255(c.red), to255(c.green), to255(c.blue)].map((n) => n.toString(16).padStart(2, "0")).join("")}`;
 }
 
 // --- タブ一覧＋列グループ化メタデータ ---
@@ -242,6 +268,7 @@ function parseArgs(argv) {
     else if (argv[i] === "--formulas") out.formulas = true;
     else if (argv[i] === "--rows") out.rows = argv[++i];
     else if (argv[i] === "--cells") out.cells = argv[++i];
+    else if (argv[i] === "--colors") out.colors = true;
   }
   return out;
 }
