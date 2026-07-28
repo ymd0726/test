@@ -61,6 +61,8 @@ function doPost(e) {
       result = cascadeParentStop(ssId, sheetName, params.creativeName, params.stopDate);
     } else if (action === 'cascade_audit') {
       result = cascadeAudit(ssId, sheetName, params.stopDate, params.dryRun === true || params.dryRun === 'true');
+    } else if (action === 'regray_check') {
+      result = regrayStopped(ssId, sheetName, params.dryRun === true || params.dryRun === 'true');
     } else {
       result = { success: false, message: '不明なaction: ' + action };
     }
@@ -182,6 +184,10 @@ function readCheckboxState(sheet, memoCol) {
 
 // ID行(1〜8行のヘッダーブロック)を1回スキャンし、全列の正規化ID(crXX/crXX_NN等)を返す。
 // { 列番号(1-based): 正規化ID } のマップ。空セルの列は含めない。
+// BUG-113で発覚: 「rows1〜8のうち最初に非空だった行を採用」だと、ID行より上にある
+// ラベル行（1行目「消化金額」等）が必ず先に非空でヒットしてしまい、実際のcr名(6行目等)を
+// 一度も見ずに「消化金額」等をIDとして誤採用していた（＝親子連動が実質常に不成立だった）。
+// findNameCol() と同じ基準（"cr"+数字で始まる）を満たす行だけをID候補として採用する。
 function scanAllCreativeIds(sheet) {
   var lastCol = sheet.getLastColumn();
   if (lastCol < 1) return {};
@@ -191,7 +197,7 @@ function scanAllCreativeIds(sheet) {
   for (var c = 0; c < lastCol; c++) {
     for (var r = 0; r < nameRows; r++) {
       var n = normCrName(block[r][c]);
-      if (n) { idByCol[c + 1] = n; break; }
+      if (n && /^cr\d/i.test(n)) { idByCol[c + 1] = n; break; }
     }
   }
   return idByCol;
@@ -354,6 +360,43 @@ function cascadeAudit(ssId, sheetName, stopDate, dryRun) {
     }
   }
   return { success: true, dryRun: !!dryRun, sheet: sheet.getName(), candidateCount: candidates.length, results: results };
+}
+
+// BUG-113: 「チェックボックスはON(停止済み)なのに列群がグレー化されていない」CRを検出・再グレー化する。
+// 主にstopCreative_common.gs導入前／cr停止くん経由でない手動チェック等、過去の運用でチェックのみ
+// 入って塗り潰しが行われなかったケースの一括是正用。チェックボックス・メモは一切変更しない
+// （塗り潰し＝背景色のみを対象範囲に再適用）。dryRun=trueは検出のみ。
+function regrayStopped(ssId, sheetName, dryRun) {
+  var sheet = resolveSheet(openSS(ssId), sheetName);
+  if (!sheet) return { success: false, message: 'シートが見つかりません(' + (sheetName || 'meta_total') + ' 等)' };
+
+  var idByCol = scanAllCreativeIds(sheet);
+  var seen = {}; // 同一ID重複ブロックも列ごとに個別処理するが、進捗ログはID単位でまとめる
+  var candidates = [];
+  var paintNumRows = CONFIG.PAINT_END_ROW - CONFIG.PAINT_START_ROW + 1;
+
+  for (var c in idByCol) {
+    var col = Number(c);
+    var block = resolveBlockCols(sheet, col);
+    if (!block) continue;
+    var st = readCheckboxState(sheet, block.memoCol);
+    if (!st || !st.stopped) continue; // 停止済みのみ対象
+
+    var paintRange = sheet.getRange(CONFIG.PAINT_START_ROW, block.leftCol, paintNumRows, block.numCols);
+    var bgs = paintRange.getBackgrounds();
+    var alreadyGray = true;
+    for (var r = 0; r < bgs.length && alreadyGray; r++) {
+      for (var cc = 0; cc < bgs[r].length; cc++) {
+        if (String(bgs[r][cc]).toLowerCase() !== CONFIG.GRAY_COLOR.toLowerCase()) { alreadyGray = false; break; }
+      }
+    }
+    if (alreadyGray) continue;
+
+    candidates.push({ id: idByCol[col], col: col, columns: columnToLetter(block.leftCol) + '〜' + columnToLetter(block.rightCol) });
+    if (!dryRun) paintRange.setBackground(CONFIG.GRAY_COLOR);
+  }
+
+  return { success: true, dryRun: !!dryRun, sheet: sheet.getName(), count: candidates.length, candidates: candidates };
 }
 
 // ============================================================
