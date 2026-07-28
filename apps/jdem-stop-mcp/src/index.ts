@@ -361,10 +361,14 @@ async function metaSetStatus(token: string, adId: string, status: "PAUSED" | "AC
     clearTimeout(t);
   }
 }
-// 複数広告を並列で更新（直列だと多数で固まる）。成功件数を返す。
-async function setAdsStatus(token: string, ids: string[], status: "PAUSED" | "ACTIVE"): Promise<number> {
+// 複数広告を並列で更新（直列だと多数で固まる）。成功件数と、失敗があれば実際のGraph APIエラー文言を返す
+// （BUG-109: 従来は失敗件数しか分からず「トークン/権限を確認してください」としか案内できなかった）。
+interface SetAdsStatusResult { success: number; errors: string[] }
+async function setAdsStatus(token: string, ids: string[], status: "PAUSED" | "ACTIVE"): Promise<SetAdsStatusResult> {
   const r = await Promise.allSettled(ids.map((id) => metaSetStatus(token, id, status)));
-  return r.filter((x) => x.status === "fulfilled").length;
+  const success = r.filter((x) => x.status === "fulfilled").length;
+  const errors = r.filter((x): x is PromiseRejectedResult => x.status === "rejected").map((x) => String(x.reason?.message || x.reason));
+  return { success, errors };
 }
 const pauseAds = (token: string, ids: string[]) => setAdsStatus(token, ids, "PAUSED");
 const resumeAds = (token: string, ids: string[]) => setAdsStatus(token, ids, "ACTIVE");
@@ -374,7 +378,7 @@ const resumeAds = (token: string, ids: string[]) => setAdsStatus(token, ids, "AC
 // ============================================================
 interface StopResult {
   alreadyStopped?: boolean;
-  meta?: { configured: boolean; found: number; paused?: number; adNames?: string[]; adIds?: string[] };
+  meta?: { configured: boolean; found: number; paused?: number; adNames?: string[]; adIds?: string[]; errors?: string[] };
   sheet?: any;
 }
 
@@ -395,14 +399,17 @@ async function doStop(env: Env, p: Project, creative: string, date: string): Pro
         out.meta = { configured: true, found: ads.length, paused: 0, adNames: ads.map((a) => a.name) };
         return out;
       }
-      for (const a of active) await metaSetStatus(token, a.id, "PAUSED");
-      out.meta = { configured: true, found: ads.length, paused: active.length, adNames: active.map((a) => a.name), adIds: active.map((a) => a.id) };
+      // BUG-109: 直列awaitで無防備にthrowすると1件失敗しただけでB.集計表記録まで
+      // 到達できず（claude.ai/MCP経由のstop_creativeで発生）、失敗理由も分からなかった。
+      // setAdsStatus（Promise.allSettled）で並列実行しつつ成功件数と実際のエラー文言を取得する。
+      const r = await setAdsStatus(token, active.map((a) => a.id), "PAUSED");
+      out.meta = { configured: true, found: ads.length, paused: r.success, adNames: active.map((a) => a.name), adIds: active.map((a) => a.id), errors: r.errors };
     }
   } else {
     out.meta = { configured: false, found: 0 };
   }
 
-  // B. 集計表記録（複数集計対象の案件は cr名で対象タブを判定）
+  // B. 集計表記録（複数集計対象の案件は cr名で対象タブを判定）。Metaが一部/全部失敗しても必ず実行する。
   const target = await pickSheet(p, creative);
   out.sheet = target
     ? await callGas(target, { action: "stop", creativeName: creative, stopDate: date })
@@ -422,8 +429,8 @@ async function doUndo(env: Env, p: Project, creative: string, memoMode: "full" |
   if (out.sheet?.success && token && p.metaAdAccountId) {
     const ads = await metaFindAds(token, p.metaAdAccountId, creative);
     const paused = ads.filter((a) => a.effective_status === "PAUSED");
-    for (const a of paused) await metaSetStatus(token, a.id, "ACTIVE");
-    out.meta = { resumed: paused.length, adNames: paused.map((a) => a.name), adIds: paused.map((a) => a.id) };
+    const r = await setAdsStatus(token, paused.map((a) => a.id), "ACTIVE");
+    out.meta = { resumed: r.success, adNames: paused.map((a) => a.name), adIds: paused.map((a) => a.id), errors: r.errors };
   }
   return out;
 }
@@ -436,6 +443,7 @@ function fmtStop(out: StopResult, creative: string, date: string): string {
   const parts: string[] = [];
   if (out.meta?.configured) {
     parts.push(out.meta.found === 0 ? "⚠️Meta広告が見つかりません" : `Meta ${out.meta.paused}件停止`);
+    if (out.meta.errors?.length) parts.push(`⚠️Meta失敗理由: ${out.meta.errors.join(" / ")}`);
   } else {
     parts.push("Meta未連携");
   }
@@ -445,7 +453,10 @@ function fmtStop(out: StopResult, creative: string, date: string): string {
 function fmtUndo(out: any, creative: string, memoMode: string): string {
   if (!out.sheet?.success) return `⚠️ ${creative}: ${out.sheet?.message || "取消情報なし"}`;
   const parts: string[] = [];
-  if (out.meta) parts.push(`Meta ${out.meta.resumed}件再開`);
+  if (out.meta) {
+    parts.push(`Meta ${out.meta.resumed}件再開`);
+    if (out.meta.errors?.length) parts.push(`⚠️Meta失敗理由: ${out.meta.errors.join(" / ")}`);
+  }
   parts.push(`集計表 復元(${memoMode})`);
   return `✅ ${creative} の停止を取り消しました｜${parts.join(" / ")}`;
 }
@@ -553,6 +564,7 @@ function stopRunPatch(out: StopResult) {
     sheetResult,
     adIds: out.meta?.adIds || [],
     sheetTabs: out.sheet?.sheet ? [String(out.sheet.sheet)] : [],
+    detail: out.meta?.errors?.length ? { metaError: out.meta.errors } : undefined,
   };
 }
 function undoRunPatch(out: any) {
@@ -562,6 +574,7 @@ function undoRunPatch(out: any) {
     metaResult: out.meta ? "成功" : "未実行",
     sheetResult,
     adIds: out.meta?.adIds || [],
+    detail: out.meta?.errors?.length ? { metaError: out.meta.errors } : undefined,
   };
 }
 
@@ -1102,12 +1115,20 @@ function handleSlackInteract(env: Env, ctx: ExecutionContext, bodyText: string, 
         const runLogWarn = !runLogId && env.NOTION_TOKEN ? "\n⚠️ 実行ログの記録に失敗（翌日自動チェックの対象外になります）" : "";
         // Meta失敗は集計表を止めない（権限不足等でも集計表記録は実行し、Metaエラーは併記）
         let metaErr = "";
+        // 実際のGraph APIエラー文言（BUG-109: 従来は件数しか分からず原因切り分けができなかった）
+        let metaErrDetail: string[] = [];
         const target = await pickSheet(project, v.c); // 複数集計対象の案件は cr名で対象タブを判定
         if (v.a === "stop") {
           let paused = 0;
-          if (metaOn && ids.length) { try { paused = await pauseAds(token!, ids); if (paused < ids.length) metaErr = `${ids.length - paused}件の停止に失敗`; } catch (e) { metaErr = String(e); } }
+          if (metaOn && ids.length) {
+            try {
+              const r = await pauseAds(token!, ids);
+              paused = r.success;
+              if (paused < ids.length) { metaErr = `${ids.length - paused}件の停止に失敗`; metaErrDetail = r.errors; }
+            } catch (e) { metaErr = String(e); metaErrDetail = [String(e)]; }
+          }
           const sheet = target ? await callGas(target, { action: "stop", creativeName: v.c, stopDate: v.d }) : { success: false, message: "集計表に該当crなし(複数対象)" };
-          const extra = (metaErr ? `\n⚠️ Meta停止に失敗（${metaErr}）。Metaトークン/権限を確認してください。` : "");
+          const extra = (metaErr ? `\n⚠️ Meta停止に失敗（${metaErr}）：${metaErrDetail.join(" / ") || "詳細不明"}` : "");
           let note = extra + runLogWarn;
           if (paused || sheet?.success) {
             const r = await notifySlack(env, project.channelId, stopLines(v.c, v.d, paused, sheet, metaOn, `by <@${userId}>`) + extra);
@@ -1121,12 +1142,19 @@ function handleSlackInteract(env: Env, ctx: ExecutionContext, bodyText: string, 
             sheetResult: sheetResultLabel(sheet),
             adIds: ids,
             sheetTabs: sheet?.sheet ? [String(sheet.sheet)] : target?.sheetName ? [target.sheetName] : [],
+            detail: metaErrDetail.length ? { metaError: metaErrDetail } : undefined,
           });
         } else {
           let resumed = 0;
-          if (metaOn && ids.length) { try { resumed = await resumeAds(token!, ids); if (resumed < ids.length) metaErr = `${ids.length - resumed}件の再開に失敗`; } catch (e) { metaErr = String(e); } }
+          if (metaOn && ids.length) {
+            try {
+              const r = await resumeAds(token!, ids);
+              resumed = r.success;
+              if (resumed < ids.length) { metaErr = `${ids.length - resumed}件の再開に失敗`; metaErrDetail = r.errors; }
+            } catch (e) { metaErr = String(e); metaErrDetail = [String(e)]; }
+          }
           const sheet = target ? await callGas(target, { action: "undo", creativeName: v.c, memoMode: v.m || "tag" }) : { success: false, message: "集計表に該当crなし(複数対象)" };
-          const extra = (metaErr ? `\n⚠️ Meta再開に失敗（${metaErr}）。Metaトークン/権限を確認してください。` : "");
+          const extra = (metaErr ? `\n⚠️ Meta再開に失敗（${metaErr}）：${metaErrDetail.join(" / ") || "詳細不明"}` : "");
           let note = extra + runLogWarn;
           if (resumed || sheet?.success) {
             const r = await notifySlack(env, project.channelId, undoLines(v.c, v.m || "tag", resumed, sheet, metaOn, `by <@${userId}>`) + extra);
@@ -1140,6 +1168,7 @@ function handleSlackInteract(env: Env, ctx: ExecutionContext, bodyText: string, 
             sheetResult: sheetResultLabel(sheet),
             adIds: ids,
             sheetTabs: target?.sheetName ? [target.sheetName] : [],
+            detail: metaErrDetail.length ? { metaError: metaErrDetail } : undefined,
           });
         }
       } catch (e) {
