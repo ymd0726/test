@@ -130,6 +130,11 @@ const PROJECTS: Project[] = [
     driveFolderId: "154PB5vb2qEgmKJTIda2DSRay3PyvmhzY", crdbDataSourceId: CRDB_DATA_SOURCE_ID }, // ID行=7行目（他案件と異なる。GASの1〜8行探索で自動対応済み）
   { name: "brm",  channelId: "C07KJES7LHW", sheets: [{ spreadsheetId: "1MSJ6sLNWIbZnYy1CbDUNg86KUWq9fX_MlFENKGdGKH8" }], metaAdAccountId: "825363383075510",
     driveFolderId: "1g2t0BOjVesJ2laFH3lnWZzyjtLNBWd-L", crdbDataSourceId: CRDB_DATA_SOURCE_ID },
+  // nrc: n43_nrc_ナリッシュバスト（Re Nouriche株式会社・青木様）。2026-07-28 BUG-111で登録。
+  // Meta広告アカウントは「n43_nrc」(1903907890279162, 株式会社リード business)をads_get_ad_accountsで実測確定。
+  // 集計表タブは meta_total、cr倉庫DriveはCLDB「n43_nrc」(2ef35c2adb5680759037e4e5a8efd764)より抽出。
+  { name: "nrc",  channelId: "C0BDKUYPULT", sheets: [{ spreadsheetId: "1O9cXBQ4-dLwOzOitHJiZQ9QalRBE-4sPxw3BfG7KQo4", sheetName: "meta_total" }], metaAdAccountId: "1903907890279162",
+    driveFolderId: "1hLhNbuG7bw3V5SsiPa4SjuDOo8DNvGdl", cldbPageId: "2ef35c2adb5680759037e4e5a8efd764", crdbDataSourceId: CRDB_DATA_SOURCE_ID },
   // ── 複数集計対象の案件 ──
   { name: "una",  channelId: "C08DV6STNER", metaAdAccountId: "1063670028480764", sheets: [
       { spreadsheetId: "1J_T8FurvLgRd6IhxjqE0AqGS8NfQPRanXp55dy9o5gI", sheetName: "meta_total" },        // 本店
