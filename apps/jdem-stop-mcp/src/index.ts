@@ -89,6 +89,7 @@ interface Project {
   adNameStyle?: "full" | "short"; // Meta広告名: full=ファイル名そのまま / short=cr番号のみ
   adsetAllowlist?: string[]; // 入稿先候補にする広告セットID（省略時はACTIVE全セット）
   submitBlocked?: string;   // 設定時は/cr-inをこの理由で即エラー終了（既知の未解決事項がある案件）
+  noJudgeRow?: boolean;     // 集計表に「子にて判定」の判定行が構造的に無い案件（nrc等）。判定行未検出を正常扱いにする（BUG-115）
 }
 
 // 案件に対応するMetaトークンを返す（BMが違う案件は別secretを使う）
@@ -133,8 +134,11 @@ const PROJECTS: Project[] = [
   // nrc: n43_nrc_ナリッシュバスト（Re Nouriche株式会社・青木様）。2026-07-28 BUG-111で登録。
   // Meta広告アカウントは「n43_nrc」(1903907890279162, 株式会社リード business)をads_get_ad_accountsで実測確定。
   // 集計表タブは meta_total、cr倉庫DriveはCLDB「n43_nrc」(2ef35c2adb5680759037e4e5a8efd764)より抽出。
+  // nrc の meta_total は ID行=5、cr00テンプレ2個（AD:BL=集計内/親, EL:FJ=集計外/子, 除外マーカー
+  // 「パターン替え→」=EN1）。各ブロックに「子にて判定」を書く判定行が無く、停止判定はAB/AC列の
+  // グローバル設定（消化判定ライン2.0倍/許容CPAライン10%）で持つ形式のため noJudgeRow:true（BUG-115）。
   { name: "nrc",  channelId: "C0BDKUYPULT", sheets: [{ spreadsheetId: "1O9cXBQ4-dLwOzOitHJiZQ9QalRBE-4sPxw3BfG7KQo4", sheetName: "meta_total" }], metaAdAccountId: "1903907890279162",
-    driveFolderId: "1hLhNbuG7bw3V5SsiPa4SjuDOo8DNvGdl", cldbPageId: "2ef35c2adb5680759037e4e5a8efd764", crdbDataSourceId: CRDB_DATA_SOURCE_ID },
+    driveFolderId: "1hLhNbuG7bw3V5SsiPa4SjuDOo8DNvGdl", cldbPageId: "2ef35c2adb5680759037e4e5a8efd764", crdbDataSourceId: CRDB_DATA_SOURCE_ID, noJudgeRow: true },
   // ── 複数集計対象の案件 ──
   { name: "una",  channelId: "C08DV6STNER", metaAdAccountId: "1063670028480764", sheets: [
       { spreadsheetId: "1J_T8FurvLgRd6IhxjqE0AqGS8NfQPRanXp55dy9o5gI", sheetName: "meta_total" },        // 本店

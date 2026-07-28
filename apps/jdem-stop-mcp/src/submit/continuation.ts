@@ -334,8 +334,22 @@ async function runHop(
           const tabName = t.sheetName || r.sheetName || "集計表";
           const label = sheetLink(t.spreadsheetId, tabName);
           // GASからの警告（分類プルダウン未反映・判定行未検出等）は完了通知に必ず表示する。
-          // 以前は握りつぶしていたため、集計表側の設定漏れに気づけなかった（BUG-68）
-          const warnSuffix = r.ok && r.warnings?.length ? ` ⚠️ ${r.warnings.join(" / ")}` : "";
+          // 以前は握りつぶしていたため、集計表側の設定漏れに気づけなかった（BUG-68）。
+          // ただし判定行が構造的に無い案件（nrc等 noJudgeRow）では、判定行未検出は「正常」なので
+          // ⚠️警告ではなく ℹ️案内にトーンダウンする（BUG-115）。他の警告は従来どおり⚠️で顕在化。
+          let warnSuffix = "";
+          if (r.ok && r.warnings?.length) {
+            const judgeWarns: string[] = [];
+            const otherWarns: string[] = [];
+            for (const w of r.warnings) {
+              if (plan.noJudgeRow && /判定行/.test(w)) judgeWarns.push(w);
+              else otherWarns.push(w);
+            }
+            const parts: string[] = [];
+            if (otherWarns.length) parts.push(`⚠️ ${otherWarns.join(" / ")}`);
+            if (judgeWarns.length) parts.push("ℹ️ この案件は判定行が無い構造のため「子にて判定」は元々不要です（正常）");
+            if (parts.length) warnSuffix = ` ${parts.join(" ")}`;
+          }
           if (r.ok) {
             results.push(`${label}${warnSuffix}`);
           } else if (/タイムアウト/.test(r.error || "")) {

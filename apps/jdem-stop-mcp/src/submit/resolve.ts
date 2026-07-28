@@ -260,6 +260,7 @@ export async function resolveSubmit(
     channelId: input.channelId,
     responseUrl: input.responseUrl,
     userId: input.userId,
+    noJudgeRow: project.noJudgeRow,
   };
 
   // 集計表だけモード（BUG-110）: Meta候補の探索・広告セット選択を全てスキップし、

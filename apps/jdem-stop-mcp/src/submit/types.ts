@@ -55,6 +55,14 @@ export interface SubmitProject {
    * 解決したら削除してcr入稿くんを有効化する。
    */
   submitBlocked?: string;
+  /**
+   * この案件の集計表は各ブロックに「子にて判定」を書く判定行が構造的に存在しない
+   * （停止判定をグローバル設定で持つ形式。例: nrc は消化判定ライン/許容CPAラインを
+   * AB/AC列のレジェンドで持つ）。設定時は判定行未検出を「正常」として扱い、完了通知の
+   * ⚠️警告を ℹ️案内にトーンダウンする（BUG-115）。判定行を持つ案件では未設定のままにし、
+   * 検出失敗を⚠️で顕在化させる。
+   */
+  noJudgeRow?: boolean;
 }
 
 /** 入稿先1件（複数広告セット同時入稿用。BUG-31） */
@@ -107,6 +115,9 @@ export interface SubmitPlan {
   /** 集計表だけモード（BUG-110）。Meta入稿は既に手動等で済んでおり、集計表の展開だけ行う。
    * uploadやcreate_ads等のMetaステップを全てスキップし、sheetステップから実行する。 */
   sheetOnly?: boolean;
+  /** この案件は判定行が無い構造（SubmitProject.noJudgeRow を継承）。BUG-115。
+   * true のとき、集計表の判定行未検出の警告を⚠️→ℹ️（正常）にトーンダウンする。 */
+  noJudgeRow?: boolean;
 }
 
 export interface PlannedVideo {
