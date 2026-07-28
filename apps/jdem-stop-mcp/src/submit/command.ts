@@ -64,6 +64,37 @@ async function resolveAndAsk(
 
     const blocks: any[] = [{ type: "section", text: { type: "mrkdwn", text: head } }];
 
+    if (plan.sheetOnly) {
+      // 集計表だけモード（BUG-110）: Meta入稿はスキップし、集計表の展開だけ行う
+      const childIds = plan.videos.map((v) => v.sheetId).filter((sid) => /cr\d+_\d{2}/i.test(sid));
+      const sheetPlanText =
+        `📊 *集計表だけ展開します（Metaへの入稿はしません）*\n` +
+        `親: *${plan.crKey}*` +
+        (childIds.length ? `\n子: ${childIds.join(", ")}` : "（子パターンなし＝親ブロックのみ）");
+      blocks.push({ type: "section", text: { type: "mrkdwn", text: sheetPlanText } });
+      blocks.push({
+        type: "actions",
+        elements: [
+          {
+            type: "button",
+            style: "primary",
+            text: { type: "plain_text", text: "📊 集計表だけ展開する" },
+            action_id: "crin_exec_0",
+            value: JSON.stringify({ a: payload.text.trim(), sheet: 1 }),
+            confirm: {
+              title: { type: "plain_text", text: "集計表の展開" },
+              text: { type: "mrkdwn", text: `*${plan.crKey}* を集計表に展開します（Metaへの入稿はしません）。` },
+              confirm: { type: "plain_text", text: "展開する" },
+              deny: { type: "plain_text", text: "やめる" },
+            },
+          },
+          cancelButton(),
+        ],
+      });
+      await respond(payload.response_url, { blocks, response_type: "in_channel" });
+      return;
+    }
+
     if (outcome.adsetCandidates) {
       // 広告セット複数 → セットごとに実行ボタン。
       // 候補は「直近7日間に消化のあったセット」に絞られている（listAdsetCandidates）。
@@ -155,15 +186,17 @@ async function resolveAndAsk(
       // hydのcr47のようにCRDB候補が複数だと必ずこのpickを通るため、ここで落とすと
       // /cr-in cr47_07 08 の絞り込みが効かなくなる。ボタンvalueにpatを載せて持ち回る。
       const pat = e.patterns && e.patterns.length ? e.patterns : undefined;
+      const sh = e.sheetOnly ? 1 : undefined; // 集計表だけモードも維持（BUG-110）
+      const modeNote = `${pat ? `　（_${pat.join(", _")} のみ）` : ""}${sh ? "　（集計表だけ）" : ""}`;
       e.candidates.slice(0, 5).forEach((c, i) => {
         blocks.push({
           type: "section",
-          text: { type: "mrkdwn", text: `*${c.name || "(無題)"}*${pat ? `　（_${pat.join(", _")} のみ）` : ""}` },
+          text: { type: "mrkdwn", text: `*${c.name || "(無題)"}*${modeNote}` },
           accessory: {
             type: "button",
-            text: { type: "plain_text", text: "このページ" },
+            text: { type: "plain_text", text: sh ? "このページ（集計表）" : "このページ" },
             action_id: `crin_pick_${i}`,
-            value: JSON.stringify({ p: c.pageId, pat }),
+            value: JSON.stringify({ p: c.pageId, pat, sh }),
           },
         });
       });
@@ -176,7 +209,7 @@ async function resolveAndAsk(
           style: "primary",
           text: { type: "plain_text", text: `📤 すべての入稿プランを表示（${Math.min(e.candidates.length, 5)}件）` },
           action_id: "crin_pick_all",
-          value: JSON.stringify({ ps: e.candidates.slice(0, 5).map((c) => c.pageId), pat }),
+          value: JSON.stringify({ ps: e.candidates.slice(0, 5).map((c) => c.pageId), pat, sh }),
         });
       }
       pickActions.push(cancelButton());
@@ -230,7 +263,7 @@ export function handleCrInInteraction(
       ctx.waitUntil(respond(responseUrl, { text: "案件が特定できません", replace_original: true }));
       return new Response("", { status: 200 });
     }
-    const v = JSON.parse(action.value) as { a: string; ad?: string; s?: string; all?: number };
+    const v = JSON.parse(action.value) as { a: string; ad?: string; s?: string; all?: number; sheet?: number };
     ctx.waitUntil(
       confirmAndRun(v, interaction, project, env, ctx, metaTokenFor(project), gasTargetsFor(project))
     );
@@ -261,8 +294,9 @@ export function handleCrInInteraction(
       );
       return new Response("", { status: 200 });
     }
-    const va = JSON.parse(action.value) as { ps: string[]; pat?: string[] };
-    const patSuffix = va.pat && va.pat.length ? " " + va.pat.join(" ") : ""; // パターン指定を維持（BUG-101）
+    const va = JSON.parse(action.value) as { ps: string[]; pat?: string[]; sh?: number };
+    const patSuffix =
+      (va.pat && va.pat.length ? " " + va.pat.join(" ") : "") + (va.sh ? " 集計表" : ""); // パターン/集計表モードを維持（BUG-101/110）
     const base = {
       channel_id: interaction.channel?.id || interaction.container?.channel_id || "",
       user_id: interaction.user?.id || "",
@@ -291,10 +325,11 @@ export function handleCrInInteraction(
       );
       return new Response("", { status: 200 });
     }
-    const v = JSON.parse(action.value) as { p: string; pat?: string[] };
-    // pageId の後ろにパターン番号を付けて再解決に渡す（BUG-101）。resolveSubmitは
-    // 先頭トークンをNotionID直指定として扱い、残りトークンをパターン指定として拾う。
-    const pickText = v.p + (v.pat && v.pat.length ? " " + v.pat.join(" ") : "");
+    const v = JSON.parse(action.value) as { p: string; pat?: string[]; sh?: number };
+    // pageId の後ろにパターン番号・集計表キーワードを付けて再解決に渡す（BUG-101/110）。
+    // resolveSubmitは先頭トークンをNotionID直指定、残りトークンをパターン/モード指定として拾う。
+    const pickText =
+      v.p + (v.pat && v.pat.length ? " " + v.pat.join(" ") : "") + (v.sh ? " 集計表" : "");
     const payload: SlashPayload = {
       text: pickText,
       channel_id: interaction.channel?.id || interaction.container?.channel_id || "",
@@ -312,7 +347,7 @@ export function handleCrInInteraction(
 }
 
 async function confirmAndRun(
-  v: { a: string; ad?: string; s?: string; all?: number },
+  v: { a: string; ad?: string; s?: string; all?: number; sheet?: number },
   interaction: any,
   project: SubmitProject,
   env: SubmitEnv,
@@ -333,6 +368,12 @@ async function confirmAndRun(
     });
     const plan = outcome.plan!;
     plan.userName = interaction.user?.username || interaction.user?.name || ""; // 実行ログDB用（TOOL-40）
+    if (plan.sheetOnly) {
+      // 集計表だけモード（BUG-110）: Metaステップは踏まず sheet から実行する。
+      // metaAdAccountId未設定の案件でも動くよう、accountIdは空で渡す（sheetステップは使わない）
+      await startExecution(plan, env, ctx, metaToken, project.metaAdAccountId || "", gasTargets);
+      return;
+    }
     const cands = (outcome.adsetCandidates || []).filter((c) => c.latestAd);
     if (v.all) {
       // 「すべてに入稿」（BUG-31）: 表示された全候補セットをターゲットにする。

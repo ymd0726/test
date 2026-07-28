@@ -104,6 +104,9 @@ export interface SubmitPlan {
   userName?: string;
   /** 統一「ツール実行ログDB」のページID（開始時に作成し、継続ホップをまたいで更新する） */
   runLogPageId?: string | null;
+  /** 集計表だけモード（BUG-110）。Meta入稿は既に手動等で済んでおり、集計表の展開だけ行う。
+   * uploadやcreate_ads等のMetaステップを全てスキップし、sheetステップから実行する。 */
+  sheetOnly?: boolean;
 }
 
 export interface PlannedVideo {

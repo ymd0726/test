@@ -46,7 +46,14 @@ export async function startExecution(
   projectAccountId: string,
   gasTargets: { spreadsheetId: string; sheetName?: string }[]
 ): Promise<void> {
-  const state: ContinuationState = { step: "upload", index: 0, attempts: 0, plan, startedAt: Date.now() };
+  // 集計表だけモード（BUG-110）はMetaステップ(upload/create_ads/activate)を全てスキップしsheetから開始
+  const state: ContinuationState = {
+    step: plan.sheetOnly ? "sheet" : "upload",
+    index: 0,
+    attempts: 0,
+    plan,
+    startedAt: Date.now(),
+  };
   // 実行ログDB（TOOL-40）: 開始時に「実行中」で作成。翌朝チェックの照合キー（親cr/子cr/入稿先）も先に記録する
   const runDetail = {
     parentSheetId: sheetParentId(plan),
@@ -55,7 +62,7 @@ export async function startExecution(
   (plan as any)._runDetail = runDetail;
   plan.runLogPageId = await createRunLog(env.NOTION_TOKEN, {
     tool: "cr入稿くん",
-    action: "入稿",
+    action: plan.sheetOnly ? "集計表展開" : "入稿",
     project: plan.project,
     crName: plan.parentName,
     userName: plan.userName,
@@ -67,7 +74,13 @@ export async function startExecution(
     detail: runDetail,
   });
   const logWarn = !plan.runLogPageId && env.NOTION_TOKEN ? "\n⚠️ 実行ログの記録に失敗（翌日自動チェックの対象外になります）" : "";
-  await postProgress(env, plan, `🚀 入稿を開始します: *${plan.parentName}*（動画 ${plan.videos.length} 本）${logWarn}`);
+  await postProgress(
+    env,
+    plan,
+    plan.sheetOnly
+      ? `📊 集計表だけ展開します: *${plan.parentName}*（Metaへの入稿はしません）${logWarn}`
+      : `🚀 入稿を開始します: *${plan.parentName}*（動画 ${plan.videos.length} 本）${logWarn}`
+  );
   ctx.waitUntil(runHop(state, env, metaToken, projectAccountId, gasTargets));
 }
 
@@ -316,7 +329,10 @@ async function runHop(
             childIds,
             dryRun: false,
           });
-          const label = t.sheetName || t.spreadsheetId;
+          // 集計表は生のスプレッドシートID（長い）ではなくSlackリンクで表示する（BUG-105）。
+          // 表示名はタブ名（GASが返す実タブ名を優先）。gid未取得なので/editでシートを開く。
+          const tabName = t.sheetName || r.sheetName || "集計表";
+          const label = sheetLink(t.spreadsheetId, tabName);
           // GASからの警告（分類プルダウン未反映・判定行未検出等）は完了通知に必ず表示する。
           // 以前は握りつぶしていたため、集計表側の設定漏れに気づけなかった（BUG-68）
           const warnSuffix = r.ok && r.warnings?.length ? ` ⚠️ ${r.warnings.join(" / ")}` : "";
@@ -412,6 +428,30 @@ async function runHop(
 
       case "done": {
         const sheetNames = ((plan as any)._sheetResults || []).join(" / ") || "対象なし";
+        // 集計表だけモード（BUG-110）: Meta関連の行を出さず、集計表結果に絞った完了通知にする
+        if (plan.sheetOnly) {
+          const childIds = plan.videos.map((v) => v.sheetId).filter((sid) => /cr\d+_\d{2}/i.test(sid));
+          const lines = [
+            `:bar_chart: 集計表の展開が完了しました: ${plan.parentName}`,
+            "",
+            `:white_check_mark: 親： ${sheetParentId(plan)}${childIds.length ? ` ／ 子： ${childIds.join(", ")}` : "（親ブロックのみ）"}`,
+            `:white_check_mark: 集計表： ${sheetNames}`,
+          ];
+          // サムネ: Metaに動画が無い(=videoIdなし)ため、ffmpeg(Actions/Drive)経路のみ対応。トークンありなら起動
+          if (!sheetNames.includes("❌") && env.GITHUB_DISPATCH_TOKEN) {
+            try {
+              const tr = await triggerThumbnailWorkflow(env, plan, gasTargets);
+              if (tr === "ok") lines.push(":frame_with_picture: サムネ： 集計表へ0:01フレームを自動挿入中（30秒〜1分半後に反映）");
+            } catch { /* サムネ失敗は致命ではない */ }
+          }
+          await updateRunLog(env.NOTION_TOKEN, plan.runLogPageId, {
+            status: sheetNames.includes("❌") || sheetNames.includes("確認できませんでした") ? "一部失敗" : "完了",
+            sheetResult: sheetNames.includes("❌") ? "失敗" : "成功",
+          });
+          const posted = await postPublic(env, plan.channelId, lines.join("\n"));
+          if (!posted) await postProgress(env, plan, lines.join("\n"), true);
+          return;
+        }
         const notionLine = (plan as any)._notionWarn
           ? `:warning: Notion： ${(plan as any)._notionWarn}`
           : ":white_check_mark: Notion： 入稿済み";
@@ -705,6 +745,14 @@ async function chainNext(state: ContinuationState, env: SubmitEnv): Promise<void
     ? await env.SELF_WORKER.fetch(`https://self${CONTINUE_PATH}`, init)
     : await fetch(`${env.SELF_URL}${CONTINUE_PATH}`, init);
   if (!res.ok) throw new Error(`continuation連鎖失敗: ${res.status}`);
+}
+
+/** 集計表をSlackのクリック可能リンクで表示（BUG-105。生のスプレッドシートIDは長いため） */
+function sheetLink(spreadsheetId: string, text: string): string {
+  const url = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`;
+  // Slackリンクのtext内で | と > はエスケープ（表示崩れ防止）
+  const safe = String(text).replace(/[|>]/g, " ").trim() || "集計表";
+  return `<${url}|${safe}>`;
 }
 
 function sheetParentId(plan: SubmitPlan): string {

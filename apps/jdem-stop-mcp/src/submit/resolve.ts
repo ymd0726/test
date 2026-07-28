@@ -18,12 +18,20 @@ export class CrPageAmbiguousError extends Error {
   candidates: { pageId: string; name: string }[];
   /** パターン指定（例 ["07","08"]）。ページ選択後の再解決でも維持するため持ち回る（BUG-101） */
   patterns: string[];
-  constructor(key: string, candidates: { pageId: string; name: string }[], patterns: string[] = []) {
+  /** 集計表だけモード（BUG-110）。ページ選択後の再解決でも維持する */
+  sheetOnly: boolean;
+  constructor(
+    key: string,
+    candidates: { pageId: string; name: string }[],
+    patterns: string[] = [],
+    sheetOnly = false
+  ) {
     super(
       `Notion CRDBに「${key}」の候補が複数あります:\n${candidates.map((c) => `・${c.name}`).join("\n")}`
     );
     this.candidates = candidates;
     this.patterns = patterns;
+    this.sheetOnly = sheetOnly;
   }
 }
 
@@ -57,12 +65,19 @@ export async function resolveSubmit(
   let arg = tokens[0] || "";
   if (!arg)
     throw new Error(
-      "使い方: `/cr-in <cr名 または NotionページURL> [パターン番号…]`（例: `/cr-in cr79` ／ 特定パターンのみ: `/cr-in cr79_06` や `/cr-in cr79 06 07`）"
+      "使い方: `/cr-in <cr名 または NotionページURL> [パターン番号…] [集計表]`（例: `/cr-in cr79` ／ 特定パターンのみ: `/cr-in cr79_06` や `/cr-in cr79 06 07` ／ 集計表だけ展開: `/cr-in cr79 集計表`）"
     );
   const selPatterns = new Set<string>();
+  // 集計表だけモード（BUG-110）: 追加トークンに「集計表/シート/sheet」等があれば、
+  // Meta入稿をスキップして集計表の展開だけ行う（Meta側は既に手動等で入稿済みのケース）。
+  let sheetOnly = false;
   for (const t of tokens.slice(1)) {
     const pm = t.match(/^_?(\d{1,2})$/);
-    if (pm) selPatterns.add(pm[1].padStart(2, "0"));
+    if (pm) {
+      selPatterns.add(pm[1].padStart(2, "0"));
+      continue;
+    }
+    if (/^(集計表|集計|シート|sheet|sheetonly|シートのみ|集計表のみ)$/i.test(t)) sheetOnly = true;
   }
   if (!/notion\.(so|com)|app\.notion\.com|^[0-9a-f-]{32,36}$/i.test(arg)) {
     // cr名末尾の _NN はパターン指定として扱い、CRDB検索キーからは外す（cr47_07 / 47_07 両対応）
@@ -119,7 +134,8 @@ export async function resolveSubmit(
       throw new CrPageAmbiguousError(
         key,
         submittable.map((h) => ({ pageId: h.pageId, name: h.name })),
-        [...selPatterns]
+        [...selPatterns],
+        sheetOnly
       );
     crPage = submittable[0];
   }
@@ -213,19 +229,9 @@ export async function resolveSubmit(
     warnings.push(`ℹ️ パターン指定: _${want.join(", _")} のみを入稿します（他のパターンは対象外）`);
   }
 
-  // 3. Meta 広告セット候補
-  if (!project.metaAdAccountId) throw new Error(`案件「${project.name}」にmetaAdAccountIdが未設定です`);
-  const candidates = await listAdsetCandidates(project.metaAdAccountId, metaToken, project.adsetAllowlist);
-  const usable = candidates.filter((c) => c.latestAd);
-  if (usable.length === 0) {
-    throw new Error(
-      "コピー元にできる直近cr広告を持つ広告セットが見つかりません（直近7日間に消化のあるセット、無ければACTIVE全セットを探索）"
-    );
-  }
-
-  // 4. プラン組み立て（実際に入稿する動画 = 子があれば子、無ければ親）
-  const targets: DriveFile[] = children.length > 0 ? children : parent ? [parent] : [];
-  const videos: PlannedVideo[] = targets.map((f) => {
+  // 3. プラン組み立て（実際に入稿する動画 = 子があれば子、無ければ親）
+  const dtargets: DriveFile[] = children.length > 0 ? children : parent ? [parent] : [];
+  const videos: PlannedVideo[] = dtargets.map((f) => {
     const base = stripExt(f.name);
     return {
       adName: adNameFor(project, base),
@@ -236,14 +242,6 @@ export async function resolveSubmit(
       mimeType: f.mimeType,
     };
   });
-
-  // 冪等性チェック: 同名広告が既にあれば警告
-  const dup = await findAdsByExactName(
-    project.metaAdAccountId,
-    metaToken,
-    videos.map((v) => v.adName)
-  );
-  if (dup.length > 0) warnings.push(`⚠️ 同名の広告が既に存在します: ${dup.join(", ")}`);
 
   const outcome: ResolveOutcome = {
     crPage,
@@ -263,6 +261,39 @@ export async function resolveSubmit(
     responseUrl: input.responseUrl,
     userId: input.userId,
   };
+
+  // 集計表だけモード（BUG-110）: Meta候補の探索・広告セット選択を全てスキップし、
+  // 集計表展開だけのプランを返す。metaAdAccountI未設定の案件でも集計表展開はできる。
+  if (sheetOnly) {
+    outcome.plan = {
+      ...planBase,
+      sheetOnly: true,
+      adsetId: "",
+      adsetName: "",
+      campaignName: "",
+      sourceAdId: "",
+      sourceAdName: "",
+    };
+    return outcome;
+  }
+
+  // 4. Meta 広告セット候補
+  if (!project.metaAdAccountId) throw new Error(`案件「${project.name}」にmetaAdAccountIdが未設定です`);
+  const candidates = await listAdsetCandidates(project.metaAdAccountId, metaToken, project.adsetAllowlist);
+  const usable = candidates.filter((c) => c.latestAd);
+  if (usable.length === 0) {
+    throw new Error(
+      "コピー元にできる直近cr広告を持つ広告セットが見つかりません（直近7日間に消化のあるセット、無ければACTIVE全セットを探索）"
+    );
+  }
+
+  // 冪等性チェック: 同名広告が既にあれば警告
+  const dup = await findAdsByExactName(
+    project.metaAdAccountId,
+    metaToken,
+    videos.map((v) => v.adName)
+  );
+  if (dup.length > 0) warnings.push(`⚠️ 同名の広告が既に存在します: ${dup.join(", ")}`);
 
   if (usable.length === 1) {
     const c = usable[0];
