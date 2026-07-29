@@ -226,8 +226,7 @@ if (!APPLY) {
   for (const b of blocks) {
     readRanges.push(`'${TAB}'!${colToA1(b.discCol)}${METRIC_ROW}`, `'${TAB}'!${colToA1(b.cvCol)}${METRIC_ROW}`, `'${TAB}'!${colToA1(b.cpaCol)}${METRIC_ROW}`);
   }
-  const vals = await sheets.spreadsheets.values.batchGet({ spreadsheetId: SPREADSHEET_ID, ranges: readRanges, valueRenderOption: "UNFORMATTED_VALUE" });
-  const vr = vals.data.valueRanges;
+  const vr = await batchGetChunked(readRanges, "UNFORMATTED_VALUE");
   const target = num(vr[0]?.values?.[0]?.[0]);
   const spend = num(vr[1]?.values?.[0]?.[0]);
   const preCpaF = num(vr[2]?.values?.[0]?.[0]);
@@ -305,17 +304,21 @@ const data = [
   ...writable.map((b) => ({ range: `'${TAB}'!${b.cell}`, values: [[b.formula]] })),
   ...clearTargets.map((c) => ({ range: `'${TAB}'!${c.cell}`, values: [[""]] })),
 ];
-await sheets.spreadsheets.values.batchUpdate({
-  spreadsheetId: SPREADSHEET_ID,
-  requestBody: { valueInputOption: "USER_ENTERED", data },
-});
+// 大規模タブでも安全に通るよう分割して書き込む（POST本文なのでURL長制限は無いが、
+// 1リクエストが巨大だとタイムアウトしやすいため）
+for (let i = 0; i < data.length; i += 200) {
+  await sheets.spreadsheets.values.batchUpdate({
+    spreadsheetId: SPREADSHEET_ID,
+    requestBody: { valueInputOption: "USER_ENTERED", data: data.slice(i, i + 200) },
+  });
+}
 console.log(`# 中間行 ${blocks.length}セル / 表示行 ${writable.length}セル に式を書き込み${clearTargets.length ? `、旧行 ${clearTargets.length} セルを掃除` : ""}しました。反映を再読取で確認します…`);
 
 const checks = [...blocks.map((b) => ({ cell: b.tierCell, want: b.tierFormula })), ...writable.map((b) => ({ cell: b.cell, want: b.formula }))];
-const verify = await sheets.spreadsheets.values.batchGet({ spreadsheetId: SPREADSHEET_ID, ranges: checks.map((c) => `'${TAB}'!${c.cell}`), valueRenderOption: "FORMULA" });
+const verifyRanges = await batchGetChunked(checks.map((c) => `'${TAB}'!${c.cell}`), "FORMULA");
 let mismatch = 0;
 for (let i = 0; i < checks.length; i++) {
-  const now = String(verify.data.valueRanges[i]?.values?.[0]?.[0] ?? "").replace(/\s/g, "");
+  const now = String(verifyRanges[i]?.values?.[0]?.[0] ?? "").replace(/\s/g, "");
   if (now !== checks[i].want.replace(/\s/g, "")) { mismatch++; if (mismatch <= 5) console.log(`  ⚠ ${checks[i].cell}: 反映不一致（要目視）`); }
 }
 console.log(`\n===== 適用完了: 中間行 ${blocks.length} / 表示行 ${writable.length} セル（要目視確認 ${mismatch} 件）${clearTargets.length ? ` / 旧行掃除 ${clearTargets.length} セル` : ""} =====`);
@@ -339,6 +342,17 @@ function parseArgs(argv) {
     else if (a === "--settings-col") out.settingsCol = argv[++i];
     else if (a === "--apply") out.apply = true;
     else if (a === "--undo-out") out.undoOut = argv[++i];
+  }
+  return out;
+}
+// batchGet は URL に ranges を並べる GET のため、件数が多いと URL 長制限で 400 になる。
+// 大規模タブ（nrn: 173ブロック×3セル=519レンジ）でも通るよう分割して読む。
+async function batchGetChunked(ranges, valueRenderOption, chunkSize = 100) {
+  const out = [];
+  for (let i = 0; i < ranges.length; i += chunkSize) {
+    const part = ranges.slice(i, i + chunkSize);
+    const res = await sheets.spreadsheets.values.batchGet({ spreadsheetId: SPREADSHEET_ID, ranges: part, valueRenderOption });
+    out.push(...(res.data.valueRanges || []));
   }
   return out;
 }
