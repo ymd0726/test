@@ -155,6 +155,20 @@ export interface ContinuationState {
   attempts: number;
   plan: SubmitPlan;
   startedAt: number;
+  /**
+   * アップロード中の動画のMetaチャンクアップロードセッション（BUG-119）。
+   * 大きな動画（例: blaの1分動画は約70MB=約9チャンク）を1ホップで全部送ると単一ホップの
+   * 実行時間/CPU上限を超えてWorkerがサイレント終了する。1ホップ数チャンクずつ送り、未完なら
+   * このセッションを保存して同じuploadステップへ連鎖して継続する（Metaのupload_session_idは
+   * リクエストをまたいで再開可能）。完了したらundefinedに戻す。UploadSession(meta.ts)と同形。
+   */
+  uploadSession?: {
+    uploadSessionId: string;
+    videoId: string;
+    startOffset: number;
+    endOffset: number;
+    fileSize: number;
+  };
 }
 
 export interface SubmitEnv {
@@ -188,6 +202,9 @@ export const GRAPH = "https://graph.facebook.com/v21.0";
 
 /** Meta動画チャンクサイズ（Workerメモリに載せる単位。Drive Range取得と一致させる） */
 export const UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024; // 8MB
+// 1ホップで転送するチャンク数の上限（BUG-119）。8MB×4=32MB/ホップ。大きな動画は複数ホップに
+// 分割して転送し、単一ホップの実行時間/CPU上限超過によるサイレント停止を防ぐ。
+export const UPLOAD_CHUNKS_PER_HOP = 4;
 
 /** wait_ready ポーリング上限（1hop=1回チェック、Slack進捗を出しつつ最大N回） */
 export const MAX_READY_ATTEMPTS = 60; // ~5分相当（5秒間隔×60）

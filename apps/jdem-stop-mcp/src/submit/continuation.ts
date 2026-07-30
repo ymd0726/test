@@ -14,7 +14,7 @@
 //   notion         … CRページのステータス更新＋実行ログ
 //   done           … 結果サマリーをSlackへ
 
-import { ContinuationState, SubmitEnv, SubmitPlan, MAX_READY_ATTEMPTS } from "./types";
+import { ContinuationState, SubmitEnv, SubmitPlan, MAX_READY_ATTEMPTS, UPLOAD_CHUNK_BYTES, UPLOAD_CHUNKS_PER_HOP } from "./types";
 import { driveAccessToken } from "./drive";
 import {
   startVideoUpload,
@@ -125,14 +125,37 @@ async function runHop(
     switch (state.step) {
       case "upload": {
         const v = plan.videos[state.index];
-        await postProgress(env, plan, `⏳ ${v.adName} をアップロード中… (${state.index + 1}/${plan.videos.length})`);
         const driveToken = await driveAccessToken(env.GOOGLE_SERVICE_ACCOUNT_JSON);
-        let session = await startVideoUpload(accountId, metaToken, v.fileSizeBytes);
-        while (session.startOffset < v.fileSizeBytes) {
+        // BUG-119: 大きな動画（blaの1分動画は約70MB=約9チャンク）を1ホップで全チャンク送ると
+        // 単一ホップの実行時間/CPU上限を超え、Workerがcatchを通らずサイレント終了する
+        // （runは「実行中」のまま残り、通知も出ない）。1ホップ最大 UPLOAD_CHUNKS_PER_HOP 個ずつ
+        // 送り、未完ならセッションを保存して同じuploadステップへ連鎖して継続する。
+        let session = state.uploadSession || (await startVideoUpload(accountId, metaToken, v.fileSizeBytes));
+        const totalChunks = Math.max(1, Math.ceil(v.fileSizeBytes / UPLOAD_CHUNK_BYTES));
+        const doneBefore = Math.floor(session.startOffset / UPLOAD_CHUNK_BYTES);
+        await postProgress(
+          env,
+          plan,
+          `⏳ ${v.adName} をアップロード中… (${state.index + 1}/${plan.videos.length} 本, ${Math.min(doneBefore + 1, totalChunks)}/${totalChunks} ブロック)`
+        );
+        let sent = 0;
+        while (session.startOffset < v.fileSizeBytes && sent < UPLOAD_CHUNKS_PER_HOP) {
+          const prevOffset = session.startOffset;
           session = await transferVideoChunk(accountId, metaToken, session, driveToken, v.driveFileId);
+          sent += 1;
+          // オフセットが進まない場合は無限ループ防止のため明示エラー（通常Metaが必ず前進させる）
+          if (session.startOffset <= prevOffset) {
+            throw new Error(`動画 ${v.adName} のアップロードが進みません (offset=${session.startOffset}/${v.fileSizeBytes})`);
+          }
+        }
+        if (session.startOffset < v.fileSizeBytes) {
+          // まだ残りがある → セッションを保存し、同じ動画のuploadを次ホップで継続（fresh budget）
+          state.uploadSession = session;
+          break; // step/index はそのまま。chainNextで同じuploadステップへ
         }
         await finishVideoUpload(accountId, metaToken, session, v.adName);
         v.videoId = session.videoId;
+        state.uploadSession = undefined;
         state.step = "wait_ready";
         state.attempts = 0;
         break;
