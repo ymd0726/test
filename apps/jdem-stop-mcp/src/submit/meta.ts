@@ -51,16 +51,26 @@ export async function transferVideoChunk(
   const end = Math.min(start + UPLOAD_CHUNK_BYTES, session.fileSize) - 1;
   const bytes = await fetchFileRange(driveToken, driveFileId, start, end);
 
-  const form = new FormData();
-  form.set("upload_phase", "transfer");
-  form.set("upload_session_id", session.uploadSessionId);
-  form.set("start_offset", String(start));
-  form.set("video_file_chunk", new Blob([bytes]), "chunk.bin");
-  form.set("access_token", token);
+  // 一時障害（Service temporarily unavailable / is_transient 等）はバックオフして再試行する
+  // （BUG-120）。同じ start_offset の再POSTはMetaのresumable upload的に冪等。FormData/Blobは
+  // 一度consumeすると再送できないため、試行ごとに作り直す（bytesは使い回す）。
+  const data = await withMetaRetry(async () => {
+    const form = new FormData();
+    form.set("upload_phase", "transfer");
+    form.set("upload_session_id", session.uploadSessionId);
+    form.set("start_offset", String(start));
+    form.set("video_file_chunk", new Blob([bytes]), "chunk.bin");
+    form.set("access_token", token);
 
-  const res = await fetch(`${GRAPH}/act_${accountId}/advideos`, { method: "POST", body: form });
-  const data = (await res.json()) as any;
-  if (!res.ok || data.error) throw new Error(`動画チャンク転送失敗: ${JSON.stringify(data.error || data)}`);
+    const res = await fetch(`${GRAPH}/act_${accountId}/advideos`, { method: "POST", body: form });
+    const d = (await res.json()) as any;
+    if (!res.ok || d.error) {
+      const err: any = new Error(`動画チャンク転送失敗: ${JSON.stringify(d.error || d)}`);
+      err.transient = transientFromError(d.error || d, res.status);
+      throw err;
+    }
+    return d;
+  });
   return {
     ...session,
     startOffset: Number(data.start_offset),
@@ -422,20 +432,77 @@ export async function findAdsByExactName(
 
 const META_TIMEOUT_MS = 25_000;
 
+// ---- 一時障害リトライ（BUG-120）----
+// Metaの動画アップロードAPIは高頻度で一時障害（is_transient:true /「Service temporarily
+// unavailable」/ 5xx）を返す。1回で諦めると入稿全体が失敗するため、一時障害はバックオフして
+// 再試行する。チャンク転送はMetaのresumable upload（upload_session_id + start_offset）なので
+// 同じチャンクの再POSTは冪等（安全）。恒久エラー（権限・不正パラメータ等）は即座にthrowする。
+const META_MAX_ATTEMPTS = 4; // 初回 + 最大3回リトライ
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/** Metaのエラーオブジェクト/HTTPステータスが一時障害かを判定 */
+function transientFromError(errObj: any, status?: number): boolean {
+  if (typeof status === "number" && status >= 500) return true;
+  if (errObj && typeof errObj === "object") {
+    if (errObj.is_transient === true) return true;
+    if (Number(errObj.code) === 2) return true; // 一時障害でよく使われるコード
+    if ([1363047, 1363030, 1363037, 1363019].includes(Number(errObj.error_subcode))) return true; // 動画アップロード一時障害系
+    if (/temporarily unavailable|please try again|reduce the amount of data|unexpected error/i.test(String(errObj.message || ""))) return true;
+  }
+  return false;
+}
+
+/** throwされたエラーがリトライ可能（一時障害・ネットワーク/タイムアウト）か */
+function isRetryable(e: any): boolean {
+  if (e?.transient === true) return true;
+  const s = `${e?.name || ""} ${e?.message || ""}`;
+  return /AbortError|aborted|network|Failed to fetch|temporarily unavailable|is_transient|"code":2/i.test(s);
+}
+
+/** 一時障害はバックオフ(1s,2s,4s)して再試行。恒久エラー・最終失敗はthrow。 */
+async function withMetaRetry<T>(fn: () => Promise<T>): Promise<T> {
+  let lastErr: any;
+  for (let i = 0; i < META_MAX_ATTEMPTS; i++) {
+    try {
+      return await fn();
+    } catch (e: any) {
+      lastErr = e;
+      if (i === META_MAX_ATTEMPTS - 1 || !isRetryable(e)) throw e;
+      await sleep(1000 * Math.pow(2, i)); // 1s, 2s, 4s
+    }
+  }
+  throw lastErr;
+}
+
 async function graphGet(path: string, token: string): Promise<any> {
   const sep = path.includes("?") ? "&" : "?";
-  const res = await fetchWithTimeout(`${GRAPH}/${path}${sep}access_token=${encodeURIComponent(token)}`);
-  const data = (await res.json()) as any;
-  if (data.error) throw new Error(`Meta API失敗: ${JSON.stringify(data.error)}`);
-  return data;
+  return withMetaRetry(async () => {
+    const res = await fetchWithTimeout(`${GRAPH}/${path}${sep}access_token=${encodeURIComponent(token)}`);
+    const data = (await res.json()) as any;
+    if (data.error) {
+      const err: any = new Error(`Meta API失敗: ${JSON.stringify(data.error)}`);
+      err.transient = transientFromError(data.error, res.status);
+      throw err;
+    }
+    return data;
+  });
 }
 
 async function graphPost(path: string, token: string, params: Record<string, string>): Promise<any> {
-  const body = new URLSearchParams({ ...params, access_token: token });
-  const res = await fetchWithTimeout(`${GRAPH}/${path}`, { method: "POST", body });
-  const data = (await res.json()) as any;
-  if (data.error) throw new Error(`Meta API失敗 (${path}): ${JSON.stringify(data.error)}`);
-  return data;
+  return withMetaRetry(async () => {
+    const body = new URLSearchParams({ ...params, access_token: token });
+    const res = await fetchWithTimeout(`${GRAPH}/${path}`, { method: "POST", body });
+    const data = (await res.json()) as any;
+    if (data.error) {
+      const err: any = new Error(`Meta API失敗 (${path}): ${JSON.stringify(data.error)}`);
+      err.transient = transientFromError(data.error, res.status);
+      throw err;
+    }
+    return data;
+  });
 }
 
 async function fetchWithTimeout(url: string, init?: RequestInit): Promise<Response> {
