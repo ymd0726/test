@@ -8,8 +8,8 @@
 // 承認時に再度 resolve してから実行する（Slackのvalue 2000字制限対策＋常に最新状態で実行）。
 
 import { SubmitProject, SubmitEnv } from "./types";
-import { resolveSubmit, CrPageAmbiguousError } from "./resolve";
-import { startExecution, postProgress } from "./continuation";
+import { resolveSubmit, CrPageAmbiguousError, parseThumbRequest } from "./resolve";
+import { startExecution, postProgress, runThumbBackfill } from "./continuation";
 import { setEntityStatus } from "./meta";
 
 interface SlashPayload {
@@ -44,6 +44,36 @@ async function resolveAndAsk(
   metaToken: string
 ): Promise<void> {
   try {
+    // サムネ後追いモード（BUG-121/122/124）: 通常フローの解決（Notion/Drive/広告セット）は
+    // 不要なので先に分岐する。実行はボタン承認後（confirmAndRunのthブランチ）。
+    const thumbReq = parseThumbRequest(payload.text);
+    if (thumbReq) {
+      const desc =
+        thumbReq.mode === "one"
+          ? `*${thumbReq.crKey}* の親+全パターン子のサムネを、Meta広告の動画から取得して集計表セルへ挿入します（既存サムネは上書き）`
+          : "集計表をスキャンし、サムネ未挿入のcrブロックへ一括挿入します（1回で最大10件・再実行で続きから）";
+      const blocks: any[] = [
+        {
+          type: "section",
+          text: { type: "mrkdwn", text: `🖼️ *サムネのみ対応*（ブロック追加・Metaへの入稿はしません）\n${desc}` },
+        },
+        {
+          type: "actions",
+          elements: [
+            {
+              type: "button",
+              style: "primary",
+              text: { type: "plain_text", text: "🖼️ サムネを挿入する" },
+              action_id: "crin_exec_0",
+              value: JSON.stringify({ a: payload.text.trim(), th: 1 }),
+            },
+            cancelButton(),
+          ],
+        },
+      ];
+      await respond(payload.response_url, { blocks, response_type: "in_channel" });
+      return;
+    }
     const outcome = await resolveSubmit(project, env, metaToken, {
       text: payload.text,
       channelId: payload.channel_id,
@@ -263,7 +293,7 @@ export function handleCrInInteraction(
       ctx.waitUntil(respond(responseUrl, { text: "案件が特定できません", replace_original: true }));
       return new Response("", { status: 200 });
     }
-    const v = JSON.parse(action.value) as { a: string; ad?: string; s?: string; all?: number; sheet?: number };
+    const v = JSON.parse(action.value) as { a: string; ad?: string; s?: string; all?: number; sheet?: number; th?: number };
     ctx.waitUntil(
       confirmAndRun(v, interaction, project, env, ctx, metaTokenFor(project), gasTargetsFor(project))
     );
@@ -347,7 +377,7 @@ export function handleCrInInteraction(
 }
 
 async function confirmAndRun(
-  v: { a: string; ad?: string; s?: string; all?: number; sheet?: number },
+  v: { a: string; ad?: string; s?: string; all?: number; sheet?: number; th?: number },
   interaction: any,
   project: SubmitProject,
   env: SubmitEnv,
@@ -358,6 +388,19 @@ async function confirmAndRun(
   const responseUrl = interaction.response_url;
   try {
     if (project.submitBlocked) throw new Error(`この案件は cr入稿くん が未対応です: ${project.submitBlocked}`);
+    if (v.th) {
+      // サムネ後追いモード（BUG-121/122/124）: resolve（Notion/Drive/広告セット）を踏まず直接実行
+      const tb = parseThumbRequest(v.a);
+      await respond(responseUrl, { text: "🖼️ サムネ挿入を実行します…", replace_original: true });
+      await runThumbBackfill(env, project, metaToken, gasTargets, {
+        crKey: tb && tb.mode === "one" ? tb.crKey : undefined,
+        channelId: interaction.channel?.id || interaction.container?.channel_id || "",
+        userId: interaction.user?.id || "",
+        userName: interaction.user?.username || interaction.user?.name || "",
+        responseUrl,
+      });
+      return;
+    }
     await respond(responseUrl, { text: "🔎 最新状態を確認して実行します…", replace_original: true });
     // 承認時に再解決（ボタン表示中に状況が変わっていても最新で実行）
     const outcome = await resolveSubmit(project, env, metaToken, {

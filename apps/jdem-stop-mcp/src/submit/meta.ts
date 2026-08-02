@@ -428,6 +428,60 @@ export async function findAdsByExactName(
   return names.filter((n) => existing.has(n));
 }
 
+/** cr番号に一致する既存広告と動画IDの組（サムネ後追い挿入 BUG-121/122 用） */
+export interface CrAdVideo {
+  adId: string;
+  name: string;
+  /** 広告名から抽出したパターン番号（_NN）。無ければ親/単独cr */
+  pattern?: string;
+  videoId?: string;
+}
+
+/**
+ * cr番号（例 cr93）に一致する既存広告を検索し、各広告のcreativeから動画IDを引く。
+ * MetaのCONTAIN検索は下線混じりの長い文字列で0件を返す癖があるため、cr番号で広く
+ * 検索→手元で厳密一致（cr930等の誤マッチは末尾の数字境界で防ぐ）→一致分だけ
+ * creativeをバッチ取得する（cr停止くんのmetaFindAdsと同じ3段方式）。
+ */
+export async function findCrAdsWithVideos(
+  accountId: string,
+  token: string,
+  crKey: string
+): Promise<CrAdVideo[]> {
+  const key = crKey.toLowerCase();
+  const strict = new RegExp(`(?:^|[^0-9a-z])${key}(?:_(\\d{2}))?(?![0-9])`, "i");
+  const filtering = encodeURIComponent(
+    JSON.stringify([{ field: "name", operator: "CONTAIN", value: key }])
+  );
+  let list: any[] =
+    (await graphGet(`act_${accountId}/ads?fields=id,name&filtering=${filtering}&limit=300`, token)).data || [];
+  let matched = list.filter((a: any) => strict.test(a.name));
+  if (matched.length === 0) {
+    // CONTAINが実在広告に0件を返す癖への保険（BUG-28）: フィルタ無しで直近500件から拾い直す
+    list = (await graphGet(`act_${accountId}/ads?fields=id,name&limit=500`, token)).data || [];
+    matched = list.filter((a: any) => strict.test(a.name));
+  }
+  const out: CrAdVideo[] = matched.map((a: any) => ({
+    adId: a.id,
+    name: a.name,
+    pattern: a.name.match(strict)?.[1],
+  }));
+  // creative（video_id）は一致した広告だけバッチ取得（全件fields指定は重い）
+  for (let i = 0; i < out.length; i += 40) {
+    const batch = out.slice(i, i + 40);
+    const ids = batch.map((b) => b.adId).join(",");
+    const res = await graphGet(
+      `?ids=${encodeURIComponent(ids)}&fields=${encodeURIComponent("creative{video_id,object_story_spec}")}`,
+      token
+    );
+    for (const b of batch) {
+      const c = res?.[b.adId]?.creative;
+      b.videoId = c?.video_id || c?.object_story_spec?.video_data?.video_id || undefined;
+    }
+  }
+  return out;
+}
+
 // ---------- 低レベル ----------
 
 const META_TIMEOUT_MS = 25_000;

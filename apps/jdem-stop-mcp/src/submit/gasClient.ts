@@ -78,6 +78,25 @@ export async function callSheetThumbnail(
   return (await callGasJson(gasUrl, { action: "insertCrThumbnail", ...req }, GAS_THUMB_TIMEOUT_MS)) as SheetThumbnailResult;
 }
 
+/**
+ * サムネ未挿入crの列挙（BUG-122の後追いクローリング用・読み取り専用）。
+ * GAS action=listCrMissingThumbs。デプロイ済みGASが古いと「不明なaction」エラーが
+ * 返るため、呼び出し側はGAS再デプロイの案内にフォールバックする。
+ */
+export interface SheetThumbListResult {
+  ok: boolean;
+  missing?: string[];
+  total?: number;
+  error?: string;
+}
+
+export async function callSheetThumbList(
+  gasUrl: string,
+  req: { spreadsheetId: string; sheetName?: string }
+): Promise<SheetThumbListResult> {
+  return (await callGasJson(gasUrl, { action: "listCrMissingThumbs", ...req }, GAS_THUMB_TIMEOUT_MS)) as SheetThumbListResult;
+}
+
 async function callGasJson(gasUrl: string, body: unknown, timeoutMs: number): Promise<{ ok: boolean; error?: string }> {
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), timeoutMs);
