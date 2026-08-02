@@ -17,6 +17,10 @@ on:
         description: "true で対象タブの非空セルを A1:値 で全ダンプ（tab指定時のみ有効）"
         required: false
         default: "false"
+      merges:
+        description: "true で各crブロックのサムネ表示セル（結合セル）有無を診断（tab指定時のみ有効）"
+        required: false
+        default: "false"
 
 jobs:
   inspect:
@@ -36,6 +40,7 @@ jobs:
         run: |
           DUMP=""
           if [ "${{ github.event.inputs.dump }}" = "true" ]; then DUMP="--dump"; fi
+          if [ "${{ github.event.inputs.merges }}" = "true" ]; then DUMP="$DUMP --merges"; fi
           if [ -n "${{ github.event.inputs.tab }}" ]; then
             node inspect_sheet.mjs --sheet "${{ github.event.inputs.sheet }}" --tab "${{ github.event.inputs.tab }}" $DUMP
           else

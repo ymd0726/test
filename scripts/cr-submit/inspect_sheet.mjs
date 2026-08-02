@@ -15,7 +15,7 @@ import { google } from "googleapis";
 
 const args = parseArgs(process.argv.slice(2));
 if (!args.sheet) {
-  console.error("使い方: node inspect_sheet.mjs --sheet <spreadsheetId|URL> [--tab <タブ名>] [--json]");
+  console.error("使い方: node inspect_sheet.mjs --sheet <spreadsheetId|URL> [--tab <タブ名>] [--json] [--merges]");
   process.exit(1);
 }
 const SPREADSHEET_ID = extractId(args.sheet);
@@ -78,6 +78,21 @@ for (const sheet of targets) {
   if (!args.tab && info.cr00Blocks.length === 0) continue; // 全タブモードではcr00があるタブだけ報告
   report.tabs.push(info);
   printTab(info);
+
+  // --merges: 各ブロックに「サムネ表示セル」用の結合セルがあるかをGASのsubmitThumbTargetCell_と
+  // 同じロジック（cr名より右・ブロック列範囲内で最大面積の結合セル）で判定する（読み取り専用）。
+  // BUG-125想定: jde系のように結合セルが元々無い案件はサムネ後追い挿入(BUG-121/122)が
+  // 個別モードは誤挿入防止のためスキップ、一括モードは対象外になるため「対応されない」ように見える。
+  if (args.tab && args.merges) {
+    const mres = await sheets.spreadsheets.get({
+      spreadsheetId: SPREADSHEET_ID,
+      ranges: [`'${p.title}'`],
+      fields: "sheets(merges)",
+    });
+    const merges = mres.data.sheets?.[0]?.merges || [];
+    console.log(`\n--- ${p.title} サムネ表示セル（結合セル）診断 / 結合セル総数=${merges.length} ---`);
+    printThumbTargets(info, merges);
+  }
 
   // --dump: 対象タブの1〜ID行の非空セルを A1:値 で全出力（実構造の目視確認用）
   if (args.tab && args.dump) {
@@ -174,6 +189,7 @@ function analyzeTab(props, columnGroups, rows) {
     memoColCount: memoCols.length,
     cr00Blocks: cr00Blocks.map((b) => ({ ...b, startA1: colToA1(b.startCol), endA1: colToA1(b.endCol) })),
     blocksSample: blocks.slice(0, 5),
+    blocksAll: blocks, // --merges診断用（全ブロック。表示用のblocksSampleとは別に保持）
     columnGroups: columnGroups.map((g) => ({
       start: g.range?.startIndex,
       end: g.range?.endIndex,
@@ -196,6 +212,33 @@ function printTab(t) {
   console.log(`- 列グループ化: ${t.columnGroups.length}個`);
 }
 
+// GAS submitThumbTargetCell_ と同じ判定（cr名より右・ブロック列範囲内で最大面積の結合セル）。
+// merges は Sheets API の 0-indexed { startRowIndex, endRowIndex, startColumnIndex, endColumnIndex }（end excusive）。
+function printThumbTargets(info, merges) {
+  let withCell = 0, withoutCell = 0;
+  for (const b of info.blocksAll) {
+    for (const idc of b.creativeIds) {
+      if (idc.id.toLowerCase() === TEMPLATE_ID) continue; // テンプレ自体は対象外（GASのlistCrMissingThumbsと同じ）
+      let best = null, bestArea = 0;
+      for (const m of merges) {
+        const col0 = m.startColumnIndex; // 0-indexed開始列
+        if (col0 <= idc.col) continue; // cr名セルより右のみ
+        if (col0 < b.startCol || col0 > b.endCol) continue; // ブロック列範囲内のみ
+        const area = (m.endRowIndex - m.startRowIndex) * (m.endColumnIndex - m.startColumnIndex);
+        if (area > bestArea) { bestArea = area; best = m; }
+      }
+      if (best) {
+        withCell++;
+        console.log(`  ✅ ${idc.id} (${colToA1(idc.col)}) → 結合セルあり ${colToA1(best.startColumnIndex)}${best.startRowIndex + 1} (${best.endColumnIndex - best.startColumnIndex}x${best.endRowIndex - best.startRowIndex})`);
+      } else {
+        withoutCell++;
+        console.log(`  ❌ ${idc.id} (${colToA1(idc.col)}) → 結合セルなし（ブロック ${b.startA1 || colToA1(b.startCol)}:${b.endA1 || colToA1(b.endCol)} 内に無し。個別挿入は+10列右へフォールバック書込・一括挿入(listCrMissingThumbs)は対象外スキップ）`);
+      }
+    }
+  }
+  console.log(`  → 結合セルあり ${withCell}件 / なし ${withoutCell}件`);
+}
+
 function parseArgs(argv) {
   const out = {};
   for (let i = 0; i < argv.length; i++) {
@@ -203,6 +246,7 @@ function parseArgs(argv) {
     else if (argv[i] === "--tab") out.tab = argv[++i];
     else if (argv[i] === "--json") out.json = true;
     else if (argv[i] === "--dump") out.dump = true;
+    else if (argv[i] === "--merges") out.merges = true;
   }
   return out;
 }
