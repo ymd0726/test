@@ -58,11 +58,15 @@ https://jdem-stop-mcp.<あなたのサブドメイン>.workers.dev
 ```
 
 ### 5. 動作確認（任意・ローカルから）
-MCPエンドポイントは `/<SHARED_SECRET>/sse`（SSE）と `/<SHARED_SECRET>/mcp`（Streamable HTTP）。
-シークレット無し/誤りは 401 になることだけ先に確認できる:
+MCPエンドポイントは `/<SHARED_SECRET>/mcp`（Streamable HTTP。**claude.ai接続はこちらを使う**）と
+`/<SHARED_SECRET>/sse`（SSE。旧方式）。シークレット無し/誤りは **404** になることを先に確認できる:
 ```bash
-curl -s -o /dev/null -w "%{http_code}\n" https://jdem-stop-mcp.<sub>.workers.dev/wrong/sse   # → 401
+# 誤ったシークレット → 404
+curl -s -o /dev/null -w "%{http_code}\n" -m 5 https://jdem-stop-mcp.<sub>.workers.dev/wrong/mcp    # → 404
+# 正しいシークレット → 404 以外（接続が続くため 000/405 等になる）
+curl -s -o /dev/null -w "%{http_code}\n" -m 5 https://jdem-stop-mcp.<sub>.workers.dev/<SHARED_SECRET>/mcp
 ```
+> この2つを見比べると「シークレットが合っているか」を確実に切り分けられる（両方 404 なら値が不一致）。
 
 ---
 
@@ -72,8 +76,11 @@ curl -s -o /dev/null -w "%{http_code}\n" https://jdem-stop-mcp.<sub>.workers.dev
 2. 名前: `jdem 停止` など
 3. URL: 下記を入力（`<...>` を自分の値に置換）
    ```
-   https://jdem-stop-mcp.<あなたのサブドメイン>.workers.dev/<SHARED_SECRET>/sse
+   https://jdem-stop-mcp.<あなたのサブドメイン>.workers.dev/<SHARED_SECRET>/mcp
    ```
+   > ⚠️ **末尾は `/mcp`**。`/sse`（旧方式）だと claude.ai は接続できず、
+   > 「サインインサービスに登録できませんでした／OAuth Client IDを追加してください」という
+   > **紛らわしいエラー**になる（OAuthの設定不足ではない。2026-07-17 に確認）。
 4. 保存すると `stop_creative` / `undo_creative` がツールとして見えるようになる。
    設定はWeb側で行えば **モバイル / デスクトップ / Web に自動同期**される（モバイル単体では追加不可）。
 
@@ -100,7 +107,10 @@ curl -s -o /dev/null -w "%{http_code}\n" https://jdem-stop-mcp.<sub>.workers.dev
 
 | 症状 | 原因 / 対処 |
 |---|---|
-| Claude接続時に 401 | URLの `<SHARED_SECRET>` が `wrangler secret` の値と不一致 |
+| 「サインインサービスに登録できませんでした / OAuth Client IDを追加してください」 | **OAuthの問題ではない**。①URL末尾が `/sse` になっている（→ `/mcp` に直す） ②`<SHARED_SECRET>` が現在値と不一致。上記 curl の2本比較で切り分ける |
+| Claude接続時に 404 / つながらない | URLの `<SHARED_SECRET>` が `wrangler secret` の値と不一致（本Workerは非該当パスを404で返す） |
+| `wrangler: command not found` | 作業フォルダが Google Drive 同期内で `node_modules` 破損。同期外へコピーし `rm -rf node_modules && npm install` |
+| `Wrangler requires at least Node.js v22` | Node が古い。nodejs.org の LTS を入れてターミナルを開き直す |
 | ツール実行で `JSON以外が返りました` | GASデプロイの「アクセスできるユーザー」が **全員** でない。要再設定 |
 | `クリエイティブが見つかりません` | creativeName または対象タブの不一致（GAS側 CONFIG.SHEET_NAME を確認） |
 | ログ確認 | `npx wrangler tail` でリアルタイムログ |

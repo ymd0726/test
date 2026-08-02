@@ -85,7 +85,7 @@ Claude / Claude Code・MCP・各種コネクタを従業員と安全に共有す
 - [ ] **自作MCP（②）を使わせる場合のみ、接続URLを1対1で共有**（社内チャットの公開チャンネルに貼らない）。
   1. claude.ai → **Settings → Connectors → Add custom connector（「+」）**
   2. 名前：`jdem 停止` など
-  3. URL：`https://jdem-stop-mcp.<サブドメイン>.workers.dev/<SHARED_SECRET>/sse`
+  3. URL：`https://jdem-stop-mcp.<サブドメイン>.workers.dev/<SHARED_SECRET>/mcp`（**末尾は `/mcp`**。`/sse` は繋がらない → 付録A参照）
   4. 保存すると `stop_creative` / `undo_creative` などが見える（Webで設定すればモバイル/デスクトップに自動同期）。
   - 詳細・トラブルシュートは `apps/jdem-stop-mcp/README.md`。
 - [ ] 「生のAPIキーは受け取らない・発行しない・チャットに貼らない」を本人に周知。
@@ -146,9 +146,11 @@ Claude / Claude Code・MCP・各種コネクタを従業員と安全に共有す
 
 ### 手順
 
-1. **新しい値を先に作り、パスワード管理ツールに保存する**（← 今回の最大の教訓。Cloudflareは後から値を見られない）。
+1. **新しい値を先に作り、パスワード管理ツールに保存する**（← 最大の教訓。Cloudflareは後から値を見られない）。
+   **値のズレを防ぐため、生成は1回だけにしてファイルに残す**（`openssl` を複数回叩いて別々の値を使ってしまう事故が実際に起きた）：
    ```bash
-   openssl rand -hex 16     # 出た値を 1Password/Bitwarden に「Cloudflare SHARED_SECRET (jdem-stop-mcp)」で保存
+   openssl rand -hex 16 | tee /tmp/newsecret.txt   # 画面表示＋ファイル保存。1Password等にも保存
+   cat /tmp/newsecret.txt                          # 登録時・URL組み立て時は毎回これを表示して使う
    ```
 2. **`wrangler.jsonc` があるフォルダへ移動**（同期外のコピー）。
    ```bash
@@ -170,9 +172,14 @@ Claude / Claude Code・MCP・各種コネクタを従業員と安全に共有す
    # Enter a secret value: ← ここで手順1の値を貼り付け（画面には出ない）
    ```
    → `✨ Success! Uploaded secret SHARED_SECRET` が出れば完了。**この瞬間から旧URLは無効。**
-6. **新しいURLを組み立てる**。
+6. **新しいURLを組み立てる**（⚠️ **末尾は `/mcp`**。`/sse` は claude.ai から繋がらない）。
    ```
-   https://jdem-stop-mcp.lead1504.workers.dev/<手順1の値>/sse
+   https://jdem-stop-mcp.lead1504.workers.dev/<手順1の値>/mcp
+   ```
+   **登録前に必ず疎通確認**（2本を見比べる。両方 404 なら値が不一致）：
+   ```bash
+   curl -s -o /dev/null -w "新URL: %{http_code}\n" -m 5 "https://jdem-stop-mcp.lead1504.workers.dev/<手順1の値>/mcp"
+   curl -s -o /dev/null -w "誤り  : %{http_code}\n" -m 5 "https://jdem-stop-mcp.lead1504.workers.dev/wrongsecret/mcp"
    ```
    （サブドメインが不明なら Cloudflareダッシュボード → Workers & Pages → `jdem-stop-mcp` で確認）
 7. **各自のコネクタを差し替える**：claude.ai → Settings → Connectors → 対象コネクタのURLを新URLに変更（編集不可なら削除して Add custom connector で再追加）。
@@ -183,12 +190,38 @@ Claude / Claude Code・MCP・各種コネクタを従業員と安全に共有す
 
 | 症状 | 原因 / 対処 |
 |---|---|
+| **「サインインサービスに登録できませんでした／OAuth Client IDを追加してください」** | **OAuthの問題ではない**（本WorkerはOAuth非対応）。接続失敗時に出る紛らわしい表示。原因は①**URL末尾が `/sse`** → `/mcp` に直す ②シークレット不一致 → 上のcurl2本で切り分け |
+| コネクタに「連携/連携させる」ボタンが出る | 同上。正しく登録できていれば**ボタンは出ず、即座に3ツールが表示される** |
 | `wrangler requires at least Node.js v22` | Nodeが古い。LTSインストーラーで更新→ターミナル開き直し |
 | `sh: wrangler: command not found` | Google Drive同期でnode_modules破損。同期外フォルダで `rm -rf node_modules && npm install` |
 | `Required Worker name missing` | `wrangler.jsonc` の無い場所で実行している。正しいフォルダへ `cd` |
-| 値を控え忘れた | Cloudflareからは読めない。再度この手順で作り直す（＝今回の発端） |
+| 値を控え忘れた | Cloudflareからは読めない。再度この手順で作り直す |
+
+### 接続後に必ずやること
+- **ツール権限**：`Stop creative` / `Undo creative` は **「承認が必要」（✋）** に設定する。「常に許可」にすると停止・取消が確認なしで実行される。`List projects`（読み取り）は自動許可でも可。
+- **コネクタ名**：`自作MetaMCP` のように Meta社の公式コネクタ「Meta Ads」と区別できる名前にする（同名だと Claude 自身が取り違え、ツールを見失う）。
 
 > ⏰ 切り替えは**静かな時間帯**に（cr入稿くん実行中や毎朝7:30の自動チェック直前を避ける）。
+
+---
+
+## 付録B. Meta公式MCP と 自作MCP の使い分け
+
+**両方つなぐのが正解**（競合ではなく補完関係）。判断基準は1行で：
+
+> **Metaの中で完結する作業 → 公式MCP／集計表・Notion・Slack・自社の命名規則が絡む作業 → 自作MCP**
+
+| | Meta公式MCP（`Meta Ads`） | 自作MCP（`自作MetaMCP`） |
+|---|---|---|
+| 触れる範囲 | **Metaの中だけ** | **Meta＋集計表＋Notion＋Slack** |
+| ツール数 | 約82個（広範囲） | 3個＋cr入稿・翌朝チェック（特化） |
+| 得意 | 数値分析・ベンチマーク・キャンペーン作成・カタログ・ピクセル・A/Bテスト | 停止/取消/入稿の業務フロー一括実行、実行ログ、翌朝照合 |
+| 認証 | 各自がMetaでOAuth（最小権限・個別失効） | サーバー保管トークン＋接続URL |
+| 保守 | Meta社（API変更に自動追従） | **自社**（`GRAPH = "v21.0"` の更新も自前） |
+| 弱み | 集計表・Notion・Slackに触れない／自社の命名規則を知らない | 分析はできない／誰が操作したか区別できない（全員同じ合言葉） |
+
+- Metaの権限を持たない担当にも作業を委譲できるのは**自作MCPの強み**（鍵はサーバー側にあるため）。
+- 公式で無料でできる分析を自作で作り直さない。逆に自作の業務フローは公式では代替不可能。
 
 ---
 
