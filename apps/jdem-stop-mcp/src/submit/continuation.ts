@@ -30,8 +30,10 @@ import {
   setEntityStatus,
   getAdsetParentStatus,
   getAdsetAdsByName,
+  findCrAdsWithVideos,
+  CrAdVideo,
 } from "./meta";
-import { callSheetSubmit, callSheetCheck, callSheetThumbnail } from "./gasClient";
+import { callSheetSubmit, callSheetCheck, callSheetThumbnail, callSheetThumbList } from "./gasClient";
 import { markSubmitted } from "./notion";
 import { createRunLog, updateRunLog } from "../check/runlog";
 
@@ -473,6 +475,9 @@ async function runHop(
             "",
             `:white_check_mark: 親： ${sheetParentId(plan)}${childIds.length ? ` ／ 子： ${childIds.join(", ")}` : "（親ブロックのみ）"}`,
             `:white_check_mark: 集計表： ${sheetNames}`,
+            // 集計表のみ対応であることを明記（BUG-124）: 通常入稿と見分けがつかず
+            // 「Metaにも入稿された」と誤解されるのを防ぐ
+            `:information_source: Metaには入稿していません（集計表のみ対応）`,
           ];
           // サムネ: Metaに動画が無い(=videoIdなし)ため、ffmpeg(Actions/Drive)経路のみ対応。トークンありなら起動
           if (!sheetNames.includes("❌") && env.GITHUB_DISPATCH_TOKEN) {
@@ -524,8 +529,14 @@ async function runHop(
               if (tr === "ok") lines.push(":frame_with_picture: サムネ： 集計表へ0:01フレームを自動挿入中（30秒〜1分半後に反映されます）");
             } else {
               // トークン無し（ゼロ設定）: Metaの自動生成サムネをWorkerが取得しbase64でセル挿入（BUG-104）
-              const n = await insertMetaThumbnails(env, plan, metaToken, gasTargets);
-              if (n > 0) lines.push(`:frame_with_picture: サムネ： 集計表に挿入しました（${n}件）`);
+              const r = await insertMetaThumbnails(env, plan, metaToken, gasTargets);
+              if (r.inserted > 0) lines.push(`:frame_with_picture: サムネ： 集計表に挿入しました（${r.inserted}件）`);
+              // 失敗を握りつぶさず可視化する（BUG-121: サムネ欠落が黙って発生し原因が追えなかった）
+              if (r.failures.length > 0)
+                lines.push(
+                  `:warning: サムネ挿入 失敗${r.failures.length}件: ${r.failures.slice(0, 5).join(" / ")}${r.failures.length > 5 ? " …" : ""}` +
+                    `（\`/cr-in ${plan.crKey} サムネ\` で後追い挿入できます）`
+                );
             }
           } catch (e: any) {
             lines.push(`:warning: サムネ挿入に失敗: ${e.message}（集計表のサムネは後で手動でも入れられます）`);
@@ -589,14 +600,14 @@ async function runHop(
  * 挿入する。ffmpeg不要・GitHubトークン不要・ユーザー作業ゼロ。フレームはMetaの自動選択
  * （厳密な0:01ではない）だが、base64埋め込みなのでURL失効の心配はなく恒久的。
  * 「親は01」運用に合わせ、親ブロックは _01 の動画サムネを使う（_01が今回に無ければ親はスキップ）。
- * 戻り値: 挿入できたセル数。
+ * 失敗は握りつぶさず理由付きで返す（BUG-121: サムネ欠落が黙って起きると原因が追えない）。
  */
 async function insertMetaThumbnails(
   env: SubmitEnv,
   plan: SubmitPlan,
   metaToken: string,
   gasTargets: { spreadsheetId: string; sheetName?: string }[]
-): Promise<number> {
+): Promise<{ inserted: number; failures: string[] }> {
   const parentId = sheetParentId(plan);
   const childVids = plan.videos.filter((v) => /cr\d+_\d{2}/i.test(v.sheetId) && v.videoId);
   // (集計表ID, 動画) のペアを作る
@@ -608,39 +619,228 @@ async function insertMetaThumbnails(
   } else if (plan.videos[0]?.videoId) {
     items.push({ id: parentId, videoId: plan.videos[0].videoId!, thumbUrl: plan.videos[0].thumbUrl });
   }
-  if (items.length === 0) return 0;
+  const failures: string[] = [];
+  let inserted = 0;
+  if (items.length === 0) return { inserted, failures };
 
   const gasUrl = env.SUBMIT_GAS_URL || env.COMMON_GAS_URL;
-  let inserted = 0;
   for (const it of items) {
     // サムネURL（create_adsで取得済み。再実行等で未取得なら取り直す）
-    let url = it.thumbUrl;
-    if (!url) url = (await getVideoThumbnailUrl(it.videoId, metaToken)) || undefined;
-    if (!url) continue;
-    // Metaサムネ画像のバイトを取得しbase64化（数十KB程度のJPEG）
-    let b64 = "";
-    let mime = "image/jpeg";
-    try {
-      const r = await fetch(url);
-      if (!r.ok) continue;
-      mime = r.headers.get("content-type") || "image/jpeg";
-      b64 = abToBase64(await r.arrayBuffer());
-    } catch {
+    const img = await fetchThumbBase64(it.videoId, metaToken, it.thumbUrl);
+    if (!img.data) {
+      failures.push(`${it.id}(${img.reason})`);
       continue;
     }
-    if (!b64) continue;
     for (const t of gasTargets) {
       const res = await callSheetThumbnail(gasUrl, {
         spreadsheetId: t.spreadsheetId,
         sheetName: t.sheetName,
         id: it.id,
-        imageBase64: b64,
-        mimeType: mime,
+        imageBase64: img.data.b64,
+        mimeType: img.data.mime,
       });
       if (res.ok) inserted++;
+      else failures.push(`${it.id}(GAS: ${res.error || "不明"})`);
     }
   }
-  return inserted;
+  return { inserted, failures };
+}
+
+/**
+ * Meta動画の自動生成サムネを取得してbase64化する（insertMetaThumbnails / サムネ後追いの共通部）。
+ * 失敗時は data=null と理由を返す（呼び出し側が失敗一覧に載せる）。
+ */
+async function fetchThumbBase64(
+  videoId: string,
+  metaToken: string,
+  knownUrl?: string
+): Promise<{ data: { b64: string; mime: string } | null; reason: string }> {
+  let url = knownUrl;
+  try {
+    if (!url) url = (await getVideoThumbnailUrl(videoId, metaToken)) || undefined;
+  } catch (e: any) {
+    return { data: null, reason: `サムネURL取得失敗: ${String(e.message || e).slice(0, 80)}` };
+  }
+  if (!url) return { data: null, reason: "サムネ未生成" };
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return { data: null, reason: `画像取得HTTP ${r.status}` };
+    const mime = r.headers.get("content-type") || "image/jpeg";
+    const b64 = abToBase64(await r.arrayBuffer());
+    if (!b64) return { data: null, reason: "画像が空" };
+    return { data: { b64, mime }, reason: "" };
+  } catch {
+    return { data: null, reason: "画像取得失敗" };
+  }
+}
+
+// 1回のサムネ後追い実行で処理する最大件数（Worker実行上限対策）。挿入済みは次回スキャンの
+// missingから消えるため、再実行すれば続きから自然に進む（チェーン不要の冪等設計）。
+const THUMB_BACKFILL_MAX_IDS = 10;
+
+/**
+ * サムネ後追い挿入（BUG-121/122/124）。サムネ挿入は入稿フローが最後まで成功した
+ * doneステップでしか走らないため、途中失敗・再実行・旧バージョン入稿分のcrはセルが
+ * 空のまま残る事象が繰り返し起きていた。入稿フローとは独立に、既存Meta広告の動画
+ * サムネを集計表へ挿入し直す。
+ * - crKey指定（/cr-in cr93 サムネ）: そのcrの親+全パターン子へ上書き挿入（冪等）
+ * - crKey省略（/cr-in サムネ一括）: GAS listCrMissingThumbs で未挿入crを列挙して挿入。
+ *   デプロイ済みGASが古い場合は再デプロイ案内を出して安全に終了する。
+ */
+export async function runThumbBackfill(
+  env: SubmitEnv,
+  project: { name: string; metaAdAccountId?: string },
+  metaToken: string,
+  gasTargets: { spreadsheetId: string; sheetName?: string }[],
+  req: { crKey?: string; channelId: string; userId: string; userName?: string; responseUrl: string }
+): Promise<void> {
+  const slackCtx = { channelId: req.channelId, userId: req.userId, responseUrl: req.responseUrl } as any;
+  try {
+    if (!project.metaAdAccountId)
+      throw new Error(`案件「${project.name}」にmetaAdAccountIdが未設定のため、Metaからサムネを取得できません`);
+    const accountId = project.metaAdAccountId;
+    const gasUrl = env.SUBMIT_GAS_URL || env.COMMON_GAS_URL;
+    await postProgress(
+      env,
+      slackCtx,
+      req.crKey ? `🖼️ ${req.crKey} のサムネ挿入を開始します…` : "🖼️ 集計表のサムネ未挿入crをスキャンしています…"
+    );
+    const runLogPageId = await createRunLog(env.NOTION_TOKEN, {
+      tool: "cr入稿くん",
+      action: "サムネ挿入",
+      project: project.name,
+      crName: req.crKey || "サムネ一括",
+      userName: req.userName,
+      userId: req.userId,
+      route: "Slack",
+      sheetTabs: gasTargets.map((t) => t.sheetName || "").filter(Boolean),
+    });
+
+    // 対象 (集計表タブ, id) を集める
+    type Job = { target: { spreadsheetId: string; sheetName?: string }; id: string };
+    let jobs: Job[] = [];
+    let remaining = 0;
+    let needGasRedeploy = false;
+    if (req.crKey) {
+      // 指定crモード: Meta広告から実在パターンを列挙し、親+子を全タブへ上書き挿入（冪等）
+      const ads = await findCrAdsWithVideos(accountId, metaToken, req.crKey);
+      if (ads.length === 0)
+        throw new Error(
+          `Meta広告アカウントに「${req.crKey}」の広告が見つかりません（集計表のみ運用のcrはMetaにサムネ取得元が無いため対象外です）`
+        );
+      const ids = [req.crKey, ...[...new Set(ads.filter((a) => a.pattern).map((a) => `${req.crKey}_${a.pattern}`))].sort()];
+      for (const t of gasTargets) for (const id of ids) jobs.push({ target: t, id });
+    } else {
+      // 一括モード: GASでサムネ未挿入crを列挙（新action。古いGASデプロイでは「不明なaction」）
+      for (const t of gasTargets) {
+        const res = await callSheetThumbList(gasUrl, { spreadsheetId: t.spreadsheetId, sheetName: t.sheetName });
+        if (!res.ok) {
+          if (/不明なaction/.test(res.error || "")) {
+            needGasRedeploy = true;
+            continue;
+          }
+          throw new Error(`集計表スキャン失敗（${t.sheetName || t.spreadsheetId}）: ${res.error}`);
+        }
+        for (const id of res.missing || []) jobs.push({ target: t, id });
+      }
+      if (needGasRedeploy && jobs.length === 0) {
+        await postProgress(
+          env,
+          slackCtx,
+          "⚠️ 入稿GASが古く、サムネ未挿入スキャン（listCrMissingThumbs）に未対応です。入稿GASの再デプロイをお願いします（最新目印: listCrMissingThumbs）。個別の `/cr-in <cr名> サムネ` はGAS再デプロイ無しで使えます",
+          true
+        );
+        await updateRunLog(env.NOTION_TOKEN, runLogPageId, { status: "失敗", detail: { reason: "GAS未対応(listCrMissingThumbs)" } });
+        return;
+      }
+      if (jobs.length > THUMB_BACKFILL_MAX_IDS) {
+        remaining = jobs.length - THUMB_BACKFILL_MAX_IDS;
+        jobs = jobs.slice(0, THUMB_BACKFILL_MAX_IDS);
+      }
+      if (jobs.length === 0 && !needGasRedeploy) {
+        await postProgress(env, slackCtx, "✅ サムネ未挿入のcrはありませんでした（全ブロック挿入済み）", true);
+        await updateRunLog(env.NOTION_TOKEN, runLogPageId, { status: "完了", detail: { inserted: [] } });
+        return;
+      }
+    }
+
+    // cr番号ごとにMeta検索を1回にまとめて処理する
+    const byCr = new Map<string, Job[]>();
+    for (const j of jobs) {
+      const key = (j.id.match(/cr\d+/i)?.[0] || j.id).toLowerCase();
+      if (!byCr.has(key)) byCr.set(key, []);
+      byCr.get(key)!.push(j);
+    }
+    const done: string[] = [];
+    const failed: string[] = [];
+    const b64Cache = new Map<string, { b64: string; mime: string } | null>();
+    for (const [crKey, crJobs] of byCr) {
+      let ads: CrAdVideo[] = [];
+      try {
+        ads = await findCrAdsWithVideos(accountId, metaToken, crKey);
+      } catch (e: any) {
+        for (const j of crJobs) failed.push(`${j.id}(Meta検索失敗)`);
+        continue;
+      }
+      for (const j of crJobs) {
+        // 子(_NN)はパターン一致、親は_01優先（「親は01」運用）、無ければ単独広告の動画を使う
+        const nn = j.id.match(/cr\d+_(\d{2})/i)?.[1];
+        const ad = nn
+          ? ads.find((a) => a.pattern === nn && a.videoId)
+          : ads.find((a) => a.pattern === "01" && a.videoId) ||
+            ads.find((a) => !a.pattern && a.videoId) ||
+            ads.find((a) => a.videoId);
+        if (!ad?.videoId) {
+          failed.push(`${j.id}(Metaに対応する動画広告なし)`);
+          continue;
+        }
+        let img = b64Cache.get(ad.videoId);
+        if (img === undefined) {
+          const r = await fetchThumbBase64(ad.videoId, metaToken);
+          img = r.data;
+          b64Cache.set(ad.videoId, img);
+          if (!img) {
+            failed.push(`${j.id}(${r.reason})`);
+            continue;
+          }
+        }
+        if (!img) {
+          failed.push(`${j.id}(サムネ取得失敗)`);
+          continue;
+        }
+        const res = await callSheetThumbnail(gasUrl, {
+          spreadsheetId: j.target.spreadsheetId,
+          sheetName: j.target.sheetName,
+          id: j.id,
+          imageBase64: img.b64,
+          mimeType: img.mime,
+        });
+        if (res.ok) done.push(j.id);
+        else failed.push(`${j.id}(GAS: ${res.error || "不明"})`);
+      }
+    }
+
+    // 完了通知: サムネのみ対応であること（ブロック追加・Meta入稿なし）を明記する（BUG-124）
+    const lines = [
+      `🖼️ サムネのみ対応が完了しました${req.crKey ? `: ${req.crKey}` : "（一括スキャン）"}（ブロック追加・Metaへの入稿はしていません）`,
+      done.length ? `✅ 挿入: ${done.join(", ")}` : "✅ 挿入: 0件",
+    ];
+    if (failed.length)
+      lines.push(`⚠️ 失敗: ${failed.slice(0, 8).join(" / ")}${failed.length > 8 ? ` 他${failed.length - 8}件` : ""}`);
+    if (remaining > 0)
+      lines.push(`⏭ 未処理が残り${remaining}件あります。もう一度 \`/cr-in サムネ一括\` を実行すると続きから処理されます`);
+    if (needGasRedeploy)
+      lines.push("⚠️ 一部タブは入稿GASが古くスキャンできませんでした（要GAS再デプロイ。最新目印: listCrMissingThumbs）");
+    const posted = await postPublic(env, req.channelId, lines.join("\n"));
+    if (!posted) await postProgress(env, slackCtx, lines.join("\n"), true);
+    await updateRunLog(env.NOTION_TOKEN, runLogPageId, {
+      status: failed.length ? "一部失敗" : "完了",
+      sheetResult: failed.length ? "失敗" : "成功",
+      detail: { inserted: done, failed: failed.slice(0, 20), remaining },
+    });
+  } catch (e: any) {
+    await postProgress(env, slackCtx, `❌ サムネ挿入に失敗しました: ${e.message}`, true);
+  }
 }
 
 /** ArrayBuffer → base64（Meta自動サムネは小さいので単純ループで十分） */

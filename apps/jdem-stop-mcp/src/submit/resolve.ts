@@ -347,6 +347,29 @@ function sheetIdFor(fileBaseName: string): string {
   return m ? m[0].toLowerCase() : fileBaseName;
 }
 
+/**
+ * サムネ後追いモード（BUG-121/122/124）の引数解釈。
+ * `/cr-in cr93 サムネ` → { mode:"one", crKey:"cr93" }（そのcrの親+全パターン子に上書き挿入）
+ * `/cr-in サムネ一括` → { mode:"all" }（集計表をスキャンし未挿入crへ一括挿入）
+ * サムネ系トークンが無ければ null（通常の入稿フロー）。
+ * cr名なしの `/cr-in サムネ` は誤爆防止で明示エラーにする（一括と単発の取り違え防止）。
+ */
+export type ThumbRequest = { mode: "one"; crKey: string } | { mode: "all" };
+const THUMB_ONE_RE = /^(サムネ|サムネイル|サムネのみ|thumb|thumbnail)$/i;
+const THUMB_ALL_RE = /^(サムネ一括|サムネ全部|サムネクロール|thumb-all|thumball)$/i;
+
+export function parseThumbRequest(text: string): ThumbRequest | null {
+  const tokens = text.trim().split(/[\s,、]+/).filter(Boolean);
+  if (tokens.some((t) => THUMB_ALL_RE.test(t))) return { mode: "all" };
+  if (!tokens.some((t) => THUMB_ONE_RE.test(t))) return null;
+  const crTok = tokens.find((t) => !THUMB_ONE_RE.test(t));
+  if (!crTok)
+    throw new Error(
+      "使い方: `/cr-in <cr名> サムネ`（そのcrのサムネを挿入）または `/cr-in サムネ一括`（未挿入crへ一括挿入）"
+    );
+  return { mode: "one", crKey: normalizeCrKey(crTok) };
+}
+
 export function normalizeCrKey(s: string): string {
   const m = s.match(/(?:cr)?[_ ]?(\d+)/i);
   if (!m) throw new Error(`cr名として解釈できません: ${s}`);
