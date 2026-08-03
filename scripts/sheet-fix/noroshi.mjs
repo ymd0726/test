@@ -12,10 +12,11 @@
 //   表示行（既定2行目）で子を集約しようとすると、子の表示セルも同じ2行目にあるため
 //   「2行目が2行目を参照する」＝循環参照になる。そこで判定結果を数値で持つ中間行
 //   （--tier-row、既定は指標行の少し下の空き行）を挟む。
-//     ・中間行 : 自分の指標だけで 0/1/2 を算出（他ブロックを一切参照しない）
-//     ・表示行 : 自分のIDに紐づく子(<id>_*)が存在すれば子の中間行を集約、
-//                いなければ自分の中間行を採用してラベル化
+//     ・中間行 : 自分の指標だけで判定し「<cr識別子>|<0/1/2>」を返す（他ブロックを参照しない）
+//     ・表示行 : 自分のIDに紐づく子(<id>_*)が存在すれば子の中間セルを集約、
+//                いなければ自分の中間セルを採用してラベル化
 //   どちらの式も全ブロックで同一。中間行も同じ列にあるので列複製で一緒に付いてくる。
+//   中間セルに識別子を含めることで、中間行がメモ列にあってもID行との列突き合わせが不要。
 //
 // 判定条件（CPA効率重視。量型は対象外）:
 //   消化{metricRow} >= {targetCell}*{spendlineCell}  … 十分な消化（データ量ゲート）
@@ -91,7 +92,7 @@ if (!raw) { console.error("ERROR: GOOGLE_SERVICE_ACCOUNT_JSON が未設定です
 const creds = JSON.parse(raw);
 console.log(`# 実行中のサービスアカウント: ${creds.client_email}`);
 console.log(`# モード: ${APPLY ? "APPLY（書き込みあり）" : "DRY RUN（書き込みなし）"}`);
-console.log(`# 対象: ${TAB} / ラベル行=${LABEL_ROW} / ID行=${ID_ROW} / 表示行=${NOROSHI_ROW}(${NOROSHI_COL === "memo" ? "メモ列" : "消化金額列"}) / 中間行=${TIER_ROW}(消化金額列) / 指標行=${METRIC_ROW}${CLEAR_OLD_ROW ? ` / 旧行掃除=${CLEAR_OLD_ROW}` : ""}`);
+console.log(`# 対象: ${TAB} / ラベル行=${LABEL_ROW} / ID行=${ID_ROW} / 表示行=${NOROSHI_ROW}(${NOROSHI_COL === "memo" ? "メモ列" : "消化金額列"}) / 中間行=${TIER_ROW}(${NOROSHI_COL === "memo" ? "メモ列" : "消化金額列"}) / 指標行=${METRIC_ROW}${CLEAR_OLD_ROW ? ` / 旧行掃除=${CLEAR_OLD_ROW}` : ""}`);
 console.log(`# 消化ゲート: 消化>=${TARGET}*${SPENDLINE}`);
 console.log(`# ${LABEL_CAND}: CPA<=${TARGET}*${CAND_CPA} かつ 実質cv>=${CAND_CV}`);
 console.log(`# ${LABEL_PRE}: CPA<=${TARGET}*${PRE_CPA} かつ 実質cv>=${PRE_CV}`);
@@ -146,13 +147,13 @@ for (let c = 0; c < labelRow.length; c++) {
   if (cvCol < 0 || cpaCol < 0) { skipped.push({ id, col: colToA1(c), reason: `実質cv/CPA列が見つからない（cv:${cvCol < 0 ? "無" : "有"} cpa:${cpaCol < 0 ? "無" : "有"}）` }); continue; }
   if (NOROSHI_COL === "memo" && memoCol < 0) { skipped.push({ id, col: colToA1(c), reason: `メモ列(${MEMO_LABEL})が見つからない` }); continue; }
   const col = colToA1(c);
-  // 判定テキストを出す列。--noroshi-col memo ならメモ列、既定は消化金額列。
-  // ※中間行は必ず消化金額列（ID行と同じ列でないと親の COUNTIFS 集約が成立しない）
+  // 判定テキスト・中間コードを置く列。--noroshi-col memo ならメモ列、既定は消化金額列。
+  // ※中間セルは「<cr識別子>|<コード>」形式なので、消化金額列から離れても親が子を数えられる
   const badgeCol = NOROSHI_COL === "memo" ? memoCol : c;
   blocks.push({
     id, discCol: c, cvCol, cpaCol, memoCol, badgeCol, col,
     cell: `${colToA1(badgeCol)}${NOROSHI_ROW}`, current: String(noroshiRowCur[badgeCol] ?? "").trim(),
-    tierCell: `${col}${TIER_ROW}`, tierCurrent: String(tierRowCur[c] ?? "").trim(),
+    tierCell: `${colToA1(badgeCol)}${TIER_ROW}`, tierCurrent: String(tierRowCur[badgeCol] ?? "").trim(),
   });
 }
 
@@ -173,7 +174,7 @@ console.log(`子を持つブロック（式内で子集約に切り替わる）:
 
 // --- 中間行の書込可否：空 or 自分が生成した式のみ。他の内容があれば中止（行を選び直す）---
 // ※行の入れ替え（表示行↔中間行）にも対応するため、表示式・中間式のどちらでも上書き可とする
-const isOurTier = (v) => v.startsWith("=IF(N(") && v.includes(`${SETTINGS_TAB}!$${SETTINGS_COL}$`);
+const isOurTier = (v) => v.includes(`${SETTINGS_TAB}!$${SETTINGS_COL}$`) && v.includes("IF(N(");
 const isOurBadge = (v) => v.includes("当たり候補") || v.includes("当たり予備軍") || v.includes("当たりの狼煙");
 const isGenerated = (v) => isOurTier(v) || isOurBadge(v);
 const tierForeign = blocks.filter((b) => b.tierCurrent !== "" && !isGenerated(b.tierCurrent));
@@ -203,27 +204,33 @@ const targetAbs = toAbs(TARGET), spendAbs = toAbs(SPENDLINE);
 const idRowRef = `$${ID_ROW}:$${ID_ROW}`;
 const tierRowRef = `$${TIER_ROW}:$${TIER_ROW}`;
 
-// 中間行：自分の指標のみで 0/1/2 を返す（他ブロックを参照しない＝循環しない）
+// 中間行：自分の指標のみで 0/1/2 を判定し「<cr識別子>|<コード>」の形で返す。
+// 識別子を同じセルに持たせることで、中間行が消化金額列から離れて（メモ列など）いても
+// 親が COUNTIF 一本で子を数えられる（ID行との列突き合わせが不要になる）。
+// セル自体が「どのCRの何のコードか」を示すので、後から見て用途が分かる。
 const tierFormula = (b) => {
+  const idCell = `${b.col}${ID_ROW}`;
   const disc = `${colToA1(b.discCol)}${METRIC_ROW}`;
   const cv = `${colToA1(b.cvCol)}${METRIC_ROW}`;
   const cpa = `${colToA1(b.cpaCol)}${METRIC_ROW}`;
   return (
-    `=IF(N(${disc})<${targetAbs}*${spendAbs},0,` +
+    `=${idCell}&"|"&` +
+    `IF(N(${disc})<${targetAbs}*${spendAbs},0,` +
     `IF(AND(ISNUMBER(${cpa}),${cpa}<=${targetAbs}*${CAND_CPA},N(${cv})>=${CAND_CV}),2,` +
     `IF(AND(ISNUMBER(${cpa}),${cpa}<=${targetAbs}*${PRE_CPA},N(${cv})>=${PRE_CV}),1,0)))`
   );
 };
 
-// 表示行：子(<id>_*)がいれば子の中間行を集約、いなければ自分の中間行。全ブロック同一の式。
+// 表示行：子(<id>_*)がいれば子の中間セルを集約、いなければ自分の中間セル。全ブロック同一の式。
+// 子の判定は中間行だけを見る（"<親id>_*|2" のワイルドカード一致）。
 const displayFormula = (b) => {
   const idCell = `${b.col}${ID_ROW}`;
-  const myTier = `${b.col}${TIER_ROW}`;
+  const myTier = `${colToA1(b.badgeCol)}${TIER_ROW}`;
   return (
-    `=LET(id,${idCell},kids,COUNTIF(${idRowRef},id&"_*"),` +
+    `=LET(id,${idCell},kids,COUNTIF(${tierRowRef},id&"_*"),` +
     `t,IF(kids>0,` +
-    `IF(COUNTIFS(${idRowRef},id&"_*",${tierRowRef},2)>0,2,IF(COUNTIFS(${idRowRef},id&"_*",${tierRowRef},1)>0,1,0)),` +
-    `N(${myTier})),` +
+    `IF(COUNTIF(${tierRowRef},id&"_*|2")>0,2,IF(COUNTIF(${tierRowRef},id&"_*|1")>0,1,0)),` +
+    `IFERROR(VALUE(RIGHT(${myTier},1)),0)),` +
     `IF(t=2,"${LABEL_CAND}",IF(t=1,"${LABEL_PRE}","")))`
   );
 };
@@ -332,7 +339,7 @@ console.log(`# 中間行 ${blocks.length}セル / 表示行 ${writable.length}�
 
 // 文字色を設定（中間行=グレーの補助情報 / 判定テキスト=黒）
 const colorReqs = [
-  ...blocks.map((b) => colorRequest(b.discCol, TIER_ROW, TIER_FONT)),
+  ...blocks.map((b) => colorRequest(b.badgeCol, TIER_ROW, TIER_FONT)),
   ...writable.map((b) => colorRequest(b.badgeCol, NOROSHI_ROW, BADGE_FONT)),
 ];
 for (let i = 0; i < colorReqs.length; i += 100) {
