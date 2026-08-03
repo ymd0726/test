@@ -60,7 +60,8 @@ const NOROSHI_ROW = Number(args.noroshiRow || 2); // 当たり判定を表示す
 const NOROSHI_COL = (args.noroshiCol || "disc").toLowerCase();
 const MEMO_LABEL = args.memoLabel || "メモ";
 const TIER_ROW = Number(args.tierRow);          // 中間行（0/1/2 の判定コード）
-const CLEAR_OLD_ROW = args.clearOldRow ? Number(args.clearOldRow) : null; // 行移動時の旧行掃除
+// 行移動時の旧行掃除。カンマ区切りで複数指定可（例 "2,1103"）
+const CLEAR_OLD_ROWS = args.clearOldRow ? String(args.clearOldRow).split(",").map((x) => Number(x.trim())).filter(Boolean) : [];
 const METRIC_ROW = Number(args.metricRow || 1100); // 指標の判定参照行
 const TARGET = args.targetCell;                 // 目標CPAセル（例 W5・タブ別）→絶対参照化
 const SPENDLINE = args.spendlineCell;           // 消化ラインセル（例 W3・タブ別）
@@ -73,7 +74,7 @@ const CAND_CPA_ROW = 4;  // 2段階目🌱🌱 CPA係数
 const CAND_CV_ROW = 5;   // 2段階目🌱🌱 実質cv下限
 const APPLY = args.apply || process.env.APPLY === "1";
 const UNDO_OUT = args.undoOut || "undo_log.json";
-const HEADER_ROWS = Math.max(ID_ROW, LABEL_ROW, NOROSHI_ROW, CLEAR_OLD_ROW || 0, 8);
+const HEADER_ROWS = Math.max(ID_ROW, LABEL_ROW, NOROSHI_ROW, ...CLEAR_OLD_ROWS, 8);
 const LABEL_PRE = "当たり候補🌱";     // 1段階目（新芽1つ）
 const LABEL_CAND = "当たり候補🌱🌱";  // 2段階目・高角度（新芽2つ）
 // 上書き可能なプレースホルダ（意味を持たない仮置き）
@@ -92,7 +93,7 @@ if (!raw) { console.error("ERROR: GOOGLE_SERVICE_ACCOUNT_JSON が未設定です
 const creds = JSON.parse(raw);
 console.log(`# 実行中のサービスアカウント: ${creds.client_email}`);
 console.log(`# モード: ${APPLY ? "APPLY（書き込みあり）" : "DRY RUN（書き込みなし）"}`);
-console.log(`# 対象: ${TAB} / ラベル行=${LABEL_ROW} / ID行=${ID_ROW} / 表示行=${NOROSHI_ROW}(${NOROSHI_COL === "memo" ? "メモ列" : "消化金額列"}) / 中間行=${TIER_ROW}(${NOROSHI_COL === "memo" ? "メモ列" : "消化金額列"}) / 指標行=${METRIC_ROW}${CLEAR_OLD_ROW ? ` / 旧行掃除=${CLEAR_OLD_ROW}` : ""}`);
+console.log(`# 対象: ${TAB} / ラベル行=${LABEL_ROW} / ID行=${ID_ROW} / 表示行=${NOROSHI_ROW}(${NOROSHI_COL === "memo" ? "メモ列" : "消化金額列"}) / 中間行=${TIER_ROW}(${NOROSHI_COL === "memo" ? "メモ列" : "消化金額列"}) / 指標行=${METRIC_ROW}${CLEAR_OLD_ROWS.length ? ` / 旧行掃除=${CLEAR_OLD_ROWS.join(",")}` : ""}`);
 console.log(`# 消化ゲート: 消化>=${TARGET}*${SPENDLINE}`);
 console.log(`# ${LABEL_CAND}: CPA<=${TARGET}*${CAND_CPA} かつ 実質cv>=${CAND_CV}`);
 console.log(`# ${LABEL_PRE}: CPA<=${TARGET}*${PRE_CPA} かつ 実質cv>=${PRE_CV}`);
@@ -121,7 +122,7 @@ const rows = headRes.data.values || [];
 const labelRow = rows[LABEL_ROW - 1] || [];
 const idRow = rows[ID_ROW - 1] || [];
 const noroshiRowCur = rows[NOROSHI_ROW - 1] || [];
-const clearRowCur = CLEAR_OLD_ROW ? (rows[CLEAR_OLD_ROW - 1] || []) : [];
+const clearRowsCur = new Map(CLEAR_OLD_ROWS.map((r) => [r, rows[r - 1] || []]));
 const tierRowCur = (tierRes.data.values || [])[0] || [];
 
 // ブロック走査：ラベル行が「消化金額」かつ ID行が cr… の列＝実CRブロック先頭
@@ -293,9 +294,10 @@ if (!APPLY) {
   const p = writable.find((b) => b.kids.length > 0);
   if (p) console.log(`  [表示行/子あり例] ${p.cell} (${p.id}, 子${p.kids.length}件): ${p.formula}`);
   console.log(`  ※ 子あり・子なしで式は同一。cr00 の列群を複製すれば新CRにもそのまま効く`);
-  if (CLEAR_OLD_ROW) {
-    const toClear = blocks.filter((b) => isGenerated(String(clearRowCur[b.discCol] ?? "").trim()));
-    console.log(`\n# 旧行 ${CLEAR_OLD_ROW} の当たり式を空にする対象: ${toClear.length} 件`);
+  for (const r of CLEAR_OLD_ROWS) {
+    const cur = clearRowsCur.get(r) || [];
+    const n = blocks.filter((b) => isGenerated(String(cur[b.discCol] ?? "").trim()) || isGenerated(String(cur[b.badgeCol] ?? "").trim())).length;
+    console.log(`\n# 旧行 ${r} の当たり式を空にする対象: ${n} 件`);
   }
   console.log(`\nDRY RUN 完了（中間行 ${blocks.length}セル / 表示行 ${writable.length}セル に式を投入予定）。適用するには --apply を付けて再実行してください。`);
   process.exit(0);
@@ -303,14 +305,23 @@ if (!APPLY) {
 
 // ------------------------------------------------------------
 // APPLY：undo ログ→書き込み→確認
-const clearTargets = CLEAR_OLD_ROW
-  ? blocks.filter((b) => isGenerated(String(clearRowCur[b.discCol] ?? "").trim()))
-      .map((b) => ({ cell: `${colToA1(b.discCol)}${CLEAR_OLD_ROW}`, before: String(clearRowCur[b.discCol]).trim(), after: "" }))
-  : [];
+const clearTargets = [];
+for (const r of CLEAR_OLD_ROWS) {
+  const cur = clearRowsCur.get(r) || [];
+  for (const b of blocks) {
+    for (const cIdx of new Set([b.discCol, b.badgeCol])) {
+      const v = String(cur[cIdx] ?? "").trim();
+      // 新しく書き込むセル自体は掃除対象にしない
+      const cellRef = `${colToA1(cIdx)}${r}`;
+      if (cellRef === b.cell || cellRef === b.tierCell) continue;
+      if (isGenerated(v)) clearTargets.push({ cell: cellRef, before: v, after: "" });
+    }
+  }
+}
 const undoLog = {
   spreadsheetId: SPREADSHEET_ID, title: meta.data.properties.title, tab: TAB,
   noroshiRow: NOROSHI_ROW, tierRow: TIER_ROW, metricRow: METRIC_ROW,
-  targetCell: TARGET, spendlineCell: SPENDLINE, clearOldRow: CLEAR_OLD_ROW,
+  targetCell: TARGET, spendlineCell: SPENDLINE, clearOldRows: CLEAR_OLD_ROWS,
   settings: { tab: SETTINGS_TAB, preCpa: PRE_CPA, preCv: PRE_CV, candCpa: CAND_CPA, candCv: CAND_CV },
   appliedAt: new Date().toISOString(), serviceAccount: creds.client_email,
   edits: [

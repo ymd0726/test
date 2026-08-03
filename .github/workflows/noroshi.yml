@@ -42,7 +42,7 @@ on:
         required: true
         default: "1103"
       clear_old_row:
-        description: "行移動時に旧行の当たり式を空にする（例: 7。空なら掃除しない）"
+        description: "行移動時に旧行の当たり式を空にする。カンマ区切りで複数可（例: 2,1103。空なら掃除しない）"
         required: false
         default: ""
       id_row:
