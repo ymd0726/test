@@ -158,9 +158,12 @@ for (const b of blocks) {
 const withKids = blocks.filter((b) => b.kids.length > 0);
 console.log(`子を持つブロック（式内で子集約に切り替わる）: ${withKids.length} 件 / 残り ${blocks.length - withKids.length} 件は自身の指標で判定`);
 
-// --- 中間行の書込可否：空 or 既存の中間式のみ。他の内容があれば中止（行を選び直す）---
+// --- 中間行の書込可否：空 or 自分が生成した式のみ。他の内容があれば中止（行を選び直す）---
+// ※行の入れ替え（表示行↔中間行）にも対応するため、表示式・中間式のどちらでも上書き可とする
 const isOurTier = (v) => v.startsWith("=IF(N(") && v.includes(`${SETTINGS_TAB}!$${SETTINGS_COL}$`);
-const tierForeign = blocks.filter((b) => b.tierCurrent !== "" && !isOurTier(b.tierCurrent));
+const isOurBadge = (v) => v.includes("当たり候補") || v.includes("当たり予備軍") || v.includes("当たりの狼煙");
+const isGenerated = (v) => isOurTier(v) || isOurBadge(v);
+const tierForeign = blocks.filter((b) => b.tierCurrent !== "" && !isGenerated(b.tierCurrent));
 if (tierForeign.length) {
   console.error(`\n✗ 中間行 ${TIER_ROW} に既存の内容があるブロックが ${tierForeign.length} 件あります。別の空き行を --tier-row に指定してください。`);
   for (const b of tierForeign.slice(0, 10)) console.error(`  - ${b.tierCell} ${b.id}: 現在値=${JSON.stringify(b.tierCurrent)}`);
@@ -168,12 +171,12 @@ if (tierForeign.length) {
 }
 console.log(`中間行 ${TIER_ROW}: 全 ${blocks.length} ブロックで書込可（既存の中間式の更新 ${blocks.filter((b) => b.tierCurrent !== "").length} 件）`);
 
-// --- 表示行の書込可否：空 / "-" / 既存の当たり式のみ。手動注記は保護 ---
-const isOurs = (v) => v.includes("当たり候補") || v.includes("当たり予備軍") || v.includes("当たりの狼煙");
-const canWrite = (v) => PLACEHOLDERS.has(v) || isOurs(v);
+// --- 表示行の書込可否：空 / "-" / 自分が生成した式のみ。手動注記は保護 ---
+const isOurs = isOurBadge;
+const canWrite = (v) => PLACEHOLDERS.has(v) || isGenerated(v);
 const writable = blocks.filter((b) => canWrite(b.current));
 const foreign = blocks.filter((b) => !canWrite(b.current));
-const updateCount = writable.filter((b) => isOurs(b.current)).length;
+const updateCount = writable.filter((b) => isGenerated(b.current)).length;
 if (updateCount) console.log(`表示行 ${NOROSHI_ROW}: 既存の当たり式の更新 ${updateCount} 件`);
 if (foreign.length) {
   console.log(`\n⚠ 表示行 ${NOROSHI_ROW} に保護対象の内容があるため表示は見送り: ${foreign.length} 件（中間行には式を入れるので親の集約には反映されます）`);
@@ -271,7 +274,7 @@ if (!APPLY) {
   if (p) console.log(`  [表示行/子あり例] ${p.cell} (${p.id}, 子${p.kids.length}件): ${p.formula}`);
   console.log(`  ※ 子あり・子なしで式は同一。cr00 の列群を複製すれば新CRにもそのまま効く`);
   if (CLEAR_OLD_ROW) {
-    const toClear = blocks.filter((b) => isOurs(String(clearRowCur[b.discCol] ?? "").trim()));
+    const toClear = blocks.filter((b) => isGenerated(String(clearRowCur[b.discCol] ?? "").trim()));
     console.log(`\n# 旧行 ${CLEAR_OLD_ROW} の当たり式を空にする対象: ${toClear.length} 件`);
   }
   console.log(`\nDRY RUN 完了（中間行 ${blocks.length}セル / 表示行 ${writable.length}セル に式を投入予定）。適用するには --apply を付けて再実行してください。`);
@@ -281,7 +284,7 @@ if (!APPLY) {
 // ------------------------------------------------------------
 // APPLY：undo ログ→書き込み→確認
 const clearTargets = CLEAR_OLD_ROW
-  ? blocks.filter((b) => isOurs(String(clearRowCur[b.discCol] ?? "").trim()))
+  ? blocks.filter((b) => isGenerated(String(clearRowCur[b.discCol] ?? "").trim()))
       .map((b) => ({ cell: `${colToA1(b.discCol)}${CLEAR_OLD_ROW}`, before: String(clearRowCur[b.discCol]).trim(), after: "" }))
   : [];
 const undoLog = {
