@@ -1,0 +1,9 @@
+{
+  "sheet": "1oEK8JCJg2NcseWmnxLtfNFCe5A7XGJ_DJSj7c2EW1sg",
+  "tab": "data",
+  "note": "小当たり(🌱🌱🌱)のCPA上限倍率を専用セルに新設（kk_mak）。目標CPA×1.2=+20%まで許容し、代わりに消化予算シェア(S8=5%)を厳しめに見る設計。",
+  "edits": [
+    { "cell": "R9", "expectedBefore": "", "after": "当たり候補🌱🌱🌱 小当たり CPA上限倍率(目標CPA×。1.0超=許容ライン)", "note": "3段階目CPAラベル" },
+    { "cell": "S9", "expectedBefore": "", "after": "1.2", "note": "3段階目 CPA上限倍率=1.2倍(目標CPAの+20%まで許容)" }
+  ]
+}
