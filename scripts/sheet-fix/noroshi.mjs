@@ -74,6 +74,9 @@ const LABEL_PRE = "当たり候補🌱";     // 1段階目（新芽1つ）
 const LABEL_CAND = "当たり候補🌱🌱";  // 2段階目・高角度（新芽2つ）
 // 上書き可能なプレースホルダ（意味を持たない仮置き）
 const PLACEHOLDERS = new Set(["", "-"]);
+// 文字色: 中間行は補助情報なのでグレー、判定テキストは通常の黒
+const TIER_FONT = { red: 0.6, green: 0.6, blue: 0.6 };
+const BADGE_FONT = { red: 0, green: 0, blue: 0 };
 // data設定への絶対参照（クロスタブ）
 const sref = (row) => `${SETTINGS_TAB}!$${SETTINGS_COL}$${row}`;
 const PRE_CPA = sref(PRE_CPA_ROW), PRE_CV = sref(PRE_CV_ROW), CAND_CPA = sref(CAND_CPA_ROW), CAND_CV = sref(CAND_CV_ROW);
@@ -97,11 +100,13 @@ const auth = new google.auth.GoogleAuth({
 });
 const sheets = google.sheets({ version: "v4", auth });
 
-const meta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID, fields: "properties.title,sheets(properties(title))" });
+const meta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID, fields: "properties.title,sheets(properties(title,sheetId))" });
 console.log(`# スプレッドシート: ${meta.data.properties.title} (${SPREADSHEET_ID})`);
-if (!meta.data.sheets.some((s) => s.properties.title === TAB)) {
+const tabProps = meta.data.sheets.find((s) => s.properties.title === TAB)?.properties;
+if (!tabProps) {
   console.error(`ERROR: タブ「${TAB}」が見つかりません。`); process.exit(1);
 }
+const SHEET_ID = tabProps.sheetId;
 
 // ヘッダー領域＋中間行を数式で読む
 const [headRes, tierRes] = await Promise.all([
@@ -315,7 +320,20 @@ for (let i = 0; i < data.length; i += 200) {
     requestBody: { valueInputOption: "USER_ENTERED", data: data.slice(i, i + 200) },
   });
 }
-console.log(`# 中間行 ${blocks.length}セル / 表示行 ${writable.length}セル に式を書き込み${clearTargets.length ? `、旧行 ${clearTargets.length} セルを掃除` : ""}しました。反映を再読取で確認します…`);
+console.log(`# 中間行 ${blocks.length}セル / 表示行 ${writable.length}セル に式を書き込み${clearTargets.length ? `、旧行 ${clearTargets.length} セルを掃除` : ""}しました。`);
+
+// 文字色を設定（中間行=グレーの補助情報 / 判定テキスト=黒）
+const colorReqs = [
+  ...blocks.map((b) => colorRequest(b.discCol, TIER_ROW, TIER_FONT)),
+  ...writable.map((b) => colorRequest(b.discCol, NOROSHI_ROW, BADGE_FONT)),
+];
+for (let i = 0; i < colorReqs.length; i += 100) {
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: SPREADSHEET_ID,
+    requestBody: { requests: colorReqs.slice(i, i + 100) },
+  });
+}
+console.log(`# 文字色を設定: 中間行 ${blocks.length}セル=グレー / 表示行 ${writable.length}セル=黒。反映を再読取で確認します…`);
 
 const checks = [...blocks.map((b) => ({ cell: b.tierCell, want: b.tierFormula })), ...writable.map((b) => ({ cell: b.cell, want: b.formula }))];
 const verifyRanges = await batchGetChunked(checks.map((c) => `'${TAB}'!${c.cell}`), "FORMULA");
@@ -347,6 +365,16 @@ function parseArgs(argv) {
     else if (a === "--undo-out") out.undoOut = argv[++i];
   }
   return out;
+}
+// 1セルの文字色を設定する repeatCell リクエストを作る（行・列は0始まり）
+function colorRequest(colIdx, row, rgb) {
+  return {
+    repeatCell: {
+      range: { sheetId: SHEET_ID, startRowIndex: row - 1, endRowIndex: row, startColumnIndex: colIdx, endColumnIndex: colIdx + 1 },
+      cell: { userEnteredFormat: { textFormat: { foregroundColor: rgb } } },
+      fields: "userEnteredFormat.textFormat.foregroundColor",
+    },
+  };
 }
 // batchGet は URL に ranges を並べる GET のため、件数が多いと URL 長制限で 400 になる。
 // 大規模タブ（nrn: 173ブロック×3セル=519レンジ）でも通るよう分割して読む。
