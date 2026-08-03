@@ -105,7 +105,7 @@ const auth = new google.auth.GoogleAuth({
 });
 const sheets = google.sheets({ version: "v4", auth });
 
-const meta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID, fields: "properties.title,sheets(properties(title,sheetId))" });
+const meta = await withRetry("シート情報取得", () => sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID, fields: "properties.title,sheets(properties(title,sheetId))" }));
 console.log(`# スプレッドシート: ${meta.data.properties.title} (${SPREADSHEET_ID})`);
 const tabProps = meta.data.sheets.find((s) => s.properties.title === TAB)?.properties;
 if (!tabProps) {
@@ -115,8 +115,8 @@ const SHEET_ID = tabProps.sheetId;
 
 // ヘッダー領域＋中間行を数式で読む
 const [headRes, tierRes] = await Promise.all([
-  sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `'${TAB}'!1:${HEADER_ROWS}`, valueRenderOption: "FORMULA" }),
-  sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `'${TAB}'!${TIER_ROW}:${TIER_ROW}`, valueRenderOption: "FORMULA" }),
+  withRetry("ヘッダー読取", () => sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `'${TAB}'!1:${HEADER_ROWS}`, valueRenderOption: "FORMULA" })),
+  withRetry("中間行読取", () => sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `'${TAB}'!${TIER_ROW}:${TIER_ROW}`, valueRenderOption: "FORMULA" })),
 ]);
 const rows = headRes.data.values || [];
 const labelRow = rows[LABEL_ROW - 1] || [];
@@ -341,10 +341,10 @@ const data = [
 // 大規模タブでも安全に通るよう分割して書き込む（POST本文なのでURL長制限は無いが、
 // 1リクエストが巨大だとタイムアウトしやすいため）
 for (let i = 0; i < data.length; i += 200) {
-  await sheets.spreadsheets.values.batchUpdate({
+  await withRetry("値の書き込み", () => sheets.spreadsheets.values.batchUpdate({
     spreadsheetId: SPREADSHEET_ID,
     requestBody: { valueInputOption: "USER_ENTERED", data: data.slice(i, i + 200) },
-  });
+  }));
 }
 console.log(`# 中間行 ${blocks.length}セル / 表示行 ${writable.length}セル に式を書き込み${clearTargets.length ? `、旧行 ${clearTargets.length} セルを掃除` : ""}しました。`);
 
@@ -354,10 +354,10 @@ const colorReqs = [
   ...writable.map((b) => colorRequest(b.badgeCol, NOROSHI_ROW, BADGE_FONT)),
 ];
 for (let i = 0; i < colorReqs.length; i += 100) {
-  await sheets.spreadsheets.batchUpdate({
+  await withRetry("文字色の設定", () => sheets.spreadsheets.batchUpdate({
     spreadsheetId: SPREADSHEET_ID,
     requestBody: { requests: colorReqs.slice(i, i + 100) },
-  });
+  }));
 }
 console.log(`# 文字色を設定: 中間行 ${blocks.length}セル=グレー / 表示行 ${writable.length}セル=黒。反映を再読取で確認します…`);
 
@@ -394,6 +394,24 @@ function parseArgs(argv) {
   }
   return out;
 }
+// Google API の一時的な障害（503/500/429）に対する指数バックオフ付きリトライ。
+// 大きな集計表では実行中に backendError が出ることがあり、途中で落ちると
+// 書き込みが中途半端な状態で終わってしまうため必ず経由させる。
+async function withRetry(label, fn, attempts = 5) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try { return await fn(); } catch (e) {
+      const code = e?.code || e?.status;
+      const retryable = [429, 500, 502, 503, 504].includes(Number(code));
+      lastErr = e;
+      if (!retryable || i === attempts - 1) throw e;
+      const waitMs = 2000 * Math.pow(2, i);
+      console.log(`  ⏳ ${label} が ${code} で失敗。${waitMs / 1000}秒後に再試行 (${i + 1}/${attempts - 1})`);
+      await new Promise((r) => setTimeout(r, waitMs));
+    }
+  }
+  throw lastErr;
+}
 // 1セルの文字色を設定する repeatCell リクエストを作る（行・列は0始まり）
 function colorRequest(colIdx, row, rgb) {
   return {
@@ -410,7 +428,7 @@ async function batchGetChunked(ranges, valueRenderOption, chunkSize = 100) {
   const out = [];
   for (let i = 0; i < ranges.length; i += chunkSize) {
     const part = ranges.slice(i, i + chunkSize);
-    const res = await sheets.spreadsheets.values.batchGet({ spreadsheetId: SPREADSHEET_ID, ranges: part, valueRenderOption });
+    const res = await withRetry("batchGet", () => sheets.spreadsheets.values.batchGet({ spreadsheetId: SPREADSHEET_ID, ranges: part, valueRenderOption }));
     out.push(...(res.data.valueRanges || []));
   }
   return out;
