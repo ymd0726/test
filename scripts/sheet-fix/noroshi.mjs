@@ -47,7 +47,7 @@ import { writeFileSync } from "node:fs";
 
 const args = parseArgs(process.argv.slice(2));
 if (!args.sheet || !args.tab || !args.targetCell || !args.spendlineCell || !args.tierRow) {
-  console.error("使い方: node noroshi.mjs --sheet <id|URL> --tab <タブ> --target-cell <目標CPAセル 例W5> --spendline-cell <消化ラインセル 例W3> --tier-row <中間行 例1103> [--metric-row 1101] [--noroshi-row 2] [--clear-old-row 7] [--id-row 6] [--settings-tab data] [--settings-col S] [--apply]");
+  console.error("使い方: node noroshi.mjs --sheet <id|URL> --tab <タブ> --target-cell <目標CPAセル 例W5> --spendline-cell <消化ラインセル 例W3> --tier-row <中間行 例1103> [--metric-row 1101] [--noroshi-row 2] [--noroshi-col disc|memo] [--clear-old-row 7] [--id-row 6] [--settings-tab data] [--settings-col S] [--apply]");
   process.exit(1);
 }
 const SPREADSHEET_ID = extractId(args.sheet);
@@ -55,6 +55,9 @@ const TAB = args.tab;
 const LABEL_ROW = Number(args.labelRow || 1);   // 消化金額/実質cv/CPA のラベル行
 const ID_ROW = Number(args.idRow || 6);         // cr識別子の行
 const NOROSHI_ROW = Number(args.noroshiRow || 2); // 当たり判定を表示する行
+// 判定テキストを出す列: disc=消化金額列（既定・プルダウンと同じ列）/ memo=各ブロックのメモ列
+const NOROSHI_COL = (args.noroshiCol || "disc").toLowerCase();
+const MEMO_LABEL = args.memoLabel || "メモ";
 const TIER_ROW = Number(args.tierRow);          // 中間行（0/1/2 の判定コード）
 const CLEAR_OLD_ROW = args.clearOldRow ? Number(args.clearOldRow) : null; // 行移動時の旧行掃除
 const METRIC_ROW = Number(args.metricRow || 1100); // 指標の判定参照行
@@ -88,7 +91,7 @@ if (!raw) { console.error("ERROR: GOOGLE_SERVICE_ACCOUNT_JSON が未設定です
 const creds = JSON.parse(raw);
 console.log(`# 実行中のサービスアカウント: ${creds.client_email}`);
 console.log(`# モード: ${APPLY ? "APPLY（書き込みあり）" : "DRY RUN（書き込みなし）"}`);
-console.log(`# 対象: ${TAB} / ラベル行=${LABEL_ROW} / ID行=${ID_ROW} / 表示行=${NOROSHI_ROW} / 中間行=${TIER_ROW} / 指標行=${METRIC_ROW}${CLEAR_OLD_ROW ? ` / 旧行掃除=${CLEAR_OLD_ROW}` : ""}`);
+console.log(`# 対象: ${TAB} / ラベル行=${LABEL_ROW} / ID行=${ID_ROW} / 表示行=${NOROSHI_ROW}(${NOROSHI_COL === "memo" ? "メモ列" : "消化金額列"}) / 中間行=${TIER_ROW}(消化金額列) / 指標行=${METRIC_ROW}${CLEAR_OLD_ROW ? ` / 旧行掃除=${CLEAR_OLD_ROW}` : ""}`);
 console.log(`# 消化ゲート: 消化>=${TARGET}*${SPENDLINE}`);
 console.log(`# ${LABEL_CAND}: CPA<=${TARGET}*${CAND_CPA} かつ 実質cv>=${CAND_CV}`);
 console.log(`# ${LABEL_PRE}: CPA<=${TARGET}*${PRE_CPA} かつ 実質cv>=${PRE_CV}`);
@@ -132,18 +135,23 @@ for (let c = 0; c < labelRow.length; c++) {
   for (let g = c + 1; g < labelRow.length; g++) {
     if (String(labelRow[g] ?? "").trim() === "消化金額") { end = g; break; }
   }
-  // ブロック内から 実質cv列・CPA列 を特定
-  let cvCol = -1, cpaCol = -1;
+  // ブロック内から 実質cv列・CPA列・メモ列 を特定
+  let cvCol = -1, cpaCol = -1, memoCol = -1;
   for (let g = c + 1; g < end; g++) {
     const lab = String(labelRow[g] ?? "").trim();
     if (lab === "実質cv" && cvCol < 0) cvCol = g;
     if (lab === "CPA" && cpaCol < 0) cpaCol = g;
+    if (lab === MEMO_LABEL && memoCol < 0) memoCol = g;
   }
   if (cvCol < 0 || cpaCol < 0) { skipped.push({ id, col: colToA1(c), reason: `実質cv/CPA列が見つからない（cv:${cvCol < 0 ? "無" : "有"} cpa:${cpaCol < 0 ? "無" : "有"}）` }); continue; }
+  if (NOROSHI_COL === "memo" && memoCol < 0) { skipped.push({ id, col: colToA1(c), reason: `メモ列(${MEMO_LABEL})が見つからない` }); continue; }
   const col = colToA1(c);
+  // 判定テキストを出す列。--noroshi-col memo ならメモ列、既定は消化金額列。
+  // ※中間行は必ず消化金額列（ID行と同じ列でないと親の COUNTIFS 集約が成立しない）
+  const badgeCol = NOROSHI_COL === "memo" ? memoCol : c;
   blocks.push({
-    id, discCol: c, cvCol, cpaCol, col,
-    cell: `${col}${NOROSHI_ROW}`, current: String(noroshiRowCur[c] ?? "").trim(),
+    id, discCol: c, cvCol, cpaCol, memoCol, badgeCol, col,
+    cell: `${colToA1(badgeCol)}${NOROSHI_ROW}`, current: String(noroshiRowCur[badgeCol] ?? "").trim(),
     tierCell: `${col}${TIER_ROW}`, tierCurrent: String(tierRowCur[c] ?? "").trim(),
   });
 }
@@ -325,7 +333,7 @@ console.log(`# 中間行 ${blocks.length}セル / 表示行 ${writable.length}�
 // 文字色を設定（中間行=グレーの補助情報 / 判定テキスト=黒）
 const colorReqs = [
   ...blocks.map((b) => colorRequest(b.discCol, TIER_ROW, TIER_FONT)),
-  ...writable.map((b) => colorRequest(b.discCol, NOROSHI_ROW, BADGE_FONT)),
+  ...writable.map((b) => colorRequest(b.badgeCol, NOROSHI_ROW, BADGE_FONT)),
 ];
 for (let i = 0; i < colorReqs.length; i += 100) {
   await sheets.spreadsheets.batchUpdate({
@@ -356,6 +364,8 @@ function parseArgs(argv) {
     else if (a === "--label-row") out.labelRow = argv[++i];
     else if (a === "--id-row") out.idRow = argv[++i];
     else if (a === "--noroshi-row") out.noroshiRow = argv[++i];
+    else if (a === "--noroshi-col") out.noroshiCol = argv[++i];
+    else if (a === "--memo-label") out.memoLabel = argv[++i];
     else if (a === "--tier-row") out.tierRow = argv[++i];
     else if (a === "--clear-old-row") out.clearOldRow = argv[++i];
     else if (a === "--metric-row") out.metricRow = argv[++i];
