@@ -28,10 +28,12 @@
 //   （そのCRの消化{metricRow} ÷ {shareCol}{metricRow}=タブ全体の消化）。
 //   実質cvはクライアントによって取得できない場合があり、媒体cvは重複計上の懸念があるため、
 //   量の軸を「消化予算のシェア」に統一する目的で追加（2026-08）。
-//   このモードの下限値は data!$S$6(1段階目🌱)/$S$7(2段階目🌱🌱)/$S$8(3段階目🌱🌱🌱「小当たり」)
+//   このモードの下限値は data!$S$6(1段階目🌱)/$S$7(2段階目🌱🌱)/$S$8(3段階目🌱🌱🌱「小当たり」シェア下限)
 //   を使う（$S$3/$S$5 は実質cv版を使う既存タブ用に温存し、案件間で意味を変えない）。
 //   シェアモードのみ3段階（cvモードは既存タブ互換のため2段階のまま）。
-//   3段階目はCPA基準を2段階目と共通にし、シェア下限だけをさらに引き上げる形。
+//   3段階目「小当たり」はCPA効率を問わず、目標CPAの data!$S$9 倍（既定1.2=+20%許容）以内なら
+//   OKとし、その代わりシェア下限を高く取る設計（媒体が優先配信している=良い兆候、という考え方）。
+//   1・2段階目はCPA効率重視のまま（$S$2/$S$4、1.0未満=目標より良い場合のみ）。
 //
 // 対象ブロックの特定:
 //   ラベル行（既定1行目）が「消化金額」の列 かつ ID行（既定6行目）が cr… で始まる列群先頭。
@@ -86,7 +88,8 @@ const CAND_CV_ROW = 5;   // 2段階目🌱🌱 実質cv下限（cvモード用�
 // 既存タブ（cvモードのまま）の S3/S5 の意味を変えないため。
 const PRE_SHARE_ROW = 6;  // 1段階目🌱 消化予算シェア下限（シェアモード用）
 const CAND_SHARE_ROW = 7; // 2段階目🌱🌱 消化予算シェア下限（シェアモード用）
-const TOP_SHARE_ROW = 8;  // 3段階目🌱🌱🌱「小当たり」消化予算シェア下限（シェアモード専用。CPA基準は2段階目と共通）
+const TOP_SHARE_ROW = 8;  // 3段階目🌱🌱🌱「小当たり」消化予算シェア下限（シェアモード専用）
+const TOP_CPA_ROW = 9;    // 3段階目🌱🌱🌱「小当たり」CPA上限倍率（目標CPA×。1.0超=目標より多少悪くても許容）
 const APPLY = args.apply || process.env.APPLY === "1";
 const UNDO_OUT = args.undoOut || "undo_log.json";
 const HEADER_ROWS = Math.max(ID_ROW, LABEL_ROW, NOROSHI_ROW, ...CLEAR_OLD_ROWS, 8);
@@ -102,6 +105,7 @@ const BADGE_FONT = { red: 0, green: 0, blue: 0 };
 const sref = (row) => `${SETTINGS_TAB}!$${SETTINGS_COL}$${row}`;
 const PRE_CPA = sref(PRE_CPA_ROW), PRE_CV = sref(PRE_CV_ROW), CAND_CPA = sref(CAND_CPA_ROW), CAND_CV = sref(CAND_CV_ROW);
 const PRE_SHARE = sref(PRE_SHARE_ROW), CAND_SHARE = sref(CAND_SHARE_ROW), TOP_SHARE = sref(TOP_SHARE_ROW);
+const TOP_CPA = sref(TOP_CPA_ROW);
 // 消化予算シェアモード: そのCRの消化 ÷ {shareCol}{metricRow}（タブ全体の消化。全ブロック共通の固定列）
 const SHARE_COL = args.shareCol ? String(args.shareCol).toUpperCase() : null;
 const SHARE_MODE = !!SHARE_COL;
@@ -120,7 +124,7 @@ console.log(`# 実行中のサービスアカウント: ${creds.client_email}`);
 console.log(`# モード: ${APPLY ? "APPLY（書き込みあり）" : "DRY RUN（書き込みなし）"}`);
 console.log(`# 対象: ${TAB} / ラベル行=${LABEL_ROW} / ID行=${ID_ROW} / 表示行=${NOROSHI_ROW}(${NOROSHI_COL === "memo" ? "メモ列" : "消化金額列"}) / 中間行=${TIER_ROW}(消化金額列) / 指標行=${METRIC_ROW}${SHARE_MODE ? ` / 消化予算シェアモード(全体消化列=${SHARE_COL})` : ""}${CLEAR_OLD_ROWS.length ? ` / 旧行掃除=${CLEAR_OLD_ROWS.join(",")}` : ""}`);
 console.log(`# 消化ゲート: 消化>=${TARGET}*${SPENDLINE}`);
-if (MAX_TIER === 3) console.log(`# ${LABEL_TOP}: CPA<=${TARGET}*${CAND_CPA} かつ ${VOL_LABEL}>=${TOP_SHARE}`);
+if (MAX_TIER === 3) console.log(`# ${LABEL_TOP}: CPA<=${TARGET}*${TOP_CPA} かつ ${VOL_LABEL}>=${TOP_SHARE}`);
 console.log(`# ${LABEL_CAND}: CPA<=${TARGET}*${CAND_CPA} かつ ${VOL_LABEL}>=${CAND_VOL}`);
 console.log(`# ${LABEL_PRE}: CPA<=${TARGET}*${PRE_CPA} かつ ${VOL_LABEL}>=${PRE_VOL}`);
 console.log(`# 式は全ブロック統一。子(<id>_*)の有無を式内で判定し、いれば子を集約・いなければ自身で判定`);
@@ -247,10 +251,11 @@ const tierFormula = (b) => {
   const vol = SHARE_MODE
     ? `IFERROR(N(${disc})/N($${SHARE_COL}$${METRIC_ROW}),0)`
     : `N(${colToA1(b.cvCol)}${METRIC_ROW})`;
-  // シェアモードのみ3段階目「小当たり」🌱🌱🌱を追加。CPA基準は🌱🌱と共通（data!$S$4）、
-  // シェア下限だけ TOP_SHARE(data!$S$8) を使う。
+  // シェアモードのみ3段階目「小当たり」🌱🌱🌱を追加。CPA効率は問わず「目標CPAの
+  // TOP_CPA倍（既定1.2=+20%）以内」という緩い許容ラインにし、その代わりシェアを
+  // TOP_SHARE(data!$S$8)以上に絞る。CPA上限倍率は data!$S$9（🌱🌱のCAND_CPAとは別）。
   const topBranch = SHARE_MODE
-    ? `IF(AND(ISNUMBER(${cpa}),${cpa}<=${targetAbs}*${CAND_CPA},${vol}>=${TOP_SHARE}),3,`
+    ? `IF(AND(ISNUMBER(${cpa}),${cpa}<=${targetAbs}*${TOP_CPA},${vol}>=${TOP_SHARE}),3,`
     : "";
   const topClose = SHARE_MODE ? ")" : "";
   return (
@@ -297,6 +302,7 @@ if (!APPLY) {
   const candCpaIdx = push(srefRead(CAND_CPA_ROW));
   const candVolIdx = push(srefRead(SHARE_MODE ? CAND_SHARE_ROW : CAND_CV_ROW));
   const topVolIdx = MAX_TIER === 3 ? push(srefRead(TOP_SHARE_ROW)) : -1;
+  const topCpaIdx = MAX_TIER === 3 ? push(srefRead(TOP_CPA_ROW)) : -1;
   const totalIdx = SHARE_MODE ? push(`'${TAB}'!${SHARE_COL}${METRIC_ROW}`) : -1;
   for (const b of blocks) {
     b._discIdx = push(`'${TAB}'!${colToA1(b.discCol)}${METRIC_ROW}`);
@@ -312,6 +318,7 @@ if (!APPLY) {
   const candCpaF = num(at(candCpaIdx));
   const candVolMin = num(at(candVolIdx));
   const topVolMin = MAX_TIER === 3 ? num(at(topVolIdx)) : null;
+  const topCpaF = MAX_TIER === 3 ? num(at(topCpaIdx)) : null;
   const totalSpend = SHARE_MODE ? num(at(totalIdx)) : null;
   // 中間行の値を再現
   for (const b of blocks) {
@@ -321,7 +328,7 @@ if (!APPLY) {
     const vol = SHARE_MODE ? (totalSpend ? disc / totalSpend : 0) : num(at(b._cvIdx));
     const gate = disc >= target * spend && cpaNum !== null;
     let tier = 0;
-    if (MAX_TIER === 3 && gate && cpaNum <= target * candCpaF && vol >= topVolMin) tier = 3;
+    if (MAX_TIER === 3 && gate && cpaNum <= target * topCpaF && vol >= topVolMin) tier = 3;
     else if (gate && cpaNum <= target * candCpaF && vol >= candVolMin) tier = 2;
     else if (gate && cpaNum <= target * preCpaF && vol >= preVolMin) tier = 1;
     b._self = { disc, vol, cpa: cpaNum, tier };
@@ -335,7 +342,7 @@ if (!APPLY) {
   const cands = shown.filter((b) => b._shown === 2);
   const pres = shown.filter((b) => b._shown === 1);
   const labelOf = (t) => (t === 3 ? LABEL_TOP : t === 2 ? LABEL_CAND : LABEL_PRE);
-  console.log(`\n# data設定: ${LABEL_PRE} CPA係数=${preCpaF} ${VOL_LABEL}下限=${preVolMin}${SHARE_MODE ? `(${(preVolMin * 100).toFixed(1)}%)` : ""} / ${LABEL_CAND} CPA係数=${candCpaF} ${VOL_LABEL}下限=${candVolMin}${SHARE_MODE ? `(${(candVolMin * 100).toFixed(1)}%)` : ""}${MAX_TIER === 3 ? ` / ${LABEL_TOP} CPA係数=${candCpaF} ${VOL_LABEL}下限=${topVolMin}(${(topVolMin * 100).toFixed(1)}%)` : ""}`);
+  console.log(`\n# data設定: ${LABEL_PRE} CPA係数=${preCpaF} ${VOL_LABEL}下限=${preVolMin}${SHARE_MODE ? `(${(preVolMin * 100).toFixed(1)}%)` : ""} / ${LABEL_CAND} CPA係数=${candCpaF} ${VOL_LABEL}下限=${candVolMin}${SHARE_MODE ? `(${(candVolMin * 100).toFixed(1)}%)` : ""}${MAX_TIER === 3 ? ` / ${LABEL_TOP} CPA上限倍率=${topCpaF} ${VOL_LABEL}下限=${topVolMin}(${(topVolMin * 100).toFixed(1)}%)` : ""}`);
   console.log(`（目標CPA=${target} / 消化ゲート=${target * spend}${SHARE_MODE ? ` / 全体消化(${SHARE_COL}${METRIC_ROW})=${totalSpend}` : ""}）`);
   console.log(`\n===== 点灯予測: ${MAX_TIER === 3 ? `${LABEL_TOP} ${tops.length}件 / ` : ""}${LABEL_CAND} ${cands.length}件 / ${LABEL_PRE} ${pres.length}件 （表示対象 ${writable.length}）=====`);
   for (const b of [...tops, ...cands, ...pres]) {
@@ -386,7 +393,7 @@ const undoLog = {
   spreadsheetId: SPREADSHEET_ID, title: meta.data.properties.title, tab: TAB,
   noroshiRow: NOROSHI_ROW, tierRow: TIER_ROW, metricRow: METRIC_ROW,
   targetCell: TARGET, spendlineCell: SPENDLINE, clearOldRows: CLEAR_OLD_ROWS,
-  settings: { tab: SETTINGS_TAB, preCpa: PRE_CPA, candCpa: CAND_CPA, volLabel: VOL_LABEL, preVol: PRE_VOL, candVol: CAND_VOL, topVol: MAX_TIER === 3 ? TOP_SHARE : null, maxTier: MAX_TIER, shareMode: SHARE_MODE, shareCol: SHARE_COL },
+  settings: { tab: SETTINGS_TAB, preCpa: PRE_CPA, candCpa: CAND_CPA, volLabel: VOL_LABEL, preVol: PRE_VOL, candVol: CAND_VOL, topVol: MAX_TIER === 3 ? TOP_SHARE : null, topCpa: MAX_TIER === 3 ? TOP_CPA : null, maxTier: MAX_TIER, shareMode: SHARE_MODE, shareCol: SHARE_COL },
   appliedAt: new Date().toISOString(), serviceAccount: creds.client_email,
   edits: [
     ...blocks.map((b) => ({ cell: b.tierCell, before: b.tierCurrent, after: b.tierFormula })),
