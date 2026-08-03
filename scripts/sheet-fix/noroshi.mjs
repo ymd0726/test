@@ -425,6 +425,7 @@ function parseArgs(argv) {
     else if (a === "--memo-label") out.memoLabel = argv[++i];
     else if (a === "--tier-row") out.tierRow = argv[++i];
     else if (a === "--clear-old-row") out.clearOldRow = argv[++i];
+    else if (a === "--share-col") out.shareCol = argv[++i];
     else if (a === "--metric-row") out.metricRow = argv[++i];
     else if (a === "--settings-tab") out.settingsTab = argv[++i];
     else if (a === "--settings-col") out.settingsCol = argv[++i];
