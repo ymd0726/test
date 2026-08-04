@@ -334,23 +334,46 @@ export interface AdsetCandidate {
  * 使っていないキャンペーン/セットを省く）。消化ありが1件も無い・insights取得失敗の
  * 場合は従来どおりACTIVE全セットにフォールバック。並びは消化額の大きい順。
  */
+/** 広告セット一覧のページング上限（1ページ50件。店舗数が多い案件の取りこぼし防止。BUG-135） */
+const ADSET_MAX_PAGES = 10;
+
+/**
+ * paging.next を辿って全ページの data を連結して返す（BUG-135）。
+ * Graph APIの next は絶対URL（access_token込み）なのでそのままfetchする。
+ * 上限ページ数で必ず打ち切り、無限ループにしない。
+ */
+async function graphGetAllPages(path: string, token: string, maxPages: number): Promise<any[]> {
+  const out: any[] = [];
+  let first = await graphGet(path, token);
+  out.push(...(first.data || []));
+  let next: string | undefined = first.paging?.next;
+  for (let i = 1; i < maxPages && next; i++) {
+    const res = await fetchWithTimeout(next);
+    const data = (await res.json()) as any;
+    if (data.error) break; // ページング途中の失敗は取得済み分で続行（候補0件よりマシ）
+    out.push(...(data.data || []));
+    next = data.paging?.next;
+  }
+  return out;
+}
+
 export async function listAdsetCandidates(
   accountId: string,
   token: string,
   allowlist?: string[]
 ): Promise<AdsetCandidate[]> {
-  const [res, spendMap] = await Promise.all([
-    graphGet(
-      `act_${accountId}/adsets?fields=${encodeURIComponent(
-        // creative{video_id,object_type} も取り、コピー元は動画広告を優先選ぶ（BUG-55）
-        "id,name,effective_status,campaign{name},ads.limit(50){id,name,created_time,creative{video_id,object_type}}"
-      )}&limit=50`,
-      token
-    ),
+  // 店舗ごとに広告セットを持つ案件（ssh は 22店舗×2キャンペーン＝40超）では1ページ(50件)に
+  // 収まらず、ページングしないと一部の店舗が候補から丸ごと消える（BUG-135）。paging.next を辿る。
+  const fields = encodeURIComponent(
+    // creative{video_id,object_type} も取り、コピー元は動画広告を優先選ぶ（BUG-55）
+    "id,name,effective_status,campaign{name},ads.limit(50){id,name,created_time,creative{video_id,object_type}}"
+  );
+  const [adsetPages, spendMap] = await Promise.all([
+    graphGetAllPages(`act_${accountId}/adsets?fields=${fields}&limit=50`, token, ADSET_MAX_PAGES),
     getAdsetSpend7d(accountId, token),
   ]);
   const all: AdsetCandidate[] = [];
-  for (const s of res.data || []) {
+  for (const s of adsetPages) {
     if (s.effective_status === "DELETED" || s.effective_status === "ARCHIVED") continue;
     if (allowlist && allowlist.length > 0 && !allowlist.includes(s.id)) continue;
     const ads: any[] = s.ads?.data || [];

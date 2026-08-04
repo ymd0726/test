@@ -150,13 +150,49 @@ async function resolveAndAsk(
           },
         });
       });
+      // 店舗ごとに広告セットが分かれる案件（ssh等）向けの複数選択（BUG-135）。
+      // 従来は「上位5セットを個別」か「全セットへ一括」の二択しかなく、
+      // 「この店舗とこの店舗だけ」という選び方ができなかった。
+      // Slackのmulti_static_selectは最大100件。選択値はボタン押下時の state.values から読む
+      // （ボタンvalueは2000字制限があり、数十件のIDを詰め込めないため）。
+      if (outcome.adsetCandidates.length >= 2) {
+        const options = outcome.adsetCandidates.slice(0, ADSET_SELECT_MAX).map((c) => ({
+          text: {
+            type: "plain_text",
+            text: truncate(
+              `${c.effectiveStatus === "ACTIVE" ? "🟢" : "⏸"} ${c.campaignName ? `${c.campaignName} / ` : ""}${c.name}`,
+              75
+            ),
+            emoji: true,
+          },
+          value: c.id,
+        }));
+        blocks.push({
+          type: "section",
+          block_id: ADSET_SELECT_BLOCK,
+          text: { type: "mrkdwn", text: "*複数の広告セットに入稿する場合はこちらで選択:*" },
+          accessory: {
+            type: "multi_static_select",
+            action_id: ADSET_SELECT_ACTION,
+            placeholder: { type: "plain_text", text: "広告セットを選ぶ（複数可）", emoji: true },
+            options,
+          },
+        });
+      }
       // 表示中の全セットへ同時入稿するボタン（BUG-31）。テキスト類は各セットの直近cr広告からコピー
       const actionEls: any[] = [];
       if (outcome.adsetCandidates.length >= 2) {
-        const allNames = outcome.adsetCandidates.map((c) => c.name).join(" / ");
         actionEls.push({
           type: "button",
           style: "primary",
+          text: { type: "plain_text", text: "🎯 選択したセットに入稿" },
+          action_id: "crin_exec_sel",
+          value: JSON.stringify({ a: payload.text.trim(), sel: 1 }),
+          confirm: confirmDialog(plan.parentName, "上で選択した広告セット", "各セットの直近cr広告"),
+        });
+        const allNames = outcome.adsetCandidates.map((c) => c.name).join(" / ");
+        actionEls.push({
+          type: "button",
           text: { type: "plain_text", text: `🚀 すべてに入稿（${outcome.adsetCandidates.length}セット）` },
           action_id: "crin_exec_all",
           value: JSON.stringify({ a: payload.text.trim(), all: 1 }),
@@ -172,7 +208,12 @@ async function resolveAndAsk(
           : "直近7日間に消化のある広告セットが無いため、ACTIVEな全セットを表示",
       ];
       if (outcome.adsetCandidates.length > 5)
-        notes.push(`他 ${outcome.adsetCandidates.length - 5} セットは省略。adsetAllowlistで絞ってください`);
+        notes.push(
+          `個別ボタンは上位5セットのみ表示（他 ${outcome.adsetCandidates.length - 5} セット）。` +
+            "店舗ごとに選んで入稿する場合は上の選択メニューを使ってください"
+        );
+      if (outcome.adsetCandidates.length > ADSET_SELECT_MAX)
+        notes.push(`⚠️ 選択メニューは${ADSET_SELECT_MAX}セットまで表示（候補${outcome.adsetCandidates.length}セット）`);
       blocks.push({
         type: "context",
         elements: [{ type: "mrkdwn", text: notes.join("\n") }],
@@ -271,6 +312,18 @@ async function resolveAndAsk(
  * Interactivity（action_id が crin_ で始まるもの）。
  * 既存 /slack/interact は即200ACK＋response_url表示の方式なので、それに合わせる。
  */
+/** 広告セット複数選択メニュー（BUG-135）。選択値は state.values[block][action] から読む */
+const ADSET_SELECT_BLOCK = "crin_adsets_block";
+const ADSET_SELECT_ACTION = "crin_adsets_select";
+/** Slackのmulti_static_selectのオプション上限は100件 */
+const ADSET_SELECT_MAX = 100;
+
+/** 複数選択メニューで選ばれた広告セットIDを block_actions の state から取り出す（BUG-135） */
+function selectedAdsetIds(interaction: any): string[] {
+  const sel = interaction?.state?.values?.[ADSET_SELECT_BLOCK]?.[ADSET_SELECT_ACTION]?.selected_options;
+  return Array.isArray(sel) ? sel.map((o: any) => String(o.value)).filter(Boolean) : [];
+}
+
 export function handleCrInInteraction(
   interaction: any,
   project: SubmitProject | undefined,
@@ -288,14 +341,30 @@ export function handleCrInInteraction(
     return new Response("", { status: 200 });
   }
 
+  // 複数選択メニューの操作自体は「選んだだけ」なので何もしない（200 ACKのみ）。
+  // ACKしないとSlackがエラー表示するため、実行ボタンとは別に握りつぶす（BUG-135）
+  if (action.action_id === ADSET_SELECT_ACTION) {
+    return new Response("", { status: 200 });
+  }
+
   if (action.action_id.startsWith("crin_exec_")) {
     if (!project) {
       ctx.waitUntil(respond(responseUrl, { text: "案件が特定できません", replace_original: true }));
       return new Response("", { status: 200 });
     }
-    const v = JSON.parse(action.value) as { a: string; ad?: string; s?: string; all?: number; sheet?: number; th?: number };
+    const v = JSON.parse(action.value) as {
+      a: string;
+      ad?: string;
+      s?: string;
+      all?: number;
+      sel?: number;
+      sheet?: number;
+      th?: number;
+    };
+    // 「選択したセットに入稿」は押した瞬間の選択状態を state から取り出して渡す（BUG-135）
+    const picked = v.sel ? selectedAdsetIds(interaction) : [];
     ctx.waitUntil(
-      confirmAndRun(v, interaction, project, env, ctx, metaTokenFor(project), gasTargetsFor(project))
+      confirmAndRun(v, interaction, project, env, ctx, metaTokenFor(project), gasTargetsFor(project), picked)
     );
     return new Response("", { status: 200 });
   }
@@ -377,13 +446,15 @@ export function handleCrInInteraction(
 }
 
 async function confirmAndRun(
-  v: { a: string; ad?: string; s?: string; all?: number; sheet?: number; th?: number },
+  v: { a: string; ad?: string; s?: string; all?: number; sel?: number; sheet?: number; th?: number },
   interaction: any,
   project: SubmitProject,
   env: SubmitEnv,
   ctx: ExecutionContext,
   metaToken: string,
-  gasTargets: { spreadsheetId: string; sheetName?: string }[]
+  gasTargets: { spreadsheetId: string; sheetName?: string }[],
+  /** 複数選択メニューで選ばれた広告セットID（v.sel のときのみ使う。BUG-135） */
+  pickedAdsetIds: string[] = []
 ): Promise<void> {
   const responseUrl = interaction.response_url;
   try {
@@ -418,13 +489,27 @@ async function confirmAndRun(
       return;
     }
     const cands = (outcome.adsetCandidates || []).filter((c) => c.latestAd);
-    if (v.all) {
+    if (v.all || v.sel) {
       // 「すべてに入稿」（BUG-31）: 表示された全候補セットをターゲットにする。
+      // 「選択したセットに入稿」（BUG-135）: 選ばれたIDだけに絞る（店舗ごとの複数選択）。
       // 再解決の結果1セットに減っていた場合はそのまま単一入稿になる
       if (cands.length === 0 && !plan.adsetId)
         throw new Error("入稿先の広告セット候補が見つかりません（状況が変わった可能性）。もう一度 /cr-in を実行してください");
-      if (cands.length > 0) {
-        plan.targets = cands.map((c) => ({
+      let picked = cands;
+      if (v.sel) {
+        if (pickedAdsetIds.length === 0)
+          throw new Error(
+            "広告セットが選択されていません。選択メニューで入稿先の広告セットを選んでから「🎯 選択したセットに入稿」を押してください"
+          );
+        const wanted = new Set(pickedAdsetIds);
+        picked = cands.filter((c) => wanted.has(c.id));
+        if (picked.length === 0)
+          throw new Error(
+            "選択した広告セットが候補に見つかりませんでした（状況が変わった可能性）。もう一度 /cr-in を実行してください"
+          );
+      }
+      if (picked.length > 0) {
+        plan.targets = picked.map((c) => ({
           adsetId: c.id,
           adsetName: c.name,
           campaignName: c.campaignName,
