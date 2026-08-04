@@ -138,9 +138,14 @@ async function resolveAndAsk(
       // 見切れていた。sectionのmrkdwnは折り返して全文表示され、ボタンは短い固定ラベルにする。
       outcome.adsetCandidates.slice(0, 5).forEach((c, i) => {
         const full = c.campaignName ? `${c.campaignName} / ${c.name}` : c.name;
+        // 広告セット名（店舗名）を1行目・太字に、キャンペーン名は2行目に置く。
+        // キャンペーン名が長い案件（ssh）で店舗名が埋もれるのを防ぐ（BUG-135 追加要望）
+        const label = c.campaignName
+          ? `${c.effectiveStatus === "ACTIVE" ? "🟢" : "⏸"} *${c.name}*\n${c.campaignName}`
+          : `${c.effectiveStatus === "ACTIVE" ? "🟢" : "⏸"} *${c.name}*`;
         blocks.push({
           type: "section",
-          text: { type: "mrkdwn", text: `${c.effectiveStatus === "ACTIVE" ? "🟢" : "⏸"} *${full}*` },
+          text: { type: "mrkdwn", text: label },
           accessory: {
             type: "button",
             text: { type: "plain_text", text: "このセットに入稿", emoji: true },
@@ -156,17 +161,28 @@ async function resolveAndAsk(
       // Slackのmulti_static_selectは最大100件。選択値はボタン押下時の state.values から読む
       // （ボタンvalueは2000字制限があり、数十件のIDを詰め込めないため）。
       if (outcome.adsetCandidates.length >= 2) {
-        const options = outcome.adsetCandidates.slice(0, ADSET_SELECT_MAX).map((c) => ({
-          text: {
-            type: "plain_text",
-            text: truncate(
-              `${c.effectiveStatus === "ACTIVE" ? "🟢" : "⏸"} ${c.campaignName ? `${c.campaignName} / ` : ""}${c.name}`,
-              75
-            ),
-            emoji: true,
-          },
-          value: c.id,
-        }));
+        // 表示順は「広告セット名（＝店舗名）が先」。キャンペーン名を先頭に置くと、
+        // ssh の cp06_2603_売上cp_女性テスト_フェーズ2(一部店舗女性のみ) のような長い名前で
+        // 肝心の店舗名が見切れて全項目が同じに見えてしまう（BUG-135 追加要望）。
+        // キャンペーン名は description（2行目・補足表示）に回し、さらに候補間で共通する
+        // 先頭部分を畳んで、違いのある部分が先に出るようにする。
+        const campNames = [...new Set(outcome.adsetCandidates.map((c) => c.campaignName).filter(Boolean))];
+        const common = campNames.length >= 2 ? commonPrefix(campNames) : "";
+        const shortCamp = (n: string) =>
+          common.length >= 4 && n.length > common.length + 2 ? `…${n.slice(common.length)}` : n;
+        const options = outcome.adsetCandidates.slice(0, ADSET_SELECT_MAX).map((c) => {
+          const opt: any = {
+            text: {
+              type: "plain_text",
+              text: truncate(`${c.effectiveStatus === "ACTIVE" ? "🟢" : "⏸"} ${c.name}`, 75),
+              emoji: true,
+            },
+            value: c.id,
+          };
+          if (c.campaignName)
+            opt.description = { type: "plain_text", text: truncate(shortCamp(c.campaignName), 75), emoji: true };
+          return opt;
+        });
         blocks.push({
           type: "section",
           block_id: ADSET_SELECT_BLOCK,
@@ -312,6 +328,23 @@ async function resolveAndAsk(
  * Interactivity（action_id が crin_ で始まるもの）。
  * 既存 /slack/interact は即200ACK＋response_url表示の方式なので、それに合わせる。
  */
+/**
+ * 文字列群の共通接頭辞（BUG-135 追加要望）。
+ * 同じ命名規則のキャンペーン名（cp06_2603_売上cp_…）が並ぶと、違いのある部分が
+ * 後方に押しやられて見切れるため、共通部分を畳んで表示するのに使う。
+ */
+function commonPrefix(list: string[]): string {
+  if (list.length === 0) return "";
+  let p = list[0];
+  for (const s of list.slice(1)) {
+    let i = 0;
+    while (i < p.length && i < s.length && p[i] === s[i]) i++;
+    p = p.slice(0, i);
+    if (!p) break;
+  }
+  return p;
+}
+
 /** 広告セット複数選択メニュー（BUG-135）。選択値は state.values[block][action] から読む */
 const ADSET_SELECT_BLOCK = "crin_adsets_block";
 const ADSET_SELECT_ACTION = "crin_adsets_select";
