@@ -181,7 +181,14 @@ function handleSubmitCreative(req) {
       SUBMIT_UNDO_KEY_PREFIX + req.spreadsheetId + ':' + parentId.toLowerCase(),
       JSON.stringify({ sheetName: sheet.getName(), inserted: inserted, at: new Date().toISOString() })
     );
-    return { ok: true, sheetName: sheet.getName(), inserted: inserted, warnings: warnings };
+    // 挿入先の列をA1表記でも返す（BUG-125）。「cr00の直右に入ったか」を後から検証できるようにし、
+    // 手動で追加されたブロックに押し出された場合と、ツールの挿入位置ズレを切り分ける。
+    return {
+      ok: true, sheetName: sheet.getName(), warnings: warnings,
+      inserted: inserted.map(function (x) {
+        return { id: x.id, zone: x.zone, startCol: x.startCol, startColA1: submitColA1_(x.startCol), width: x.width };
+      }),
+    };
   } catch (e) {
     return { ok: false, error: String(e && e.message ? e.message : e) };
   }
@@ -209,8 +216,9 @@ function handleInsertCrThumbnail(req) {
     lay.idCells.forEach(function (c) { if (c.id.toLowerCase() === id.toLowerCase() && idCol < 0) idCol = c.col; });
     if (idCol < 0) return { ok: false, error: '集計表に「' + id + '」が見つかりません' };
 
-    var t = submitThumbTargetCell_(sheet, lay, idCol, null);
-    var target = t.range;
+    var unit = submitUnit_(lay, idCol);
+    var pos = submitThumbTargetPos_(sheet, lay, idCol, submitMergeInfos_(sheet, unit.start, unit.width));
+    var target = sheet.getRange(pos.row, pos.col0 + 1);
 
     // base64直渡し（推奨）は data:URL、公開URL渡しはそのまま setSourceUrl に渡す
     var srcUrl = req.imageBase64
@@ -221,68 +229,92 @@ function handleInsertCrThumbnail(req) {
       .setAltTextTitle(id + ' 冒頭サムネ(0:01)')
       .build();
     target.setValue(img);
-    return { ok: true, id: id, cell: submitColA1_(target.getColumn() - 1) + target.getRow(), merged: t.merged };
+    return { ok: true, id: id, cell: submitColA1_(pos.col0) + pos.row, merged: pos.merged };
   } catch (e) {
     return { ok: false, error: String(e && e.message ? e.message : e) };
   }
 }
 
-// サムネ表示セル（cr名より右にあるブロック内の最大面積の結合セル）を返す。
-// insertCrThumbnail / listCrMissingThumbs で共通利用。merges に全シートの結合レンジを
-// 渡すとブロック毎の getMergedRanges を省略できる（巨大シートの一括スキャン高速化用）。
-// 結合セルが無いブロックは10列右にフォールバック（従来挙動。merged:false で返す）。
-function submitThumbTargetCell_(sheet, lay, idCol, merges) {
-  var unit = submitUnit_(lay, idCol);
-  var list = merges;
-  if (!list) list = sheet.getRange(1, unit.start + 1, sheet.getMaxRows(), unit.width).getMergedRanges();
-  var best = null, bestArea = 0;
-  list.forEach(function (m) {
-    var col0 = m.getColumn() - 1;
-    if (col0 <= idCol) return;
-    if (col0 < unit.start || col0 > unit.end) return; // 全シートのmergesを渡された場合のブロック外除外
-    var area = m.getNumRows() * m.getNumColumns();
-    if (area > bestArea) { bestArea = area; best = m; }
+// 結合レンジを「プレーンなJSオブジェクトの配列」にして返す（BUG-126）。
+// Rangeオブジェクトのまま各ブロックで走査すると getColumn()/getNumRows() 等の
+// Apps Script呼び出しが (ブロック数 × 結合セル数 × 3) 回発生し、kk_mak規模
+// （2190列・140ブロック）では数十万回に達して25秒のWorkerタイムアウトを超える。
+// 変換は結合セル数ぶんの1パスだけ行い、以降の判定は純JSで済ませる。
+// startCol0/width 省略時はシート全面。
+function submitMergeInfos_(sheet, startCol0, width) {
+  var rng = (startCol0 === undefined || startCol0 === null)
+    ? sheet.getRange(1, 1, sheet.getMaxRows(), sheet.getLastColumn())
+    : sheet.getRange(1, startCol0 + 1, sheet.getMaxRows(), width);
+  return rng.getMergedRanges().map(function (m) {
+    return { row: m.getRow(), col0: m.getColumn() - 1, area: m.getNumRows() * m.getNumColumns() };
   });
-  return {
-    range: best
-      ? sheet.getRange(best.getRow(), best.getColumn())
-      : sheet.getRange(lay.idRow, Math.min(idCol + 1 + 10, sheet.getMaxColumns())),
-    merged: !!best,
-  };
 }
 
+// サムネ表示セルの位置（row=1-indexed / col0=0-indexed）。cr名より右・ブロック列範囲内で
+// 最大面積の結合セルを採用する。結合セルが無いブロックは10列右にフォールバック（merged:false）。
+// mergeInfos は submitMergeInfos_ の戻り値（プレーンオブジェクト配列）。
+function submitThumbTargetPos_(sheet, lay, idCol, mergeInfos) {
+  var unit = submitUnit_(lay, idCol);
+  var best = null;
+  for (var i = 0; i < mergeInfos.length; i++) {
+    var m = mergeInfos[i];
+    if (m.col0 <= idCol || m.col0 < unit.start || m.col0 > unit.end) continue;
+    if (!best || m.area > best.area) best = m;
+  }
+  if (best) return { row: best.row, col0: best.col0, merged: true };
+  return { row: lay.idRow, col0: Math.min(idCol + 10, sheet.getMaxColumns() - 1), merged: false };
+}
+
+// 1回の listCrMissingThumbs で使う時間の上限（ms）。Worker側のGAS応答待ちは25秒で打ち切られ、
+// 超えると「GAS応答待ちタイムアウト」になる（BUG-126）。余裕を持って切り上げ、続きは nextStart で返す。
+var SUBMIT_THUMB_SCAN_BUDGET_MS = 15000;
+
 // ------------------------------------------------------------
-// サムネ未挿入crの列挙（BUG-122の後追いクローリング用・読み取り専用）。最新目印: listCrMissingThumbs
+// サムネ未挿入crの列挙（BUG-122の後追いクローリング用・読み取り専用）。最新目印: nextStart
 // ID行の各crブロックについて、サムネ表示セルにセル内画像(CellImage)が入っているかを確認し、
 // 入っていないidを返す。Workerはこの結果に対しMeta動画サムネを後追い挿入する。
 // 結合セルが無いブロックはサムネ表示セルを確実に特定できないため対象外（データセルへの
 // 誤挿入を防ぐ安全側の判断。insertCrThumbnailの個別指定なら従来どおりフォールバック挿入可）。
-// req: { spreadsheetId, sheetName? }
+// 巨大シート（kk_mak=2190列/140ブロック）でも時間内に返せるよう、結合セルはプレーン化して
+// 1パスで扱い、時間超過時は scanned/nextStart を返して打ち切る（再実行で続きから）。
+// req: { spreadsheetId, sheetName?, start? }
 // ------------------------------------------------------------
 function handleListCrMissingThumbs(req) {
   try {
+    var started = new Date().getTime();
     var ss = SpreadsheetApp.openById(req.spreadsheetId);
     var sheet = submitResolveSheet_(ss, req.sheetName);
     var lay = submitLayout_(sheet);
-    // 結合レンジは1回だけ全面取得して各ブロックで使い回す（ブロック毎のgetMergedRangesは巨大シートで遅い）
-    var allMerges = sheet.getRange(1, 1, sheet.getMaxRows(), sheet.getLastColumn()).getMergedRanges();
-    var missing = [], total = 0;
+    var blocks = [];
     lay.idCells.forEach(function (c) {
       if (!/^cr\d+/i.test(c.id)) return;
       if (c.id.toLowerCase() === SUBMIT_TEMPLATE_ID) return; // cr00テンプレは対象外
-      total++;
-      var t = submitThumbTargetCell_(sheet, lay, c.col, allMerges);
-      if (!t.merged) return; // 結合セル無し＝表示セル不明のためスキップ（安全側）
-      var v = t.range.getValue();
-      var isImage = !!v && typeof v === 'object' &&
-        (typeof v.getContentUrl === 'function' || typeof v.getUrl === 'function' ||
-         String(v).indexOf('CellImage') !== -1);
-      if (!isImage) missing.push(c.id);
+      blocks.push(c);
     });
-    return { ok: true, missing: missing, total: total };
+    var mergeInfos = submitMergeInfos_(sheet); // 全面を1回だけプレーン化
+    var start = Math.max(0, Number(req.start || 0));
+    var missing = [], skipped = 0, i = start, nextStart = null;
+    for (; i < blocks.length; i++) {
+      if (new Date().getTime() - started > SUBMIT_THUMB_SCAN_BUDGET_MS) { nextStart = i; break; }
+      var pos = submitThumbTargetPos_(sheet, lay, blocks[i].col, mergeInfos);
+      if (!pos.merged) { skipped++; continue; } // 結合セル無し＝表示セル不明のためスキップ（安全側）
+      if (!submitIsCellImage_(sheet.getRange(pos.row, pos.col0 + 1).getValue())) missing.push(blocks[i].id);
+    }
+    return {
+      ok: true, missing: missing, total: blocks.length,
+      scanned: i - start, skippedNoMergedCell: skipped, nextStart: nextStart,
+      elapsedMs: new Date().getTime() - started,
+    };
   } catch (e) {
     return { ok: false, error: String(e && e.message ? e.message : e) };
   }
+}
+
+/** セル値がセル内画像(CellImage)か。Dateも object なので明示除外する */
+function submitIsCellImage_(v) {
+  if (!v || typeof v !== 'object' || v instanceof Date) return false;
+  if (typeof v.getContentUrl === 'function' || typeof v.getUrl === 'function') return true;
+  return String(v).indexOf('CellImage') !== -1;
 }
 
 // ------------------------------------------------------------

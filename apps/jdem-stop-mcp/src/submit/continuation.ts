@@ -344,6 +344,7 @@ async function runHop(
         const parentSheetId = sheetParentId(plan);
         const childIds = plan.videos.map((v) => v.sheetId).filter((sid) => /cr\d+_\d{2}/i.test(sid));
         const results: string[] = [];
+        const insertedCols: string[] = [];
         const pending: { idx: number; spreadsheetId: string; sheetName?: string; label: string }[] = [];
         for (const t of gasTargets) {
           const r = await callSheetSubmit(env.SUBMIT_GAS_URL || env.COMMON_GAS_URL, {
@@ -377,6 +378,12 @@ async function runHop(
           }
           if (r.ok) {
             results.push(`${label}${warnSuffix}`);
+            // 挿入先の列を記録する（BUG-125）。展開はcr00テンプレの直右に入るが、その後に
+            // 手動でブロックが足されると押し出されて「位置がおかしい」ように見えるため、
+            // 入稿時点の実際の位置を残して後から切り分けられるようにする。
+            for (const x of r.inserted || []) {
+              if (x.startColA1) insertedCols.push(`${x.id}=${x.startColA1}列`);
+            }
           } else if (/タイムアウト/.test(r.error || "")) {
             // タイムアウトはGAS側で処理継続中の可能性が高い（クライアント切断ではGASは止まらない）。
             // 巨大シート(kk_kou等)ではほぼ毎回25秒を超え、実際は成功しているのに❌表示になっていた
@@ -388,6 +395,7 @@ async function runHop(
           }
         }
         (plan as any)._sheetResults = results;
+        if (insertedCols.length) (plan as any)._sheetInsertedCols = insertedCols;
         if (pending.length > 0) {
           (plan as any)._sheetPending = pending;
           (plan as any)._sheetCheckIds = [parentSheetId, ...childIds];
@@ -395,10 +403,11 @@ async function runHop(
           state.attempts = 0;
           break;
         }
-        // 実行ログ: 集計表段階の結果
+        // 実行ログ: 集計表段階の結果（挿入先の列も残す。BUG-125の位置検証用）
         await updateRunLog(env.NOTION_TOKEN, plan.runLogPageId, {
           sheetResult: results.some((r) => r.includes("❌")) ? "失敗" : "成功",
           sheetTabs: gasTargets.map((t) => t.sheetName || "").filter(Boolean),
+          detail: { ...((plan as any)._runDetail || {}), insertedCols },
         });
         state.step = "notion";
         break;
@@ -479,6 +488,9 @@ async function runHop(
             // 「Metaにも入稿された」と誤解されるのを防ぐ
             `:information_source: Metaには入稿していません（集計表のみ対応）`,
           ];
+          const insColsSheetOnly: string[] = (plan as any)._sheetInsertedCols || [];
+          if (insColsSheetOnly.length)
+            lines.push(`:round_pushpin: 挿入位置： ${insColsSheetOnly.join(" / ")}（cr00テンプレの直右に展開）`);
           // サムネ: Metaに動画が無い(=videoIdなし)ため、ffmpeg(Actions/Drive)経路のみ対応。トークンありなら起動
           if (!sheetNames.includes("❌") && env.GITHUB_DISPATCH_TOKEN) {
             try {
@@ -517,6 +529,11 @@ async function runHop(
           `:white_check_mark: 集計表： ${sheetNames}`,
           notionLine,
         ];
+        // 挿入先の列を明示する（BUG-125）。展開位置は常にcr00テンプレの直右だが、その後に
+        // 手動でブロックを足すと押し出されるため、入稿時点の位置を通知に残しておく。
+        const insCols: string[] = (plan as any)._sheetInsertedCols || [];
+        if (insCols.length)
+          lines.push(`:round_pushpin: 挿入位置： ${insCols.join(" / ")}（cr00テンプレの直右に展開）`);
         if (activateWarn) lines.push(`:warning: ${activateWarn}`);
         // crサムネ（0:01フレーム）を集計表セルに自動挿入（BUG-103）。ffmpegが要るためWorker/GASでは
         // デコードできず、GitHub Actions(cr-thumbnail.yml)へworkflow_dispatchで委譲する。
@@ -721,6 +738,7 @@ export async function runThumbBackfill(
     let jobs: Job[] = [];
     let remaining = 0;
     let needGasRedeploy = false;
+    const scanPartial: string[] = [];
     if (req.crKey) {
       // 指定crモード: Meta広告から実在パターンを列挙し、親+子を全タブへ上書き挿入（冪等）
       const ads = await findCrAdsWithVideos(accountId, metaToken, req.crKey);
@@ -731,7 +749,9 @@ export async function runThumbBackfill(
       const ids = [req.crKey, ...[...new Set(ads.filter((a) => a.pattern).map((a) => `${req.crKey}_${a.pattern}`))].sort()];
       for (const t of gasTargets) for (const id of ids) jobs.push({ target: t, id });
     } else {
-      // 一括モード: GASでサムネ未挿入crを列挙（新action。古いGASデプロイでは「不明なaction」）
+      // 一括モード: GASでサムネ未挿入crを列挙（新action。古いGASデプロイでは「不明なaction」）。
+      // 巨大シートはGAS側が時間内に走査しきれず nextStart を返すため、その分は今回の対象から
+      // 外し「再実行で続きから」と案内する（挿入済みは次回スキャンのmissingから消えるので冪等）。
       for (const t of gasTargets) {
         const res = await callSheetThumbList(gasUrl, { spreadsheetId: t.spreadsheetId, sheetName: t.sheetName });
         if (!res.ok) {
@@ -742,6 +762,7 @@ export async function runThumbBackfill(
           throw new Error(`集計表スキャン失敗（${t.sheetName || t.spreadsheetId}）: ${res.error}`);
         }
         for (const id of res.missing || []) jobs.push({ target: t, id });
+        if (res.nextStart != null) scanPartial.push(`${t.sheetName || "集計表"}: ${res.scanned || 0}/${res.total || 0}ブロック`);
       }
       if (needGasRedeploy && jobs.length === 0) {
         await postProgress(
@@ -829,6 +850,11 @@ export async function runThumbBackfill(
       lines.push(`⚠️ 失敗: ${failed.slice(0, 8).join(" / ")}${failed.length > 8 ? ` 他${failed.length - 8}件` : ""}`);
     if (remaining > 0)
       lines.push(`⏭ 未処理が残り${remaining}件あります。もう一度 \`/cr-in サムネ一括\` を実行すると続きから処理されます`);
+    if (scanPartial.length)
+      lines.push(
+        `⏭ 集計表が大きいためスキャンを途中で打ち切りました（${scanPartial.join(" / ")}）。` +
+          "残りは再実行で続きから確認されます"
+      );
     if (needGasRedeploy)
       lines.push("⚠️ 一部タブは入稿GASが古くスキャンできませんでした（要GAS再デプロイ。最新目印: listCrMissingThumbs）");
     const posted = await postPublic(env, req.channelId, lines.join("\n"));
