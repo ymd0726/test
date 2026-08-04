@@ -18,7 +18,8 @@ export interface SheetSubmitResult {
   dryRun?: boolean;
   sheetName?: string;
   plan?: unknown; // dryRun時の展開計画
-  inserted?: { id: string; zone: string; startCol: number; width: number }[];
+  /** 挿入したブロック。startColA1 は挿入先列のA1表記（BUG-125の位置検証用） */
+  inserted?: { id: string; zone: string; startCol: number; startColA1?: string; width: number }[];
   warnings?: string[];
   error?: string;
 }
@@ -87,12 +88,18 @@ export interface SheetThumbListResult {
   ok: boolean;
   missing?: string[];
   total?: number;
+  /** 今回スキャンできたブロック数 */
+  scanned?: number;
+  /** 結合セル（サムネ表示セル）が無く判定対象外にしたブロック数 */
+  skippedNoMergedCell?: number;
+  /** 時間切れで打ち切った位置。null/undefined なら全ブロック走査済み（BUG-126） */
+  nextStart?: number | null;
   error?: string;
 }
 
 export async function callSheetThumbList(
   gasUrl: string,
-  req: { spreadsheetId: string; sheetName?: string }
+  req: { spreadsheetId: string; sheetName?: string; start?: number }
 ): Promise<SheetThumbListResult> {
   return (await callGasJson(gasUrl, { action: "listCrMissingThumbs", ...req }, GAS_THUMB_TIMEOUT_MS)) as SheetThumbListResult;
 }
