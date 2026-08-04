@@ -491,12 +491,42 @@ async function runHop(
           const insColsSheetOnly: string[] = (plan as any)._sheetInsertedCols || [];
           if (insColsSheetOnly.length)
             lines.push(`:round_pushpin: 挿入位置： ${insColsSheetOnly.join(" / ")}（cr00テンプレの直右に展開）`);
-          // サムネ: Metaに動画が無い(=videoIdなし)ため、ffmpeg(Actions/Drive)経路のみ対応。トークンありなら起動
-          if (!sheetNames.includes("❌") && env.GITHUB_DISPATCH_TOKEN) {
+          // サムネ（BUG-129）: 集計表だけモードはMetaへ動画をアップロードしないため plan.videos に
+          // videoId が無く、以前はActions(ffmpeg)経路にトークンがある場合しか挿入されなかった。
+          // このモードは「Metaには既に入稿済み」の運用なので、トークンが無いときは既存Meta広告の
+          // 動画サムネを取得して挿入する（/cr-in <cr名> サムネ と同じ経路）。
+          if (!sheetNames.includes("❌")) {
             try {
-              const tr = await triggerThumbnailWorkflow(env, plan, gasTargets);
-              if (tr === "ok") lines.push(":frame_with_picture: サムネ： 集計表へ0:01フレームを自動挿入中（30秒〜1分半後に反映）");
-            } catch { /* サムネ失敗は致命ではない */ }
+              const tr = env.GITHUB_DISPATCH_TOKEN
+                ? await triggerThumbnailWorkflow(env, plan, gasTargets)
+                : "no-token";
+              if (tr === "ok") {
+                lines.push(":frame_with_picture: サムネ： 集計表へ0:01フレームを自動挿入中（30秒〜1分半後に反映）");
+              } else if (!accountId) {
+                lines.push(":information_source: サムネ： この案件はMeta広告アカウント未登録のため自動挿入できません");
+              } else {
+                const thumbJobs: ThumbJob[] = [];
+                for (const t of gasTargets) {
+                  thumbJobs.push({ target: t, id: sheetParentId(plan) });
+                  for (const cid of childIds) thumbJobs.push({ target: t, id: cid });
+                }
+                const r = await insertThumbsFromMetaAds(
+                  env.SUBMIT_GAS_URL || env.COMMON_GAS_URL,
+                  accountId,
+                  metaToken,
+                  thumbJobs
+                );
+                if (r.done.length)
+                  lines.push(`:frame_with_picture: サムネ： 既存Meta広告から挿入しました（${r.done.length}件）`);
+                if (r.failed.length)
+                  lines.push(
+                    `:warning: サムネ未挿入 ${r.failed.length}件: ${r.failed.slice(0, 5).join(" / ")}${r.failed.length > 5 ? " …" : ""}` +
+                      `（\`/cr-in ${plan.crKey} サムネ\` で再試行できます）`
+                  );
+              }
+            } catch (e: any) {
+              lines.push(`:warning: サムネ挿入に失敗: ${e.message}（\`/cr-in ${plan.crKey} サムネ\` で再試行できます）`);
+            }
           }
           await updateRunLog(env.NOTION_TOKEN, plan.runLogPageId, {
             status: sheetNames.includes("❌") || sheetNames.includes("確認できませんでした") ? "一部失敗" : "完了",
@@ -695,6 +725,77 @@ async function fetchThumbBase64(
 // missingから消えるため、再実行すれば続きから自然に進む（チェーン不要の冪等設計）。
 const THUMB_BACKFILL_MAX_IDS = 10;
 
+/** サムネ挿入対象（集計表タブ × 集計表ID） */
+type ThumbJob = { target: { spreadsheetId: string; sheetName?: string }; id: string };
+
+/**
+ * 既存Meta広告の動画サムネを集計表セルへ挿入する（BUG-121/122の後追い／BUG-129の集計表だけモード共用）。
+ * Metaへの書き込みはせず、広告の検索とcreativeの動画ID取得だけを行う。
+ * cr番号ごとにMeta検索を1回にまとめ、同じ動画のサムネはbase64をキャッシュして使い回す。
+ */
+async function insertThumbsFromMetaAds(
+  gasUrl: string,
+  accountId: string,
+  metaToken: string,
+  jobs: ThumbJob[]
+): Promise<{ done: string[]; failed: string[] }> {
+  const byCr = new Map<string, ThumbJob[]>();
+  for (const j of jobs) {
+    const key = (j.id.match(/cr\d+/i)?.[0] || j.id).toLowerCase();
+    if (!byCr.has(key)) byCr.set(key, []);
+    byCr.get(key)!.push(j);
+  }
+  const done: string[] = [];
+  const failed: string[] = [];
+  const b64Cache = new Map<string, { b64: string; mime: string } | null>();
+  for (const [crKey, crJobs] of byCr) {
+    let ads: CrAdVideo[] = [];
+    try {
+      ads = await findCrAdsWithVideos(accountId, metaToken, crKey);
+    } catch {
+      for (const j of crJobs) failed.push(`${j.id}(Meta検索失敗)`);
+      continue;
+    }
+    for (const j of crJobs) {
+      // 子(_NN)はパターン一致、親は_01優先（「親は01」運用）、無ければ単独広告の動画を使う
+      const nn = j.id.match(/cr\d+_(\d{2})/i)?.[1];
+      const ad = nn
+        ? ads.find((a) => a.pattern === nn && a.videoId)
+        : ads.find((a) => a.pattern === "01" && a.videoId) ||
+          ads.find((a) => !a.pattern && a.videoId) ||
+          ads.find((a) => a.videoId);
+      if (!ad?.videoId) {
+        failed.push(`${j.id}(Metaに対応する動画広告なし)`);
+        continue;
+      }
+      let img = b64Cache.get(ad.videoId);
+      if (img === undefined) {
+        const r = await fetchThumbBase64(ad.videoId, metaToken);
+        img = r.data;
+        b64Cache.set(ad.videoId, img);
+        if (!img) {
+          failed.push(`${j.id}(${r.reason})`);
+          continue;
+        }
+      }
+      if (!img) {
+        failed.push(`${j.id}(サムネ取得失敗)`);
+        continue;
+      }
+      const res = await callSheetThumbnail(gasUrl, {
+        spreadsheetId: j.target.spreadsheetId,
+        sheetName: j.target.sheetName,
+        id: j.id,
+        imageBase64: img.b64,
+        mimeType: img.mime,
+      });
+      if (res.ok) done.push(j.id);
+      else failed.push(`${j.id}(GAS: ${res.error || "不明"})`);
+    }
+  }
+  return { done, failed };
+}
+
 /**
  * サムネ後追い挿入（BUG-121/122/124）。サムネ挿入は入稿フローが最後まで成功した
  * doneステップでしか走らないため、途中失敗・再実行・旧バージョン入稿分のcrはセルが
@@ -734,8 +835,7 @@ export async function runThumbBackfill(
     });
 
     // 対象 (集計表タブ, id) を集める
-    type Job = { target: { spreadsheetId: string; sheetName?: string }; id: string };
-    let jobs: Job[] = [];
+    let jobs: ThumbJob[] = [];
     let remaining = 0;
     let needGasRedeploy = false;
     const scanPartial: string[] = [];
@@ -785,61 +885,7 @@ export async function runThumbBackfill(
       }
     }
 
-    // cr番号ごとにMeta検索を1回にまとめて処理する
-    const byCr = new Map<string, Job[]>();
-    for (const j of jobs) {
-      const key = (j.id.match(/cr\d+/i)?.[0] || j.id).toLowerCase();
-      if (!byCr.has(key)) byCr.set(key, []);
-      byCr.get(key)!.push(j);
-    }
-    const done: string[] = [];
-    const failed: string[] = [];
-    const b64Cache = new Map<string, { b64: string; mime: string } | null>();
-    for (const [crKey, crJobs] of byCr) {
-      let ads: CrAdVideo[] = [];
-      try {
-        ads = await findCrAdsWithVideos(accountId, metaToken, crKey);
-      } catch (e: any) {
-        for (const j of crJobs) failed.push(`${j.id}(Meta検索失敗)`);
-        continue;
-      }
-      for (const j of crJobs) {
-        // 子(_NN)はパターン一致、親は_01優先（「親は01」運用）、無ければ単独広告の動画を使う
-        const nn = j.id.match(/cr\d+_(\d{2})/i)?.[1];
-        const ad = nn
-          ? ads.find((a) => a.pattern === nn && a.videoId)
-          : ads.find((a) => a.pattern === "01" && a.videoId) ||
-            ads.find((a) => !a.pattern && a.videoId) ||
-            ads.find((a) => a.videoId);
-        if (!ad?.videoId) {
-          failed.push(`${j.id}(Metaに対応する動画広告なし)`);
-          continue;
-        }
-        let img = b64Cache.get(ad.videoId);
-        if (img === undefined) {
-          const r = await fetchThumbBase64(ad.videoId, metaToken);
-          img = r.data;
-          b64Cache.set(ad.videoId, img);
-          if (!img) {
-            failed.push(`${j.id}(${r.reason})`);
-            continue;
-          }
-        }
-        if (!img) {
-          failed.push(`${j.id}(サムネ取得失敗)`);
-          continue;
-        }
-        const res = await callSheetThumbnail(gasUrl, {
-          spreadsheetId: j.target.spreadsheetId,
-          sheetName: j.target.sheetName,
-          id: j.id,
-          imageBase64: img.b64,
-          mimeType: img.mime,
-        });
-        if (res.ok) done.push(j.id);
-        else failed.push(`${j.id}(GAS: ${res.error || "不明"})`);
-      }
-    }
+    const { done, failed } = await insertThumbsFromMetaAds(gasUrl, accountId, metaToken, jobs);
 
     // 完了通知: サムネのみ対応であること（ブロック追加・Meta入稿なし）を明記する（BUG-124）
     const lines = [
