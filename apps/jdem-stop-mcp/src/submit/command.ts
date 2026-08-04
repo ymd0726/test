@@ -161,39 +161,52 @@ async function resolveAndAsk(
       // Slackのmulti_static_selectは最大100件。選択値はボタン押下時の state.values から読む
       // （ボタンvalueは2000字制限があり、数十件のIDを詰め込めないため）。
       if (outcome.adsetCandidates.length >= 2) {
-        // 表示順は「広告セット名（＝店舗名）が先」。キャンペーン名を先頭に置くと、
-        // ssh の cp06_2603_売上cp_女性テスト_フェーズ2(一部店舗女性のみ) のような長い名前で
-        // 肝心の店舗名が見切れて全項目が同じに見えてしまう（BUG-135 追加要望）。
-        // キャンペーン名は description（2行目・補足表示）に回し、さらに候補間で共通する
-        // 先頭部分を畳んで、違いのある部分が先に出るようにする。
-        const campNames = [...new Set(outcome.adsetCandidates.map((c) => c.campaignName).filter(Boolean))];
-        const common = campNames.length >= 2 ? commonPrefix(campNames) : "";
-        const shortCamp = (n: string) =>
-          common.length >= 4 && n.length > common.length + 2 ? `…${n.slice(common.length)}` : n;
-        const options = outcome.adsetCandidates.slice(0, ADSET_SELECT_MAX).map((c) => {
-          const opt: any = {
-            text: {
-              type: "plain_text",
-              text: truncate(`${c.effectiveStatus === "ACTIVE" ? "🟢" : "⏸"} ${c.name}`, 75),
-              emoji: true,
-            },
-            value: c.id,
-          };
-          if (c.campaignName)
-            opt.description = { type: "plain_text", text: truncate(shortCamp(c.campaignName), 75), emoji: true };
-          return opt;
-        });
+        // プルダウン（multi_static_select）は1件選ぶたびにメニューが閉じるため、
+        // ssh のように10件以上をまとめて選ぶ運用だと非常に手間がかかる（BUG-135 追加要望）。
+        // 一覧が開いたまま連続でチェックできる checkboxes に変更する。
+        // checkboxes は 1ブロックにつき最大10件なので、キャンペーンごとに見出しを付けて
+        // 10件ずつのブロックに分割する（Slackの1メッセージ50ブロック制限内に収める）。
         blocks.push({
           type: "section",
-          block_id: ADSET_SELECT_BLOCK,
-          text: { type: "mrkdwn", text: "*複数の広告セットに入稿する場合はこちらで選択:*" },
-          accessory: {
-            type: "multi_static_select",
-            action_id: ADSET_SELECT_ACTION,
-            placeholder: { type: "plain_text", text: "広告セットを選ぶ（複数可）", emoji: true },
-            options,
+          text: {
+            type: "mrkdwn",
+            text: "*複数の広告セットに入稿する場合は、下のチェックボックスで選択:*",
           },
         });
+        const shown = outcome.adsetCandidates.slice(0, ADSET_CHECK_MAX_TOTAL);
+        const groups = new Map<string, typeof shown>();
+        for (const c of shown) {
+          const key = c.campaignName || "(キャンペーン名なし)";
+          if (!groups.has(key)) groups.set(key, [] as any);
+          groups.get(key)!.push(c);
+        }
+        let blockIdx = 0;
+        for (const [camp, list] of groups) {
+          // キャンペーン名は見出しに1回だけ出す（各選択肢に付けると店舗名が埋もれるため）
+          blocks.push({ type: "context", elements: [{ type: "mrkdwn", text: `*${camp}*` }] });
+          for (let i = 0; i < list.length; i += ADSET_CHECK_PER_BLOCK) {
+            const chunk = list.slice(i, i + ADSET_CHECK_PER_BLOCK);
+            blocks.push({
+              type: "actions",
+              block_id: `${ADSET_CHECK_BLOCK_PREFIX}${blockIdx}`,
+              elements: [
+                {
+                  type: "checkboxes",
+                  action_id: `${ADSET_CHECK_ACTION_PREFIX}${blockIdx}`,
+                  options: chunk.map((c) => ({
+                    text: {
+                      type: "plain_text",
+                      text: truncate(`${c.effectiveStatus === "ACTIVE" ? "🟢" : "⏸"} ${c.name}`, 75),
+                      emoji: true,
+                    },
+                    value: c.id,
+                  })),
+                },
+              ],
+            });
+            blockIdx++;
+          }
+        }
       }
       // 表示中の全セットへ同時入稿するボタン（BUG-31）。テキスト類は各セットの直近cr広告からコピー
       const actionEls: any[] = [];
@@ -226,10 +239,13 @@ async function resolveAndAsk(
       if (outcome.adsetCandidates.length > 5)
         notes.push(
           `個別ボタンは上位5セットのみ表示（他 ${outcome.adsetCandidates.length - 5} セット）。` +
-            "店舗ごとに選んで入稿する場合は上の選択メニューを使ってください"
+            "店舗ごとに選んで入稿する場合は上のチェックボックスを使ってください"
         );
-      if (outcome.adsetCandidates.length > ADSET_SELECT_MAX)
-        notes.push(`⚠️ 選択メニューは${ADSET_SELECT_MAX}セットまで表示（候補${outcome.adsetCandidates.length}セット）`);
+      if (outcome.adsetCandidates.length > ADSET_CHECK_MAX_TOTAL)
+        notes.push(
+          `⚠️ チェックボックスは${ADSET_CHECK_MAX_TOTAL}セットまで表示（候補${outcome.adsetCandidates.length}セット）。` +
+            "全部に入れる場合は「🚀 すべてに入稿」を使ってください"
+        );
       blocks.push({
         type: "context",
         elements: [{ type: "mrkdwn", text: notes.join("\n") }],
@@ -329,32 +345,36 @@ async function resolveAndAsk(
  * 既存 /slack/interact は即200ACK＋response_url表示の方式なので、それに合わせる。
  */
 /**
- * 文字列群の共通接頭辞（BUG-135 追加要望）。
- * 同じ命名規則のキャンペーン名（cp06_2603_売上cp_…）が並ぶと、違いのある部分が
- * 後方に押しやられて見切れるため、共通部分を畳んで表示するのに使う。
+ * 広告セットの複数選択（BUG-135）。選択値は state.values[block][action] から読む。
+ * ブロックIDは全て "crin_adsets" 始まりに統一し、旧プルダウン方式（crin_adsets_block /
+ * crin_adsets_select）で表示済みのメッセージからも拾えるようにする。
  */
-function commonPrefix(list: string[]): string {
-  if (list.length === 0) return "";
-  let p = list[0];
-  for (const s of list.slice(1)) {
-    let i = 0;
-    while (i < p.length && i < s.length && p[i] === s[i]) i++;
-    p = p.slice(0, i);
-    if (!p) break;
-  }
-  return p;
-}
+const ADSET_PICK_PREFIX = "crin_adsets";
+/** チェックボックス群のブロックID/アクションIDの接頭辞（末尾に連番） */
+const ADSET_CHECK_BLOCK_PREFIX = "crin_adsets_chk_";
+const ADSET_CHECK_ACTION_PREFIX = "crin_adsets_chkact_";
+/** Slackのcheckboxes要素は1ブロックあたり最大10件 */
+const ADSET_CHECK_PER_BLOCK = 10;
+/** チェックボックスで提示する広告セットの上限（1メッセージ50ブロック制限に収める） */
+const ADSET_CHECK_MAX_TOTAL = 50;
 
-/** 広告セット複数選択メニュー（BUG-135）。選択値は state.values[block][action] から読む */
-const ADSET_SELECT_BLOCK = "crin_adsets_block";
-const ADSET_SELECT_ACTION = "crin_adsets_select";
-/** Slackのmulti_static_selectのオプション上限は100件 */
-const ADSET_SELECT_MAX = 100;
-
-/** 複数選択メニューで選ばれた広告セットIDを block_actions の state から取り出す（BUG-135） */
+/**
+ * 選ばれた広告セットIDを block_actions の state から取り出す（BUG-135）。
+ * チェックボックスは10件ずつ複数ブロックに分かれるため、"crin_adsets" 始まりの
+ * 全ブロックを走査して選択値を集める。
+ */
 function selectedAdsetIds(interaction: any): string[] {
-  const sel = interaction?.state?.values?.[ADSET_SELECT_BLOCK]?.[ADSET_SELECT_ACTION]?.selected_options;
-  return Array.isArray(sel) ? sel.map((o: any) => String(o.value)).filter(Boolean) : [];
+  const values = interaction?.state?.values || {};
+  const out: string[] = [];
+  for (const blockId of Object.keys(values)) {
+    if (!blockId.startsWith(ADSET_PICK_PREFIX)) continue;
+    const actions = values[blockId] || {};
+    for (const actionId of Object.keys(actions)) {
+      const sel = actions[actionId]?.selected_options;
+      if (Array.isArray(sel)) out.push(...sel.map((o: any) => String(o.value)));
+    }
+  }
+  return [...new Set(out.filter(Boolean))];
 }
 
 export function handleCrInInteraction(
@@ -374,9 +394,9 @@ export function handleCrInInteraction(
     return new Response("", { status: 200 });
   }
 
-  // 複数選択メニューの操作自体は「選んだだけ」なので何もしない（200 ACKのみ）。
-  // ACKしないとSlackがエラー表示するため、実行ボタンとは別に握りつぶす（BUG-135）
-  if (action.action_id === ADSET_SELECT_ACTION) {
+  // 広告セットの選択操作（チェックボックス/旧プルダウン）自体は「選んだだけ」なので
+  // 何もしない（200 ACKのみ）。ACKしないとSlackがエラー表示する（BUG-135）
+  if (action.action_id.startsWith(ADSET_PICK_PREFIX)) {
     return new Response("", { status: 200 });
   }
 
