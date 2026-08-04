@@ -92,7 +92,12 @@ const TOP_SHARE_ROW = 8;  // 3段階目🌱🌱🌱「小当たり」消化予�
 const TOP_CPA_ROW = 9;    // 3段階目🌱🌱🌱「小当たり」CPA上限倍率（目標CPA×。1.0超=目標より多少悪くても許容）
 const APPLY = args.apply || process.env.APPLY === "1";
 const UNDO_OUT = args.undoOut || "undo_log.json";
-const HEADER_ROWS = Math.max(ID_ROW, LABEL_ROW, NOROSHI_ROW, ...CLEAR_OLD_ROWS, 8);
+// --clear-old-row が TIER_ROW と同じ場合（例: メモ列に残った旧形式の残骸を、消化金額列は
+// 触らずメモ列だけ掃除したい）は、その行を専用に広い範囲で再取得せず、既に読む中間行データ
+// （tierRes）を使い回す。TIER_ROW は数千行になり得るので、ヘッダー読取の対象行に含めると
+// 巨大タブで無駄に重くなる。
+const CLEAR_ROWS_NEEDING_HEADER = CLEAR_OLD_ROWS.filter((r) => r !== TIER_ROW);
+const HEADER_ROWS = Math.max(ID_ROW, LABEL_ROW, NOROSHI_ROW, ...CLEAR_ROWS_NEEDING_HEADER, 8);
 const LABEL_PRE = "当たり候補🌱";       // 1段階目（新芽1つ）
 const LABEL_CAND = "当たり候補🌱🌱";    // 2段階目・高角度（新芽2つ）
 const LABEL_TOP = "当たり候補🌱🌱🌱";   // 3段階目「小当たり」（新芽3つ。シェアモード専用）
@@ -152,8 +157,8 @@ const rows = headRes.data.values || [];
 const labelRow = rows[LABEL_ROW - 1] || [];
 const idRow = rows[ID_ROW - 1] || [];
 const noroshiRowCur = rows[NOROSHI_ROW - 1] || [];
-const clearRowsCur = new Map(CLEAR_OLD_ROWS.map((r) => [r, rows[r - 1] || []]));
 const tierRowCur = (tierRes.data.values || [])[0] || [];
+const clearRowsCur = new Map(CLEAR_OLD_ROWS.map((r) => [r, r === TIER_ROW ? tierRowCur : (rows[r - 1] || [])]));
 
 // ブロック走査：ラベル行が「消化金額」かつ ID行が cr… の列＝実CRブロック先頭
 const blocks = [];
@@ -484,13 +489,13 @@ async function withRetry(label, fn, attempts = 5) {
   }
   throw lastErr;
 }
-// 1セルの文字色を設定する repeatCell リクエストを作る（行・列は0始まり）
+// 1セルの文字色・中央寄せを設定する repeatCell リクエストを作る（行・列は0始まり）
 function colorRequest(colIdx, row, rgb) {
   return {
     repeatCell: {
       range: { sheetId: SHEET_ID, startRowIndex: row - 1, endRowIndex: row, startColumnIndex: colIdx, endColumnIndex: colIdx + 1 },
-      cell: { userEnteredFormat: { textFormat: { foregroundColor: rgb } } },
-      fields: "userEnteredFormat.textFormat.foregroundColor",
+      cell: { userEnteredFormat: { textFormat: { foregroundColor: rgb }, horizontalAlignment: "CENTER" } },
+      fields: "userEnteredFormat.textFormat.foregroundColor,userEnteredFormat.horizontalAlignment",
     },
   };
 }
