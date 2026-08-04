@@ -235,16 +235,26 @@ function handleInsertCrThumbnail(req) {
   }
 }
 
+// サムネ表示セルを探す行範囲（BUG-126）。サムネ用の結合セルはID行(1〜8行目)の周辺＝
+// ヘッダー帯にしか存在しない。にもかかわらず maxRows（kk_makは1100行超）まで結合レンジを
+// 取得すると、日次・月次データ領域の結合セルまで数千件読み込むことになり、これ自体が
+// 15秒の走査予算を食い潰して「1ブロックも走査できないまま nextStart=0 を返す」状態に
+// なっていた（＝再実行しても永久に先へ進まず「未挿入なし」と誤表示される原因）。
+// ヘッダー帯だけに絞ることで高速化し、同時にデータ領域の巨大な結合セルを
+// 「最大面積の結合セル」として誤選択する事故も防ぐ。
+var SUBMIT_THUMB_HEADER_ROWS = 40;
+
 // 結合レンジを「プレーンなJSオブジェクトの配列」にして返す（BUG-126）。
 // Rangeオブジェクトのまま各ブロックで走査すると getColumn()/getNumRows() 等の
 // Apps Script呼び出しが (ブロック数 × 結合セル数 × 3) 回発生し、kk_mak規模
 // （2190列・140ブロック）では数十万回に達して25秒のWorkerタイムアウトを超える。
 // 変換は結合セル数ぶんの1パスだけ行い、以降の判定は純JSで済ませる。
-// startCol0/width 省略時はシート全面。
+// 行はヘッダー帯（SUBMIT_THUMB_HEADER_ROWS行）に限定する。startCol0/width 省略時は全列。
 function submitMergeInfos_(sheet, startCol0, width) {
+  var rows = Math.min(SUBMIT_THUMB_HEADER_ROWS, sheet.getMaxRows());
   var rng = (startCol0 === undefined || startCol0 === null)
-    ? sheet.getRange(1, 1, sheet.getMaxRows(), sheet.getLastColumn())
-    : sheet.getRange(1, startCol0 + 1, sheet.getMaxRows(), width);
+    ? sheet.getRange(1, 1, rows, sheet.getLastColumn())
+    : sheet.getRange(1, startCol0 + 1, rows, width);
   return rng.getMergedRanges().map(function (m) {
     return { row: m.getRow(), col0: m.getColumn() - 1, area: m.getNumRows() * m.getNumColumns() };
   });
@@ -295,7 +305,9 @@ function handleListCrMissingThumbs(req) {
     var start = Math.max(0, Number(req.start || 0));
     var missing = [], skipped = 0, i = start, nextStart = null;
     for (; i < blocks.length; i++) {
-      if (new Date().getTime() - started > SUBMIT_THUMB_SCAN_BUDGET_MS) { nextStart = i; break; }
+      // 予算切れで打ち切る。ただし「1ブロックも進まないまま同じ位置を返す」と再実行しても
+      // 永久に前進しないため、最低1ブロックは必ず走査する（i > start の条件。BUG-126）。
+      if (i > start && new Date().getTime() - started > SUBMIT_THUMB_SCAN_BUDGET_MS) { nextStart = i; break; }
       var pos = submitThumbTargetPos_(sheet, lay, blocks[i].col, mergeInfos);
       if (!pos.merged) { skipped++; continue; } // 結合セル無し＝表示セル不明のためスキップ（安全側）
       if (!submitIsCellImage_(sheet.getRange(pos.row, pos.col0 + 1).getValue())) missing.push(blocks[i].id);

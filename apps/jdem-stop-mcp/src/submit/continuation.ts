@@ -724,6 +724,12 @@ async function fetchThumbBase64(
 // 1回のサムネ後追い実行で処理する最大件数（Worker実行上限対策）。挿入済みは次回スキャンの
 // missingから消えるため、再実行すれば続きから自然に進む（チェーン不要の冪等設計）。
 const THUMB_BACKFILL_MAX_IDS = 10;
+/**
+ * 1回の「サムネ一括」でGASスキャンを継続する最大パス数（BUG-126）。
+ * GASは15秒の予算で打ち切って nextStart を返すため、続きを渡して呼び直す。
+ * 巨大な集計表でも数パスで走査しきれる想定で、暴走防止に上限を設ける。
+ */
+const THUMB_SCAN_MAX_PASSES = 6;
 
 /** サムネ挿入対象（集計表タブ × 集計表ID） */
 type ThumbJob = { target: { spreadsheetId: string; sheetName?: string }; id: string };
@@ -839,6 +845,8 @@ export async function runThumbBackfill(
     let remaining = 0;
     let needGasRedeploy = false;
     const scanPartial: string[] = [];
+    /** サムネ表示セル（結合セル）が無く判定対象外になったブロック（タブ別の件数） */
+    const scanSkipped: string[] = [];
     if (req.crKey) {
       // 指定crモード: Meta広告から実在パターンを列挙し、親+子を全タブへ上書き挿入（冪等）
       const ads = await findCrAdsWithVideos(accountId, metaToken, req.crKey);
@@ -853,16 +861,44 @@ export async function runThumbBackfill(
       // 巨大シートはGAS側が時間内に走査しきれず nextStart を返すため、その分は今回の対象から
       // 外し「再実行で続きから」と案内する（挿入済みは次回スキャンのmissingから消えるので冪等）。
       for (const t of gasTargets) {
-        const res = await callSheetThumbList(gasUrl, { spreadsheetId: t.spreadsheetId, sheetName: t.sheetName });
-        if (!res.ok) {
-          if (/不明なaction/.test(res.error || "")) {
-            needGasRedeploy = true;
-            continue;
+        const label = t.sheetName || "集計表";
+        let start = 0;
+        let scannedTotal = 0;
+        let skippedTotal = 0;
+        let totalBlocks = 0;
+        let fullyScanned = false;
+        // GASは1回15秒の予算で打ち切り nextStart を返すため、続きを渡して最後まで走査する。
+        // 以前は start を渡さず毎回ブロック0から再スキャンしていたので、予算内に収まる
+        // 前半しか見えず、後半（＝サムネ未挿入の古いcr群）に永久に到達しなかった（BUG-126）。
+        for (let pass = 0; pass < THUMB_SCAN_MAX_PASSES; pass++) {
+          const res = await callSheetThumbList(gasUrl, {
+            spreadsheetId: t.spreadsheetId,
+            sheetName: t.sheetName,
+            start,
+          });
+          if (!res.ok) {
+            if (/不明なaction/.test(res.error || "")) {
+              needGasRedeploy = true;
+              break;
+            }
+            throw new Error(`集計表スキャン失敗（${label}）: ${res.error}`);
           }
-          throw new Error(`集計表スキャン失敗（${t.sheetName || t.spreadsheetId}）: ${res.error}`);
+          for (const id of res.missing || []) jobs.push({ target: t, id });
+          scannedTotal += res.scanned || 0;
+          skippedTotal += res.skippedNoMergedCell || 0;
+          totalBlocks = res.total || totalBlocks;
+          // nextStart 未返却（=古いGAS or 走査完了）なら終了
+          if (res.nextStart == null) {
+            fullyScanned = true;
+            break;
+          }
+          if (res.nextStart <= start) break; // 前進しない場合の無限ループ防止
+          start = res.nextStart;
+          if (jobs.length >= THUMB_BACKFILL_MAX_IDS) break; // 今回挿入できる上限に到達
         }
-        for (const id of res.missing || []) jobs.push({ target: t, id });
-        if (res.nextStart != null) scanPartial.push(`${t.sheetName || "集計表"}: ${res.scanned || 0}/${res.total || 0}ブロック`);
+        if (needGasRedeploy) continue;
+        if (!fullyScanned) scanPartial.push(`${label}: ${scannedTotal}/${totalBlocks || "?"}ブロック`);
+        if (skippedTotal > 0) scanSkipped.push(`${label}: ${skippedTotal}件`);
       }
       if (needGasRedeploy && jobs.length === 0) {
         await postProgress(
@@ -879,8 +915,25 @@ export async function runThumbBackfill(
         jobs = jobs.slice(0, THUMB_BACKFILL_MAX_IDS);
       }
       if (jobs.length === 0 && !needGasRedeploy) {
-        await postProgress(env, slackCtx, "✅ サムネ未挿入のcrはありませんでした（全ブロック挿入済み）", true);
-        await updateRunLog(env.NOTION_TOKEN, runLogPageId, { status: "完了", detail: { inserted: [] } });
+        // 「未挿入0件」でも、スキャンが最後まで届いていない／表示セル不明でスキップした分が
+        // あるなら“全部済み”とは言い切れない。以前は一律「全ブロック挿入済み」と表示していたため、
+        // 実際には後半が未走査なのに完了したと誤解させていた（BUG-126）。
+        const caveats: string[] = [];
+        if (scanPartial.length)
+          caveats.push(`⏭ スキャンが最後まで届きませんでした（${scanPartial.join(" / ")}）。もう一度実行すると続きを確認します`);
+        if (scanSkipped.length)
+          caveats.push(
+            `⚠️ サムネ表示セル（結合セル）が見つからず判定できなかったブロックがあります（${scanSkipped.join(" / ")}）。` +
+              "該当crは `/cr-in <cr名> サムネ` で個別に挿入できます"
+          );
+        const head = caveats.length
+          ? "ℹ️ 走査できた範囲にサムネ未挿入のcrはありませんでした"
+          : "✅ サムネ未挿入のcrはありませんでした（全ブロック挿入済み）";
+        await postProgress(env, slackCtx, [head, ...caveats].join("\n"), true);
+        await updateRunLog(env.NOTION_TOKEN, runLogPageId, {
+          status: caveats.length ? "一部失敗" : "完了",
+          detail: { inserted: [], scanPartial, scanSkipped },
+        });
         return;
       }
     }
