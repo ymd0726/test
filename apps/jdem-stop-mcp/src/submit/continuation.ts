@@ -510,11 +510,13 @@ async function runHop(
                   thumbJobs.push({ target: t, id: sheetParentId(plan) });
                   for (const cid of childIds) thumbJobs.push({ target: t, id: cid });
                 }
+                // 完了通知の直前なので、サムネ挿入で時間を使い切って通知ごと落ちないよう予算を切る（BUG-137）
                 const r = await insertThumbsFromMetaAds(
                   env.SUBMIT_GAS_URL || env.COMMON_GAS_URL,
                   accountId,
                   metaToken,
-                  thumbJobs
+                  thumbJobs,
+                  Date.now() + THUMB_RUN_BUDGET_MS
                 );
                 if (r.done.length)
                   lines.push(`:frame_with_picture: サムネ： 既存Meta広告から挿入しました（${r.done.length}件）`);
@@ -522,6 +524,11 @@ async function runHop(
                   lines.push(
                     `:warning: サムネ未挿入 ${r.failed.length}件: ${r.failed.slice(0, 5).join(" / ")}${r.failed.length > 5 ? " …" : ""}` +
                       `（\`/cr-in ${plan.crKey} サムネ\` で再試行できます）`
+                  );
+                if (r.pending.length)
+                  lines.push(
+                    `:next_track_button: サムネ： 時間切れで${r.pending.length}件が未挿入です` +
+                      `（\`/cr-in ${plan.crKey} サムネ\` で残りを挿入できます）`
                   );
               }
             } catch (e: any) {
@@ -731,8 +738,23 @@ const THUMB_BACKFILL_MAX_IDS = 10;
  */
 const THUMB_SCAN_MAX_PASSES = 6;
 
+/**
+ * 1回の実行でサムネ挿入に使える時間の上限（BUG-137）。
+ * GAS insertCrThumbnail は1件あたり数秒（巨大シート kk_mak=2190列 や、複数タブ案件
+ * bla=meta_face/meta_body のようにタブ数だけ件数が倍になるケースでは十数秒）かかる。
+ * 全件を1リクエストで回し切ろうとするとWorkerの実行上限に達して *完了通知もエラー通知も
+ * 出ないまま突然死* し、実行ログが「実行中」のまま残っていた（BUG-137の主症状）。
+ * 予算を超えた時点で打ち切り、やり残しを明示して必ず完了通知まで到達させる。
+ */
+const THUMB_RUN_BUDGET_MS = 45_000;
+
 /** サムネ挿入対象（集計表タブ × 集計表ID） */
 type ThumbJob = { target: { spreadsheetId: string; sheetName?: string }; id: string };
+
+/** 未処理として次回送りにしたジョブの表示名（タブ名付き） */
+function thumbJobLabel(j: ThumbJob): string {
+  return j.target.sheetName ? `${j.id}@${j.target.sheetName}` : j.id;
+}
 
 /**
  * 既存Meta広告の動画サムネを集計表セルへ挿入する（BUG-121/122の後追い／BUG-129の集計表だけモード共用）。
@@ -743,8 +765,10 @@ async function insertThumbsFromMetaAds(
   gasUrl: string,
   accountId: string,
   metaToken: string,
-  jobs: ThumbJob[]
-): Promise<{ done: string[]; failed: string[] }> {
+  jobs: ThumbJob[],
+  /** この時刻を過ぎたら打ち切って残りを pending で返す（BUG-137。省略時は無制限＝従来動作） */
+  deadline?: number
+): Promise<{ done: string[]; failed: string[]; pending: string[] }> {
   const byCr = new Map<string, ThumbJob[]>();
   for (const j of jobs) {
     const key = (j.id.match(/cr\d+/i)?.[0] || j.id).toLowerCase();
@@ -753,8 +777,14 @@ async function insertThumbsFromMetaAds(
   }
   const done: string[] = [];
   const failed: string[] = [];
+  const pending: string[] = [];
+  const outOfTime = () => deadline != null && Date.now() >= deadline;
   const b64Cache = new Map<string, { b64: string; mime: string } | null>();
   for (const [crKey, crJobs] of byCr) {
+    if (outOfTime()) {
+      for (const j of crJobs) pending.push(thumbJobLabel(j));
+      continue;
+    }
     let ads: CrAdVideo[] = [];
     try {
       ads = await findCrAdsWithVideos(accountId, metaToken, crKey);
@@ -763,6 +793,12 @@ async function insertThumbsFromMetaAds(
       continue;
     }
     for (const j of crJobs) {
+      // 予算切れ: ここで止めて残りを次回送りにする。1件のGAS挿入は最大25秒かかり得るため、
+      // 「開始前に残り時間があるか」で判定する（途中で殺されるより確実に通知へ到達させる）
+      if (outOfTime()) {
+        pending.push(thumbJobLabel(j));
+        continue;
+      }
       // 子(_NN)はパターン一致、親は_01優先（「親は01」運用）、無ければ単独広告の動画を使う
       const nn = j.id.match(/cr\d+_(\d{2})/i)?.[1];
       const ad = nn
@@ -799,7 +835,7 @@ async function insertThumbsFromMetaAds(
       else failed.push(`${j.id}(GAS: ${res.error || "不明"})`);
     }
   }
-  return { done, failed };
+  return { done, failed, pending };
 }
 
 /**
@@ -819,6 +855,9 @@ export async function runThumbBackfill(
   req: { crKey?: string; channelId: string; userId: string; userName?: string; responseUrl: string }
 ): Promise<void> {
   const slackCtx = { channelId: req.channelId, userId: req.userId, responseUrl: req.responseUrl } as any;
+  // 実行ログIDはcatchからも触れる位置で持つ（BUG-137: 例外時に「実行中」のまま残っていた）
+  let runLogPageId: string | null = null;
+  const startedAt = Date.now();
   try {
     if (!project.metaAdAccountId)
       throw new Error(`案件「${project.name}」にmetaAdAccountIdが未設定のため、Metaからサムネを取得できません`);
@@ -829,7 +868,7 @@ export async function runThumbBackfill(
       slackCtx,
       req.crKey ? `🖼️ ${req.crKey} のサムネ挿入を開始します…` : "🖼️ 集計表のサムネ未挿入crをスキャンしています…"
     );
-    const runLogPageId = await createRunLog(env.NOTION_TOKEN, {
+    runLogPageId = await createRunLog(env.NOTION_TOKEN, {
       tool: "cr入稿くん",
       action: "サムネ挿入",
       project: project.name,
@@ -938,7 +977,13 @@ export async function runThumbBackfill(
       }
     }
 
-    const { done, failed } = await insertThumbsFromMetaAds(gasUrl, accountId, metaToken, jobs);
+    const { done, failed, pending } = await insertThumbsFromMetaAds(
+      gasUrl,
+      accountId,
+      metaToken,
+      jobs,
+      startedAt + THUMB_RUN_BUDGET_MS
+    );
 
     // 完了通知: サムネのみ対応であること（ブロック追加・Meta入稿なし）を明記する（BUG-124）
     const lines = [
@@ -956,14 +1001,27 @@ export async function runThumbBackfill(
       );
     if (needGasRedeploy)
       lines.push("⚠️ 一部タブは入稿GASが古くスキャンできませんでした（要GAS再デプロイ。最新目印: listCrMissingThumbs）");
+    // 時間予算で打ち切った分（BUG-137）。黙って落とすと「一部だけ入った」ように見えるので必ず出す
+    if (pending.length)
+      lines.push(
+        `⏭ 時間切れで未処理: ${pending.slice(0, 8).join(" / ")}${pending.length > 8 ? ` 他${pending.length - 8}件` : ""}\n` +
+          `　同じ \`/cr-in ${req.crKey || "<cr名>"} サムネ\` をもう一度実行すると残りが入ります（挿入済みは上書きなので安全です）`
+      );
     const posted = await postPublic(env, req.channelId, lines.join("\n"));
     if (!posted) await postProgress(env, slackCtx, lines.join("\n"), true);
     await updateRunLog(env.NOTION_TOKEN, runLogPageId, {
-      status: failed.length ? "一部失敗" : "完了",
+      status: failed.length || pending.length ? "一部失敗" : "完了",
       sheetResult: failed.length ? "失敗" : "成功",
-      detail: { inserted: done, failed: failed.slice(0, 20), remaining },
+      detail: { inserted: done, failed: failed.slice(0, 20), remaining, pending: pending.slice(0, 20) },
     });
   } catch (e: any) {
+    // 実行ログを必ず終端させる（BUG-137）。ここが抜けていたため、例外で落ちた実行が
+    // すべて「実行中・詳細JSON空」のまま残り、翌日自動チェックくんからも追えなかった。
+    await updateRunLog(env.NOTION_TOKEN, runLogPageId, {
+      status: "失敗",
+      sheetResult: "失敗",
+      detail: { failedStep: "thumb_backfill", lastError: String(e?.message || e).slice(0, 500) },
+    });
     await postProgress(env, slackCtx, `❌ サムネ挿入に失敗しました: ${e.message}`, true);
   }
 }
