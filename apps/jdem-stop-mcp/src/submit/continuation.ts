@@ -14,7 +14,7 @@
 //   notion         … CRページのステータス更新＋実行ログ
 //   done           … 結果サマリーをSlackへ
 
-import { ContinuationState, SubmitEnv, SubmitPlan, MAX_READY_ATTEMPTS, UPLOAD_CHUNK_BYTES, UPLOAD_CHUNKS_PER_HOP } from "./types";
+import { ContinuationState, SubmitEnv, SubmitPlan, MAX_READY_ATTEMPTS, UPLOAD_CHUNK_BYTES, UPLOAD_CHUNKS_PER_HOP, GasTarget } from "./types";
 import { driveAccessToken } from "./drive";
 import {
   startVideoUpload,
@@ -46,7 +46,7 @@ export async function startExecution(
   ctx: ExecutionContext,
   metaToken: string,
   projectAccountId: string,
-  gasTargets: { spreadsheetId: string; sheetName?: string }[]
+  gasTargets: GasTarget[]
 ): Promise<void> {
   // 集計表だけモード（BUG-110）はMetaステップ(upload/create_ads/activate)を全てスキップしsheetから開始
   const state: ContinuationState = {
@@ -92,7 +92,7 @@ export async function handleContinue(
   env: SubmitEnv,
   ctx: ExecutionContext,
   resolveMetaToken: (project: string) => string,
-  resolveGasTargets: (project: string) => { spreadsheetId: string; sheetName?: string }[],
+  resolveGasTargets: (project: string) => GasTarget[],
   resolveAccountId: (project: string) => string
 ): Promise<Response> {
   const body = await request.text();
@@ -120,7 +120,7 @@ async function runHop(
   env: SubmitEnv,
   metaToken: string,
   accountId: string,
-  gasTargets: { spreadsheetId: string; sheetName?: string }[]
+  gasTargets: GasTarget[]
 ): Promise<void> {
   const { plan } = state;
   try {
@@ -660,7 +660,7 @@ async function insertMetaThumbnails(
   env: SubmitEnv,
   plan: SubmitPlan,
   metaToken: string,
-  gasTargets: { spreadsheetId: string; sheetName?: string }[]
+  gasTargets: GasTarget[]
 ): Promise<{ inserted: number; failures: string[] }> {
   const parentId = sheetParentId(plan);
   const childVids = plan.videos.filter((v) => /cr\d+_\d{2}/i.test(v.sheetId) && v.videoId);
@@ -749,7 +749,21 @@ const THUMB_SCAN_MAX_PASSES = 6;
 const THUMB_RUN_BUDGET_MS = 45_000;
 
 /** サムネ挿入対象（集計表タブ × 集計表ID） */
-type ThumbJob = { target: { spreadsheetId: string; sheetName?: string }; id: string };
+type ThumbJob = { target: GasTarget; id: string };
+
+/**
+ * そのタブのサムネ取得元にしてよいMeta広告だけに絞る（BUG-137）。
+ * bla は1つの広告アカウントに face(blaf_) / body(blab_) 両方の広告があり、部位ごとに
+ * cr番号が独立採番されるため、cr番号だけで検索すると別部位の同番号crを掴んでしまう。
+ * プレフィックス直後に英数字が続かないことを要求するので "blaf" が "blab" に一致することはない。
+ * adNamePrefix 未設定のタブ（bla以外の全案件）は従来どおり全件が対象。
+ */
+function adsForTarget(ads: CrAdVideo[], target: GasTarget): CrAdVideo[] {
+  const prefix = target.adNamePrefix?.toLowerCase();
+  if (!prefix) return ads;
+  const re = new RegExp(`(?:^|[^0-9a-z])${prefix}(?![0-9a-z])`, "i");
+  return ads.filter((a) => re.test(a.name));
+}
 
 /** 未処理として次回送りにしたジョブの表示名（タブ名付き） */
 function thumbJobLabel(j: ThumbJob): string {
@@ -799,13 +813,19 @@ async function insertThumbsFromMetaAds(
         pending.push(thumbJobLabel(j));
         continue;
       }
+      // このタブに対応する部位の広告だけを候補にする（BUG-137: blaのface/body取り違え防止）
+      const pool = adsForTarget(ads, j.target);
+      if (pool.length === 0) {
+        failed.push(`${j.id}(${j.target.adNamePrefix}_ の広告がMetaに見つかりません)`);
+        continue;
+      }
       // 子(_NN)はパターン一致、親は_01優先（「親は01」運用）、無ければ単独広告の動画を使う
       const nn = j.id.match(/cr\d+_(\d{2})/i)?.[1];
       const ad = nn
-        ? ads.find((a) => a.pattern === nn && a.videoId)
-        : ads.find((a) => a.pattern === "01" && a.videoId) ||
-          ads.find((a) => !a.pattern && a.videoId) ||
-          ads.find((a) => a.videoId);
+        ? pool.find((a) => a.pattern === nn && a.videoId)
+        : pool.find((a) => a.pattern === "01" && a.videoId) ||
+          pool.find((a) => !a.pattern && a.videoId) ||
+          pool.find((a) => a.videoId);
       if (!ad?.videoId) {
         failed.push(`${j.id}(Metaに対応する動画広告なし)`);
         continue;
@@ -851,7 +871,7 @@ export async function runThumbBackfill(
   env: SubmitEnv,
   project: { name: string; metaAdAccountId?: string },
   metaToken: string,
-  gasTargets: { spreadsheetId: string; sheetName?: string }[],
+  gasTargets: GasTarget[],
   req: { crKey?: string; channelId: string; userId: string; userName?: string; responseUrl: string }
 ): Promise<void> {
   const slackCtx = { channelId: req.channelId, userId: req.userId, responseUrl: req.responseUrl } as any;
@@ -886,6 +906,8 @@ export async function runThumbBackfill(
     const scanPartial: string[] = [];
     /** サムネ表示セル（結合セル）が無く判定対象外になったブロック（タブ別の件数） */
     const scanSkipped: string[] = [];
+    /** 該当部位のMeta広告が無くて対象外にしたタブ（BUG-137: blaのface/body） */
+    const targetSkipped: string[] = [];
     if (req.crKey) {
       // 指定crモード: Meta広告から実在パターンを列挙し、親+子を全タブへ上書き挿入（冪等）
       const ads = await findCrAdsWithVideos(accountId, metaToken, req.crKey);
@@ -893,8 +915,22 @@ export async function runThumbBackfill(
         throw new Error(
           `Meta広告アカウントに「${req.crKey}」の広告が見つかりません（集計表のみ運用のcrはMetaにサムネ取得元が無いため対象外です）`
         );
-      const ids = [req.crKey, ...[...new Set(ads.filter((a) => a.pattern).map((a) => `${req.crKey}_${a.pattern}`))].sort()];
-      for (const t of gasTargets) for (const id of ids) jobs.push({ target: t, id });
+      // パターンの列挙はタブごとに行う（BUG-137）。blaはface/bodyでcr番号が独立採番なので、
+      // 全広告からまとめてパターンを作ると別部位のパターン数が混ざり、無い子への挿入を
+      // 試みて無駄なGAS往復（1件最大25秒）を積む。該当部位の広告が無いタブはスキップする。
+      for (const t of gasTargets) {
+        const pool = adsForTarget(ads, t);
+        if (pool.length === 0) {
+          targetSkipped.push(`${t.sheetName || t.spreadsheetId}（${t.adNamePrefix}_ の広告なし）`);
+          continue;
+        }
+        const ids = [req.crKey, ...[...new Set(pool.filter((a) => a.pattern).map((a) => `${req.crKey}_${a.pattern}`))].sort()];
+        for (const id of ids) jobs.push({ target: t, id });
+      }
+      if (jobs.length === 0)
+        throw new Error(
+          `「${req.crKey}」に対応するMeta広告が、どの集計表タブの部位にも見つかりませんでした（${targetSkipped.join(" / ")}）`
+        );
     } else {
       // 一括モード: GASでサムネ未挿入crを列挙（新action。古いGASデプロイでは「不明なaction」）。
       // 巨大シートはGAS側が時間内に走査しきれず nextStart を返すため、その分は今回の対象から
@@ -1001,6 +1037,9 @@ export async function runThumbBackfill(
       );
     if (needGasRedeploy)
       lines.push("⚠️ 一部タブは入稿GASが古くスキャンできませんでした（要GAS再デプロイ。最新目印: listCrMissingThumbs）");
+    // 部位違いで対象外にしたタブ（BUG-137）。「なぜ片方のタブに入らないのか」を明示する
+    if (targetSkipped.length)
+      lines.push(`ℹ️ 対象外のタブ: ${targetSkipped.join(" / ")}（cr番号が部位ごとに独立採番のため）`);
     // 時間予算で打ち切った分（BUG-137）。黙って落とすと「一部だけ入った」ように見えるので必ず出す
     if (pending.length)
       lines.push(
@@ -1012,7 +1051,7 @@ export async function runThumbBackfill(
     await updateRunLog(env.NOTION_TOKEN, runLogPageId, {
       status: failed.length || pending.length ? "一部失敗" : "完了",
       sheetResult: failed.length ? "失敗" : "成功",
-      detail: { inserted: done, failed: failed.slice(0, 20), remaining, pending: pending.slice(0, 20) },
+      detail: { inserted: done, failed: failed.slice(0, 20), remaining, pending: pending.slice(0, 20), targetSkipped },
     });
   } catch (e: any) {
     // 実行ログを必ず終端させる（BUG-137）。ここが抜けていたため、例外で落ちた実行が
@@ -1046,7 +1085,7 @@ function abToBase64(buf: ArrayBuffer): string {
 async function triggerThumbnailWorkflow(
   env: SubmitEnv,
   plan: SubmitPlan,
-  gasTargets: { spreadsheetId: string; sheetName?: string }[]
+  gasTargets: GasTarget[]
 ): Promise<"ok" | "no-token" | "skip"> {
   if (!env.GITHUB_DISPATCH_TOKEN) return "no-token";
   const parentId = sheetParentId(plan);
