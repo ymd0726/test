@@ -7,7 +7,7 @@
 // 確認ボタンの value には「引数＋選択した広告セット」だけを持たせ、
 // 承認時に再度 resolve してから実行する（Slackのvalue 2000字制限対策＋常に最新状態で実行）。
 
-import { SubmitProject, SubmitEnv } from "./types";
+import { SubmitProject, SubmitEnv, GasTarget } from "./types";
 import { resolveSubmit, CrPageAmbiguousError, parseThumbRequest } from "./resolve";
 import { startExecution, postProgress, runThumbBackfill } from "./continuation";
 import { setEntityStatus } from "./meta";
@@ -383,7 +383,7 @@ export function handleCrInInteraction(
   env: SubmitEnv,
   ctx: ExecutionContext,
   metaTokenFor: (p: SubmitProject) => string,
-  gasTargetsFor: (p: SubmitProject) => { spreadsheetId: string; sheetName?: string }[]
+  gasTargetsFor: (p: SubmitProject) => GasTarget[]
 ): Response {
   const action = interaction.actions?.[0];
   const responseUrl = interaction.response_url;
@@ -505,7 +505,7 @@ async function confirmAndRun(
   env: SubmitEnv,
   ctx: ExecutionContext,
   metaToken: string,
-  gasTargets: { spreadsheetId: string; sheetName?: string }[],
+  gasTargets: GasTarget[],
   /** 複数選択メニューで選ばれた広告セットID（v.sel のときのみ使う。BUG-135） */
   pickedAdsetIds: string[] = []
 ): Promise<void> {

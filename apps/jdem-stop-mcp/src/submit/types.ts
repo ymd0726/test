@@ -3,9 +3,27 @@
 // 既存エントリ（name / channelId / sheets[] / metaAdAccountId? / metaTokenSecret?）に
 // 入稿用の追加フィールドを足したもの。
 
+/**
+ * 集計表の書き込み先（GAS呼び出し1単位）。入稿・サムネ挿入の各フローで共通に使う。
+ */
+export interface GasTarget {
+  spreadsheetId: string;
+  sheetName?: string;
+  /**
+   * このタブに対応するMeta広告名のプレフィックス（例 bla: meta_face→"blaf" / meta_body→"blab"）。
+   * blaは1つの広告アカウントに face/body 両方の広告が入っていて、かつ部位ごとにcr番号が
+   * 独立採番されるため、cr番号だけでMeta広告を検索すると別部位の同番号crを掴む
+   * （faceのcr19のサムネがbodyのcr19に入る）。設定時はこのプレフィックスに一致する広告だけを
+   * サムネ取得元にし、一致が無いタブはスキップする（BUG-137）。
+   */
+  adNamePrefix?: string;
+}
+
 export interface ProjectSheet {
   spreadsheetId: string;
   sheetName?: string;
+  /** Meta広告名のプレフィックス（GasTarget.adNamePrefix と同じ。bla の face/body 判別用） */
+  adNamePrefix?: string;
   /**
    * sheet単位のDriveフォルダ上書き（例: bla の face/body で完成素材フォルダが分かれる案件）。
    * 設定したsheetが1つ以上あるプロジェクトは、resolve.ts が各フォルダでprefix検索し、

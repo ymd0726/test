@@ -73,6 +73,9 @@ interface SheetTarget {
   // cr入稿くん: sheet単位のDriveフォルダ上書き（例: bla の face/body）
   driveFolderId?: string;
   driveFolderName?: string;
+  // cr入稿くん: このタブに対応するMeta広告名のプレフィックス（例 bla: blaf=face / blab=body）。
+  // 部位ごとにcr番号が独立採番される案件で、別部位の同番号crを掴まないようにする（BUG-137）
+  adNamePrefix?: string;
 }
 interface Project {
   name: string;
@@ -149,9 +152,12 @@ const PROJECTS: Project[] = [
     driveFolderId: "1x7msuyaB8oaGkht3mKMYI3rE4j5g-zzr", crdbDataSourceId: CRDB_DATA_SOURCE_ID },
   { name: "bla",  channelId: "C09FYGDAFEX", metaAdAccountId: "1612534536164262", sheets: [
       // face/bodyでcr番号が独立採番のためDriveフォルダも分かれる（CLDB確認済）。
-      // resolve.tsがsheet単位のdriveFolderIdで両方検索し、一致した方だけを採用する
-      { spreadsheetId: "1s7wI_d9CFRv0pGeNJXVoSg1Ux6VwKznpkf10qTjVgRw", sheetName: "meta_face", driveFolderId: "1W9eVd0Goj9GnZTpAogU7stWi-uBJU4yE" },
-      { spreadsheetId: "1s7wI_d9CFRv0pGeNJXVoSg1Ux6VwKznpkf10qTjVgRw", sheetName: "meta_body", driveFolderId: "1HowqtJktuljTF37MWrOukhXBOtXlZjMV" },
+      // resolve.tsがsheet単位のdriveFolderIdで両方検索し、一致した方だけを採用する。
+      // adNamePrefix: Meta広告名の末尾1文字で部位を判別する運用（blaf=フェイシャル / blab=ボディ。
+      // 2026-08-05 山田確認）。1つの広告アカウントに両部位が入っていて cr番号が独立採番のため、
+      // これが無いと faceのcr19のサムネが bodyのcr19 に入る（BUG-137）
+      { spreadsheetId: "1s7wI_d9CFRv0pGeNJXVoSg1Ux6VwKznpkf10qTjVgRw", sheetName: "meta_face", driveFolderId: "1W9eVd0Goj9GnZTpAogU7stWi-uBJU4yE", adNamePrefix: "blaf" },
+      { spreadsheetId: "1s7wI_d9CFRv0pGeNJXVoSg1Ux6VwKznpkf10qTjVgRw", sheetName: "meta_body", driveFolderId: "1HowqtJktuljTF37MWrOukhXBOtXlZjMV", adNamePrefix: "blab" },
     ],
     crdbDataSourceId: CRDB_DATA_SOURCE_ID },
   { name: "jdek", channelId: "C092WQSSPUL", metaAdAccountId: "1533513563939156", sheets: [ // #z-n22_jde_all（両訴求 自動判定）
