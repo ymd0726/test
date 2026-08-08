@@ -215,6 +215,12 @@ const PROJECTS: Project[] = [
   // ── n10_fp（フローズンフィリップ）2026-07-07 新規登録 ──
   { name: "fp",   channelId: "C068ESLAU03", sheets: [{ spreadsheetId: "145RGJ9yeCnR8vJexXVyO_LsDTMYVQPBehYkyAim9be8", sheetName: "meta_total" }],
     metaAdAccountId: "767158244897727", driveFolderId: "16GyZta2Li0U74zIHrQuMn59o75anNrA9", crdbDataSourceId: CRDB_DATA_SOURCE_ID }, // cr44/cr45/cr46で稼働確認済
+  // ── n42_sdb（サロンドボヌール）2026-08-07 BUG-138で新規登録 ──
+  // Meta広告アカウントは「n42_sdb」(1404743574275227, 株式会社リード既定BM)をads_get_ad_accountsで実測確定。
+  // 集計表・タブ名・cr倉庫DriveはCLDB「n42_sdb_サロンドボヌール」より抽出。
+  { name: "sdb",  channelId: "C0B36FX0G5U", sheets: [{ spreadsheetId: "1vW9WSgkaeoNl57tNRnWVry5o5FI39I8q9wtAztATzCA", sheetName: "meta_total" }],
+    metaAdAccountId: "1404743574275227", driveFolderId: "1uCVBkDobUIFI2dq6Qmbc9jYM_LbVjBqA",
+    cldbPageId: "34a35c2adb568050b145ef5af082a071", crdbDataSourceId: CRDB_DATA_SOURCE_ID },
 ];
 
 // cr名がどの集計対象(タブ/スプレッド)にあるかを判定して返す（複数対象案件のルーティング）
