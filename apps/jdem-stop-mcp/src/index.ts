@@ -170,7 +170,12 @@ const PROJECTS: Project[] = [
   // ── 株式会社リードBM（2026-07-07 Meta Ads MCPで広告名実測してアカウントID確定）──
   { name: "bbt",  channelId: "C0B3J7U8Q5N", sheets: [{ spreadsheetId: "1IoFvL9ZmbhoNRlFl_rvza8VwC0_bA1mJAT5z98-gGf8" }],
     metaAdAccountId: "1616783749463582", crdbDataSourceId: CRDB_DATA_SOURCE_ID }, // bbt_cr05_...で稼働確認済。Drive倉庫はCLDB未登録のため要登録
-  { name: "lcl",  channelId: "C08SNLK4CMP", sheets: [{ spreadsheetId: "12WYKgq0i53_ZZXlO7rLZ5zWGLzN7fbPZrGGfeB9kIT0" }],
+  // BUG-139: 集計表が n26_lcl/n44_rjf 共有スプレッドシートで、既定の"meta_total"タブは
+  // 集計サマリのみ(cr-idブロック0個)。実際のcr別ブロックは"meta_body_n26_lcl"タブ側にある
+  // (2026-08-08 構造ダンプでcr13/cr15/cr20/cr22等の実在を確認)。sheetName未指定だとGAS側
+  // resolveSheet()が既定のmeta_totalを掴んでしまい、Meta側停止は成功するのに集計表側は
+  // 常に「クリエイティブが見つかりません」になっていた(pom/rof/rob/fpと同型の原因)。
+  { name: "lcl",  channelId: "C08SNLK4CMP", sheets: [{ spreadsheetId: "12WYKgq0i53_ZZXlO7rLZ5zWGLzN7fbPZrGGfeB9kIT0", sheetName: "meta_body_n26_lcl" }],
     driveFolderId: "1K7oUiBfIYZQozePFO_g3h0z8hfeOUy8I", metaAdAccountId: "2261332077579401", crdbDataSourceId: CRDB_DATA_SOURCE_ID }, // lcl_cr24_...で稼働確認済
   { name: "aty",  channelId: "C07MTDU23A9", sheets: [{ spreadsheetId: "1Z3OIaJQgr2Nd8ElN0dB_lJ2a8Cls_J9756zaeGoJu9U" }],
     driveFolderId: "1dHweykRQzMHD-tYNZaDTVebvFACbZvdi", metaAdAccountId: "780374144048761", crdbDataSourceId: CRDB_DATA_SOURCE_ID }, // aty_cr07_...で稼働確認済
