@@ -328,6 +328,22 @@ async function fetchJsonTimeout(url: string, ms: number): Promise<any> {
   }
 }
 
+// タイムアウト付き fetch（ハング防止・レスポンスは呼び出し側で読む）。
+// BUG-141: notifySlack/logToNotion/postResponse は元々このガードが無く、Slack/Notion側が
+// 応答を返さないまま固まると fetch の await が永遠に解決せず、後続の postResponse（完了通知）や
+// updateRunLog（実行ログの「実行中」解除）まで一切到達しなかった（=呼び出し元のtry/catchも無力。
+// 何も throw されないため）。ctx.waitUntil() 全体がCloudflare側のタイムアウトで強制終了されるまで
+// Slackの「⏳ 停止実行中…」が置き換わらず「途中でSlackが止まっていました」という見え方になっていた。
+async function fetchTimeout(url: string, init: RequestInit, ms: number): Promise<Response> {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), ms);
+  try {
+    return await fetch(url, { ...init, signal: ctl.signal });
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 async function metaFindAds(token: string, adAccountId: string, creative: string): Promise<MetaAd[]> {
   // ① cr番号だけ(例 cr60_11_01→cr60)で軽く検索（id/name/statusのみ＝速い・重くならない）。
   //    MetaのCONTAINは下線複数の長い文字列で0件を返す癖があるため番号で広く取る。
@@ -547,21 +563,29 @@ async function notifySlack(env: Env, channelId: string, text: string): Promise<{
   if (!env.SLACK_BOT_TOKEN || !channelId) return { ok: false, error: "no token/channel" };
   try {
     const post = async () => {
-      const res = await fetch("https://slack.com/api/chat.postMessage", {
-        method: "POST",
-        headers: { "Content-Type": "application/json; charset=utf-8", Authorization: `Bearer ${env.SLACK_BOT_TOKEN}` },
-        body: JSON.stringify({ channel: channelId, text }),
-      });
+      const res = await fetchTimeout(
+        "https://slack.com/api/chat.postMessage",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json; charset=utf-8", Authorization: `Bearer ${env.SLACK_BOT_TOKEN}` },
+          body: JSON.stringify({ channel: channelId, text }),
+        },
+        15000,
+      );
       return (await res.json()) as any;
     };
     let data = await post();
     if (!data.ok && data.error === "not_in_channel") {
       // Bot未参加チャンネル（BUG-29: rcl）→ publicなら参加を試みて1回だけ再送
-      const j = await fetch("https://slack.com/api/conversations.join", {
-        method: "POST",
-        headers: { "Content-Type": "application/json; charset=utf-8", Authorization: `Bearer ${env.SLACK_BOT_TOKEN}` },
-        body: JSON.stringify({ channel: channelId }),
-      });
+      const j = await fetchTimeout(
+        "https://slack.com/api/conversations.join",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json; charset=utf-8", Authorization: `Bearer ${env.SLACK_BOT_TOKEN}` },
+          body: JSON.stringify({ channel: channelId }),
+        },
+        15000,
+      );
       const jd: any = await j.json();
       if (jd.ok) data = await post();
     }
@@ -581,23 +605,27 @@ interface LogEntry { creative: string; user: string; userId: string; action: "�
 async function logToNotion(env: Env, e: LogEntry): Promise<void> {
   if (!env.NOTION_TOKEN) return;
   try {
-    await fetch("https://api.notion.com/v1/pages", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${env.NOTION_TOKEN}`, "Notion-Version": "2022-06-28", "Content-Type": "application/json" },
-      body: JSON.stringify({
-        parent: { database_id: NOTION_LOG_DB_ID },
-        properties: {
-          "クリエイティブ": { title: [{ text: { content: e.creative } }] },
-          "実行者": { rich_text: [{ text: { content: e.user } }] },
-          "実行者ID": { rich_text: [{ text: { content: e.userId } }] },
-          "アクション": { select: { name: e.action } },
-          "案件": { select: { name: e.project } },
-          "経路": { select: { name: e.route } },
-          "Meta件数": { number: e.metaCount },
-          "集計表結果": { select: { name: e.sheetResult } },
-        },
-      }),
-    });
+    await fetchTimeout(
+      "https://api.notion.com/v1/pages",
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${env.NOTION_TOKEN}`, "Notion-Version": "2022-06-28", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          parent: { database_id: NOTION_LOG_DB_ID },
+          properties: {
+            "クリエイティブ": { title: [{ text: { content: e.creative } }] },
+            "実行者": { rich_text: [{ text: { content: e.user } }] },
+            "実行者ID": { rich_text: [{ text: { content: e.userId } }] },
+            "アクション": { select: { name: e.action } },
+            "案件": { select: { name: e.project } },
+            "経路": { select: { name: e.route } },
+            "Meta件数": { number: e.metaCount },
+            "集計表結果": { select: { name: e.sheetResult } },
+          },
+        }),
+      },
+      15000,
+    );
   } catch {
     /* ログ失敗は本処理を止めない */
   }
@@ -1202,7 +1230,11 @@ function handleSlackCommand(env: Env, ctx: ExecutionContext, bodyText: string, s
 
 async function postResponse(url: string, body: unknown): Promise<void> {
   if (!url) return;
-  await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  try {
+    await fetchTimeout(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }, 15000);
+  } catch {
+    /* response_urlへの通知失敗は本処理を止めない（呼び出し元でnotifySlack等の後続処理を続行させるため） */
+  }
 }
 
 function handleSlackInteract(env: Env, ctx: ExecutionContext, bodyText: string, senv: SubmitEnv): Response {
