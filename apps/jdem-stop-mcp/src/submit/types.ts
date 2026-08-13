@@ -187,6 +187,12 @@ export interface ContinuationState {
     endOffset: number;
     fileSize: number;
   };
+  /**
+   * 実行ログへ「現在のステップ」を最後に書いたときのキー（`step:index`）。BUG-143。
+   * 同じステップで何ホップも回る間（大きな動画のアップロード等）に毎回Notionを
+   * 更新しないための重複防止用。
+   */
+  loggedStep?: string;
 }
 
 export interface SubmitEnv {

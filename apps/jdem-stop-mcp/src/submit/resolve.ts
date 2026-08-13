@@ -354,6 +354,18 @@ function sheetIdFor(fileBaseName: string): string {
  * サムネ系トークンが無ければ null（通常の入稿フロー）。
  * cr名なしの `/cr-in サムネ` は誤爆防止で明示エラーにする（一括と単発の取り違え防止）。
  */
+/**
+ * 進捗確認モード（BUG-143）。`/cr-in 進捗` で直近の実行状況を表示する。
+ * Slackの進捗はephemeralで流れてしまう＆private未招待だと出ないため、
+ * いつでも実行ログDBから「今どこまで進んだか」を引けるようにする。
+ */
+const STATUS_RE = /^(進捗|進捗確認|状況|ステータス|status|progress)$/i;
+
+export function isStatusRequest(text: string): boolean {
+  const tokens = text.trim().split(/[\s,、]+/).filter(Boolean);
+  return tokens.length > 0 && tokens.every((t) => STATUS_RE.test(t));
+}
+
 export type ThumbRequest = { mode: "one"; crKey: string } | { mode: "all" };
 const THUMB_ONE_RE = /^(サムネ|サムネイル|サムネのみ|thumb|thumbnail)$/i;
 const THUMB_ALL_RE = /^(サムネ一括|サムネ全部|サムネクロール|thumb-all|thumball)$/i;

@@ -220,6 +220,67 @@ export async function queryRunsForDate(
   return out;
 }
 
+/** 進捗確認（BUG-143）で表示する1件分。ページ再取得を避けるためqueryの結果から直接組み立てる */
+export interface RecentRun {
+  pageId: string;
+  url: string;
+  crName: string;
+  action: string;
+  status: string;
+  metaResult: string;
+  sheetResult: string;
+  notionResult: string;
+  userName: string;
+  createdIso: string;
+  detail: Record<string, any>;
+}
+
+/**
+ * 案件の直近の実行ログを新しい順に取得する（BUG-143 進捗確認用）。
+ * query応答に含まれるプロパティをその場でパースするので、件数ぶんのページ取得は不要。
+ */
+export async function queryRecentRunsForProject(
+  token: string,
+  project: string,
+  limit = 5
+): Promise<RecentRun[]> {
+  const dbId = await ensureRunlogDb(token);
+  if (!dbId) throw new Error("実行ログDBが見つかりません（TOOL-40ページへのintegration共有を確認）");
+  const res = await notionApi(token, `databases/${dbId}/query`, "POST", {
+    filter: { property: "案件", select: { equals: project } },
+    sorts: [{ timestamp: "created_time", direction: "descending" }],
+    page_size: Math.max(1, Math.min(limit, 20)),
+  });
+  return (res.results || []).map((p: any) => {
+    const props = p.properties || {};
+    const text = (name: string): string => {
+      const arr = props[name]?.rich_text || props[name]?.title || [];
+      return Array.isArray(arr) ? arr.map((t: any) => t.plain_text || "").join("") : "";
+    };
+    const sel = (name: string): string => props[name]?.select?.name || "";
+    let detail: Record<string, any> = {};
+    try {
+      const v = JSON.parse(text("詳細JSON"));
+      if (v && typeof v === "object") detail = v;
+    } catch {
+      /* 詳細JSONが壊れていても進捗表示は続行する */
+    }
+    return {
+      pageId: p.id,
+      url: p.url || "",
+      crName: text("cr名"),
+      action: sel("アクション"),
+      status: sel("ステータス"),
+      metaResult: sel("結果_Meta"),
+      sheetResult: sel("結果_集計表"),
+      notionResult: sel("結果_Notion"),
+      userName: text("実行者名"),
+      createdIso: p.created_time || "",
+      detail,
+    };
+  });
+}
+
 /** ページ1件を取得してパース */
 export async function fetchRunLog(token: string, pageId: string): Promise<import("./types").RunLogRecord> {
   const page = await notionApi(token, `pages/${pageId}`, "GET");

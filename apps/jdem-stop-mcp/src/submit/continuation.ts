@@ -35,7 +35,7 @@ import {
 } from "./meta";
 import { callSheetSubmit, callSheetCheck, callSheetThumbnail, callSheetThumbList } from "./gasClient";
 import { markSubmitted } from "./notion";
-import { createRunLog, updateRunLog } from "../check/runlog";
+import { createRunLog, updateRunLog, queryRecentRunsForProject, RecentRun } from "../check/runlog";
 
 export const CONTINUE_PATH = "/internal/cr-in/continue";
 
@@ -124,6 +124,23 @@ async function runHop(
 ): Promise<void> {
   const { plan } = state;
   try {
+    // 現在のステップを実行ログへ記録する（BUG-143）。Slackの進捗はephemeralで流れて
+    // しまう＆private未招待だと出ないため、あとから `/cr-in 進捗` で「今どこか」を
+    // 確認できるようにする。書き込みはステップ or 動画indexが変わった時だけ（BUG-119で
+    // アップロードが多ホップに分割されたため、毎ホップ書くとNotion更新が過剰になる）。
+    const stepKey = `${state.step}:${state.index}`;
+    if (state.loggedStep !== stepKey) {
+      state.loggedStep = stepKey;
+      await updateRunLog(env.NOTION_TOKEN, plan.runLogPageId, {
+        detail: {
+          ...((plan as any)._runDetail || {}),
+          step: state.step,
+          videoIndex: state.index,
+          videoTotal: plan.videos.length,
+          stepAt: new Date().toISOString(),
+        },
+      });
+    }
     switch (state.step) {
       case "upload": {
         const v = plan.videos[state.index];
@@ -730,6 +747,104 @@ async function fetchThumbBase64(
 
 // 1回のサムネ後追い実行で処理する最大件数（Worker実行上限対策）。挿入済みは次回スキャンの
 // missingから消えるため、再実行すれば続きから自然に進む（チェーン不要の冪等設計）。
+// ---- 進捗確認（BUG-143）----
+
+/** ContinuationState.step → 人が読める進捗名 */
+const STEP_LABELS: Record<string, string> = {
+  upload: "動画をアップロード中",
+  wait_ready: "動画の処理待ち（Meta側）",
+  create_ads: "広告を作成中",
+  activate: "広告をONにしています",
+  sheet: "集計表へ展開中",
+  sheet_verify: "集計表の反映を確認中",
+  notion: "Notionを更新中",
+  done: "仕上げ処理中",
+};
+
+/** 経過時間を「◯分前」の形にする */
+function sinceText(iso: string): string {
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return "";
+  const min = Math.max(0, Math.floor((Date.now() - t) / 60000));
+  if (min < 1) return "たった今";
+  if (min < 60) return `${min}分前`;
+  const h = Math.floor(min / 60);
+  if (h < 24) return `${h}時間${min % 60}分前`;
+  return `${Math.floor(h / 24)}日前`;
+}
+
+/** 1件ぶんの進捗行を組み立てる */
+function formatRun(r: RecentRun): string {
+  const icon =
+    r.status === "完了" ? "✅" : r.status === "失敗" ? "❌" : r.status === "一部失敗" ? "⚠️" : "🔄";
+  const lines = [`${icon} *${r.crName || "(cr名なし)"}* — ${r.action || "実行"} / ${r.status || "?"}（${sinceText(r.createdIso)}）`];
+  if (r.status === "実行中") {
+    const step = String(r.detail?.step || "");
+    const label = STEP_LABELS[step] || (step ? `${step} 実行中` : "");
+    const vi = Number(r.detail?.videoIndex);
+    const vt = Number(r.detail?.videoTotal);
+    const prog =
+      Number.isFinite(vi) && Number.isFinite(vt) && vt > 0 && (step === "upload" || step === "wait_ready")
+        ? `（${vi + 1}/${vt}本目）`
+        : "";
+    if (label) lines.push(`　ステップ: ${label}${prog}`);
+    // 長時間「実行中」のまま動きが無いものは、途中で落ちた可能性がある（BUG-119の教訓）
+    const stepAt = Date.parse(String(r.detail?.stepAt || r.createdIso));
+    if (Number.isFinite(stepAt) && Date.now() - stepAt > STALLED_RUN_MS)
+      lines.push("　⚠️ しばらく進んでいません。途中で停止した可能性があるので、同じ `/cr-in` を再実行してください（作成済みはスキップされます）");
+  } else {
+    const parts = [
+      r.metaResult ? `Meta:${r.metaResult}` : "",
+      r.sheetResult ? `集計表:${r.sheetResult}` : "",
+      r.notionResult ? `Notion:${r.notionResult}` : "",
+    ].filter(Boolean);
+    if (parts.length) lines.push(`　${parts.join(" / ")}`);
+    const err = String(r.detail?.lastError || "");
+    if (err) lines.push(`　エラー(step=${r.detail?.failedStep || "?"}): ${err.slice(0, 160)}`);
+  }
+  if (r.userName) lines.push(`　実行者: ${r.userName}`);
+  return lines.join("\n");
+}
+
+/** 「実行中」のまま何分動きが無ければ停止疑いとするか */
+const STALLED_RUN_MS = 10 * 60 * 1000;
+
+/**
+ * 直近の実行状況をSlackへ返す（BUG-143）。
+ * Slackの進捗表示はephemeralで流れてしまい、private未招待だと出ないこともあるため、
+ * いつでも「今どこまで進んだか」を実行ログDBから引いて確認できるようにする。
+ */
+export async function runStatusReport(
+  env: SubmitEnv,
+  projectName: string,
+  slackCtx: { channelId: string; userId: string; responseUrl: string },
+  originalText: string
+): Promise<void> {
+  try {
+    const runs = await queryRecentRunsForProject(env.NOTION_TOKEN, projectName, 5);
+    const body = runs.length
+      ? runs.map(formatRun).join("\n\n")
+      : "直近の実行ログがありません（この案件ではまだ実行されていないか、ログ記録に失敗しています）";
+    const blocks: any[] = [
+      { type: "section", text: { type: "mrkdwn", text: `📊 *直近の実行状況（案件: ${projectName}）*\n\n${body}` } },
+      {
+        type: "actions",
+        elements: [
+          {
+            type: "button",
+            text: { type: "plain_text", text: "🔄 最新の状況に更新" },
+            action_id: "crin_status_refresh",
+            value: JSON.stringify({ a: originalText }),
+          },
+        ],
+      },
+    ];
+    await postProgressBlocks(env, slackCtx, blocks, "直近の実行状況");
+  } catch (e: any) {
+    await postProgress(env, slackCtx, `❌ 進捗の取得に失敗しました: ${e.message}`, true);
+  }
+}
+
 const THUMB_BACKFILL_MAX_IDS = 10;
 /**
  * 1回の「サムネ一括」でGASスキャンを継続する最大パス数（BUG-126）。
@@ -1266,6 +1381,45 @@ export async function postProgress(
     });
   } catch {
     // 進捗表示の失敗は本処理を止めない
+  }
+}
+
+/**
+ * blocks付きのephemeral投稿（BUG-143の進捗確認UI用）。postProgressのblocks版で、
+ * ephemeralが使えない場合は response_url にフォールバックする。
+ * 進捗確認はユーザーが明示的に要求したものなので、response_url枠の使用を許可する。
+ */
+export async function postProgressBlocks(
+  env: { SLACK_BOT_TOKEN?: string },
+  to: { channelId?: string; userId?: string; responseUrl: string },
+  blocks: any[],
+  fallbackText: string
+): Promise<void> {
+  if (env.SLACK_BOT_TOKEN && to.channelId && to.userId) {
+    try {
+      const post = () =>
+        fetch("https://slack.com/api/chat.postEphemeral", {
+          method: "POST",
+          headers: { "content-type": "application/json; charset=utf-8", authorization: `Bearer ${env.SLACK_BOT_TOKEN}` },
+          body: JSON.stringify({ channel: to.channelId, user: to.userId, blocks, text: fallbackText }),
+        }).then((r) => r.json() as Promise<any>);
+      let data = await post();
+      if (!data.ok && data.error === "not_in_channel") {
+        if (await joinChannel(env.SLACK_BOT_TOKEN, to.channelId)) data = await post();
+      }
+      if (data.ok) return;
+    } catch {
+      /* fallthrough */
+    }
+  }
+  try {
+    await fetch(to.responseUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ blocks, text: fallbackText, response_type: "ephemeral", replace_original: false }),
+    });
+  } catch {
+    /* 表示失敗は本処理を止めない */
   }
 }
 

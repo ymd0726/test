@@ -8,8 +8,8 @@
 // 承認時に再度 resolve してから実行する（Slackのvalue 2000字制限対策＋常に最新状態で実行）。
 
 import { SubmitProject, SubmitEnv, GasTarget } from "./types";
-import { resolveSubmit, CrPageAmbiguousError, parseThumbRequest } from "./resolve";
-import { startExecution, postProgress, runThumbBackfill } from "./continuation";
+import { resolveSubmit, CrPageAmbiguousError, parseThumbRequest, isStatusRequest } from "./resolve";
+import { startExecution, postProgress, runThumbBackfill, runStatusReport } from "./continuation";
 import { setEntityStatus } from "./meta";
 
 interface SlashPayload {
@@ -32,6 +32,18 @@ export function handleCrInCommand(
   }
   if (project.submitBlocked) {
     return slackEphemeral(`⚠️ この案件は cr入稿くん が未対応です: ${project.submitBlocked}`);
+  }
+  // 進捗確認（BUG-143）: 解決処理を踏まず実行ログDBを引くだけなので先に分岐する
+  if (isStatusRequest(payload.text)) {
+    ctx.waitUntil(
+      runStatusReport(
+        env,
+        project.name,
+        { channelId: payload.channel_id, userId: payload.user_id, responseUrl: payload.response_url },
+        payload.text.trim()
+      )
+    );
+    return slackEphemeral("📊 直近の実行状況を確認中…");
   }
   ctx.waitUntil(resolveAndAsk(payload, project, env, metaTokenFor(project)));
   return slackEphemeral(`🔎 \`${payload.text.trim()}\` の入稿プランを組み立て中…`);
@@ -344,6 +356,15 @@ async function resolveAndAsk(
  * Interactivity（action_id が crin_ で始まるもの）。
  * 既存 /slack/interact は即200ACK＋response_url表示の方式なので、それに合わせる。
  */
+/** ボタンvalueのJSONパース（壊れていてもUIを落とさない）。BUG-143 */
+function safeParse(v: any): any {
+  try {
+    return JSON.parse(String(v || "{}"));
+  } catch {
+    return {};
+  }
+}
+
 /**
  * 広告セットの複数選択（BUG-135）。選択値は state.values[block][action] から読む。
  * ブロックIDは全て "crin_adsets" 始まりに統一し、旧プルダウン方式（crin_adsets_block /
@@ -391,6 +412,28 @@ export function handleCrInInteraction(
 
   if (action.action_id === "crin_cancel") {
     ctx.waitUntil(respond(responseUrl, { text: "キャンセルしました", replace_original: true }));
+    return new Response("", { status: 200 });
+  }
+
+  // 進捗の再取得（BUG-143）。実行ログDBを引き直して最新状況を出し直す
+  if (action.action_id === "crin_status_refresh") {
+    if (!project) {
+      ctx.waitUntil(respond(responseUrl, { text: "案件が特定できません", replace_original: true }));
+      return new Response("", { status: 200 });
+    }
+    const sv = safeParse(action.value) as { a?: string };
+    ctx.waitUntil(
+      runStatusReport(
+        env,
+        project.name,
+        {
+          channelId: interaction.channel?.id || interaction.container?.channel_id || "",
+          userId: interaction.user?.id || "",
+          responseUrl,
+        },
+        sv?.a || "進捗"
+      )
+    );
     return new Response("", { status: 200 });
   }
 
