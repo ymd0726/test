@@ -76,10 +76,8 @@ for (const t of targets) {
     console.log(`   idRow=${oldLay.idRow} cr00候補=[${oldLay.cr00Candidates.map(a1).join(", ")}] excludeZone=${oldLay.excludeZoneStartCol === null ? "-" : a1(oldLay.excludeZoneStartCol)}`);
     console.log(`   旧: left=${fmt(oldLay.left)} right=${fmt(oldLay.right)} 除外レンジ=${rangesText(oldLay.excludedRanges)}`);
     console.log(`   新: left=${fmt(newLay.left)} right=${fmt(newLay.right)} 除外レンジ=${rangesText(newLay.excludedRanges)} 集計内開始=${newLay.mainZoneStartCol === null ? "-" : a1(newLay.mainZoneStartCol)}`);
-    if (changed) {
-      console.log(`   1行目マーカー: ${oldLay.arrowCols.map((c) => `${a1(c)}:${head[0][c]}`).join(" / ")}`);
-      diffs.push({ project: t.project, tab, old: oldLay, next: newLay });
-    }
+    console.log(`   1行目マーカー: ${oldLay.arrowCols.map((c) => `${a1(c)}:${head[0][c]}`).join(" / ") || "なし"}`);
+    if (changed) diffs.push({ project: t.project, tab, old: oldLay, next: newLay });
   }
 }
 
@@ -160,10 +158,12 @@ function layout(head, useArrowBoundary) {
 
 async function resolveTabs(t) {
   if (t.sheetName) return [t.sheetName];
-  const meta = await sheetsApi.spreadsheets.get({
-    spreadsheetId: t.spreadsheetId,
-    fields: "sheets(properties(title,gridProperties(columnCount)))",
-  });
+  const meta = await withTimeoutRetry(`spreadsheets.get ${t.project}`, () =>
+    sheetsApi.spreadsheets.get(
+      { spreadsheetId: t.spreadsheetId, fields: "sheets(properties(title,gridProperties(columnCount)))" },
+      { timeout: REQ_TIMEOUT_MS },
+    ),
+  );
   const names = meta.data.sheets.map((s) => s.properties.title);
   const hits = [];
   for (const name of names) {
@@ -175,12 +175,42 @@ async function resolveTabs(t) {
   return hits;
 }
 
+// Sheets API がまれに応答を返さないまま止まる（実測: 全案件スキャンが1時間経っても終わらない）ため、
+// 1リクエストごとに時間制限を掛け、失敗時は指数バックオフで数回だけ再試行する。
+const REQ_TIMEOUT_MS = 60_000;
+const REQ_MAX_ATTEMPTS = 3;
+
+async function withTimeoutRetry(label, fn) {
+  let lastErr;
+  for (let attempt = 1; attempt <= REQ_MAX_ATTEMPTS; attempt++) {
+    try {
+      return await Promise.race([
+        fn(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error(`timeout ${REQ_TIMEOUT_MS}ms`)), REQ_TIMEOUT_MS)),
+      ]);
+    } catch (e) {
+      lastErr = e;
+      if (attempt < REQ_MAX_ATTEMPTS) {
+        const waitMs = 2000 * attempt;
+        console.log(`   … ${label} 失敗(${attempt}/${REQ_MAX_ATTEMPTS}): ${e.message || e} → ${waitMs}ms後に再試行`);
+        await new Promise((r) => setTimeout(r, waitMs));
+      }
+    }
+  }
+  throw lastErr;
+}
+
 async function readHead(spreadsheetId, tab) {
-  const res = await sheetsApi.spreadsheets.values.get({
-    spreadsheetId,
-    range: `'${tab.replace(/'/g, "''")}'!1:${ID_ROW_SEARCH_MAX}`,
-    majorDimension: "ROWS",
-  });
+  const res = await withTimeoutRetry(`values.get ${tab}`, () =>
+    sheetsApi.spreadsheets.values.get(
+      {
+        spreadsheetId,
+        range: `'${tab.replace(/'/g, "''")}'!1:${ID_ROW_SEARCH_MAX}`,
+        majorDimension: "ROWS",
+      },
+      { timeout: REQ_TIMEOUT_MS },
+    ),
+  );
   const rows = res.data.values || [];
   const width = Math.max(0, ...rows.map((r) => r.length));
   return Array.from({ length: ID_ROW_SEARCH_MAX }, (_, i) => {
