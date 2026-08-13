@@ -147,6 +147,18 @@ function analyzeTab(props, columnGroups, rows) {
   }
   const idRow = idRowIdx >= 0 ? rows[idRowIdx] : [];
 
+  // 1行目のゾーンマーカー（「〜→」で終わるセル）を全部拾う。
+  // GASは1行目のマーカーでゾーン（集計内/集計外/非パターン）を判定しており、
+  // 未知の文言や境界マーカーの欠落があると「非パターンゾーン」が次のマーカーまで
+  // 際限なく広がり、本物のcr00まで除外されて
+  // 「集計内(親)ゾーンの cr00 テンプレが見つかりません」になる（BUG-144）。
+  // どのマーカーがどこにあるかを可視化して切り分けられるようにする。
+  const arrowMarkers = [];
+  for (let c = 0; c < row0.length; c++) {
+    const v = String(row0[c] ?? "").trim();
+    if (v.endsWith("→")) arrowMarkers.push({ col: c, colA1: colToA1(c), text: v });
+  }
+
   // メモ列（row0 が「メモ」）＝各ブロックの末尾
   const memoCols = [];
   for (let c = 0; c < row0.length; c++) {
@@ -184,6 +196,7 @@ function analyzeTab(props, columnGroups, rows) {
     usedHeaderCols: colCount,
     markerCol,
     markerColA1: markerCol >= 0 ? colToA1(markerCol) : null,
+    arrowMarkers,
     idRow: idRowIdx + 1, // 1-indexed
     blockCount: blocks.length,
     memoColCount: memoCols.length,
@@ -210,6 +223,12 @@ function printTab(t) {
     console.log(`    * ${b.zone} cols ${b.startCol}-${b.endCol} (${b.startA1}:${b.endA1}) 幅${b.width} 列`);
   }
   console.log(`- 列グループ化: ${t.columnGroups.length}個`);
+  if (t.arrowMarkers?.length) {
+    console.log(`- 1行目のゾーンマーカー（${t.arrowMarkers.length}個）:`);
+    for (const m of t.arrowMarkers) console.log(`    * ${m.colA1}(${m.col}) = ${m.text}`);
+  } else {
+    console.log("- 1行目のゾーンマーカー: なし");
+  }
 }
 
 // GAS submitThumbTargetCell_ と同じ判定（cr名より右・ブロック列範囲内で最大面積の結合セル）。
