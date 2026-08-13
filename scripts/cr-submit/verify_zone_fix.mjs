@@ -39,6 +39,24 @@ const PATTERN_START_MARKERS = ["CR別→", "cr→", "CR一覧→"];
 const REQ_TIMEOUT_MS = 10 * 60_000;
 const REQ_MAX_ATTEMPTS = 2;
 
+// sheetName 未指定の案件で「cr00を含むタブ」を毎回全タブ走査すると、巨大シートでは非常に遅い。
+// 2026-08-13の全案件ダンプで判明したタブ名をヒントとして持ち、これがある案件はそのタブだけ読む
+// （--rescan で従来どおりの全タブ走査に戻せる）。※こちらもトップレベルawaitより前に宣言する
+const TAB_HINTS = {
+  "11ZkSchmHPDeaDLo6h3EfyNYW9pHisxw6ErH5KlU7-EI": ["meta_total"],                        // jdem
+  "1SkCSTuegQoZhNd3keYFOEZw2YIWOnbiRAe0rY-g22bY": ["meta_total"],                        // hyd
+  "1sml0bP7vPwkADT820q4Vw9hwmY1vS1VKeYx4HJrmCs4": ["meta_total"],                        // blr
+  "1J1BxvhD7EdfK6iDErRSmwBBXGq56QESnLIAhgfROCB4": ["meta_total"],                        // rcl
+  "1Q7iph8TxZ5C5ouBb3vjvyNMNgLUmP-Uj1stCO9TewFA": ["meta_total"],                        // nrn
+  "1FkJIJOyYykyHV66I4VLpxHXbkVf_bswK5Y9NojDpOeI": ["meta_total", "meta_total_女性 のコピー"], // ssh
+  "1MSJ6sLNWIbZnYy1CbDUNg86KUWq9fX_MlFENKGdGKH8": ["meta_total"],                        // brm
+  "1IoFvL9ZmbhoNRlFl_rvza8VwC0_bA1mJAT5z98-gGf8": ["meta_total"],                        // bbt
+  "12WYKgq0i53_ZZXlO7rLZ5zWGLzN7fbPZrGGfeB9kIT0": ["meta_body_n26_lcl", "meta_face_n44_rjf"], // lcl
+  "1Z3OIaJQgr2Nd8ElN0dB_lJ2a8Cls_J9756zaeGoJu9U": ["meta_total"],                        // aty
+  "1Ug7qBDUUhLutvDLlBbQNiKvIhVbwOhxlOOYm-zPpwG0": ["meta_total"],                        // grm
+  "1fPuoBFCp4LoC8GVr84M9JWMoWwgr6tDzAGZEPEhz-VU": ["meta_total"],                        // fpl
+};
+
 const args = parseArgs(process.argv.slice(2));
 const only = args.only ? String(args.only).split(",").map((s) => s.trim()).filter(Boolean) : null;
 
@@ -162,24 +180,6 @@ function layout(head, useArrowBoundary) {
     right: rightCandidates.length ? rightCandidates[0] : null,
   };
 }
-
-// sheetName 未指定の案件で「cr00を含むタブ」を毎回全タブ走査すると、Sheets API が重い日には
-// 1時間かかっても終わらない。2026-08-13の全案件ダンプで判明したタブ名をヒントとして持ち、
-// これがある案件はそのタブだけ読む（--rescan で従来どおりの全タブ走査に戻せる）。
-const TAB_HINTS = {
-  "11ZkSchmHPDeaDLo6h3EfyNYW9pHisxw6ErH5KlU7-EI": ["meta_total"],                        // jdem
-  "1SkCSTuegQoZhNd3keYFOEZw2YIWOnbiRAe0rY-g22bY": ["meta_total"],                        // hyd
-  "1sml0bP7vPwkADT820q4Vw9hwmY1vS1VKeYx4HJrmCs4": ["meta_total"],                        // blr
-  "1J1BxvhD7EdfK6iDErRSmwBBXGq56QESnLIAhgfROCB4": ["meta_total"],                        // rcl
-  "1Q7iph8TxZ5C5ouBb3vjvyNMNgLUmP-Uj1stCO9TewFA": ["meta_total"],                        // nrn
-  "1FkJIJOyYykyHV66I4VLpxHXbkVf_bswK5Y9NojDpOeI": ["meta_total", "meta_total_女性 のコピー"], // ssh
-  "1MSJ6sLNWIbZnYy1CbDUNg86KUWq9fX_MlFENKGdGKH8": ["meta_total"],                        // brm
-  "1IoFvL9ZmbhoNRlFl_rvza8VwC0_bA1mJAT5z98-gGf8": ["meta_total"],                        // bbt
-  "12WYKgq0i53_ZZXlO7rLZ5zWGLzN7fbPZrGGfeB9kIT0": ["meta_body_n26_lcl", "meta_face_n44_rjf"], // lcl
-  "1Z3OIaJQgr2Nd8ElN0dB_lJ2a8Cls_J9756zaeGoJu9U": ["meta_total"],                        // aty
-  "1Ug7qBDUUhLutvDLlBbQNiKvIhVbwOhxlOOYm-zPpwG0": ["meta_total"],                        // grm
-  "1fPuoBFCp4LoC8GVr84M9JWMoWwgr6tDzAGZEPEhz-VU": ["meta_total"],                        // fpl
-};
 
 async function resolveTabs(t) {
   if (t.sheetName) return [t.sheetName];
