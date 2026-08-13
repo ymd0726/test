@@ -220,7 +220,10 @@ function printTab(t) {
   console.log(`- ブロック数(メモ列数): ${t.blockCount}`);
   console.log(`- cr00テンプレブロック: ${t.cr00Blocks.length}個`);
   for (const b of t.cr00Blocks) {
-    console.log(`    * ${b.zone} cols ${b.startCol}-${b.endCol} (${b.startA1}:${b.endA1}) 幅${b.width} 列`);
+    // GASのゾーン判定は「cr00セルの列」で行うため、ブロック範囲だけでなくセル列も出す（BUG-144）
+    const cell = b.creativeIds.find((x) => x.id.toLowerCase() === TEMPLATE_ID);
+    const cellInfo = cell ? ` / cr00セル=${colToA1(cell.col)}(${cell.col})` : "";
+    console.log(`    * ${b.zone} cols ${b.startCol}-${b.endCol} (${b.startA1}:${b.endA1}) 幅${b.width} 列${cellInfo}`);
   }
   console.log(`- 列グループ化: ${t.columnGroups.length}個`);
   if (t.arrowMarkers?.length) {
