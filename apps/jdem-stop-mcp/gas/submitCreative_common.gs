@@ -454,12 +454,24 @@ function submitLayout_(sheet) {
   var excludeMarkerCols = markers.filter(function (m) { return m.type === 'exclude'; }).map(function (m) { return m.col; });
   var excludeZoneStartCol = excludeMarkerCols.length ? Math.min.apply(null, excludeMarkerCols) : null;
 
+  // 集計内(親)ゾーンの開始マーカー（CR別→ 等）が実在する案件では、そこが集計内ゾーンの
+  // 先頭なので、それより左のcr00は集計内候補にしない（BUG-144の副作用対策）。
+  // 上の“→”境界化だけだと、未知文言の非パターンゾーン（nrn の「新規開業→」「赤字改善→」等）
+  // に紛れたcr00が候補に浮上して誤ったブロックへ挿入されてしまうため。
+  var patternStartCols = markers
+    .filter(function (m) {
+      return m.type === 'patternstart' && (excludeZoneStartCol === null || m.col < excludeZoneStartCol);
+    })
+    .map(function (m) { return m.col; });
+  var mainZoneStartCol = patternStartCols.length ? Math.min.apply(null, patternStartCols) : null;
+
   var cr00Candidates = idCells
     .filter(function (x) { return x.id.toLowerCase() === SUBMIT_TEMPLATE_ID; })
     .map(function (x) { return x.col; })
     .sort(function (a, b) { return a - b; });
 
   var leftCandidates = cr00Candidates.filter(function (col) {
+    if (mainZoneStartCol !== null && col < mainZoneStartCol) return false;
     return (excludeZoneStartCol === null || col < excludeZoneStartCol) && !isExcludedCol(col);
   });
   var rightCandidates = excludeZoneStartCol === null ? [] : cr00Candidates.filter(function (col) {

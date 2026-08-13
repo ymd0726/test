@@ -75,7 +75,7 @@ for (const t of targets) {
     console.log(`\n## ${t.project} / ${tab} : ${tag}`);
     console.log(`   idRow=${oldLay.idRow} cr00候補=[${oldLay.cr00Candidates.map(a1).join(", ")}] excludeZone=${oldLay.excludeZoneStartCol === null ? "-" : a1(oldLay.excludeZoneStartCol)}`);
     console.log(`   旧: left=${fmt(oldLay.left)} right=${fmt(oldLay.right)} 除外レンジ=${rangesText(oldLay.excludedRanges)}`);
-    console.log(`   新: left=${fmt(newLay.left)} right=${fmt(newLay.right)} 除外レンジ=${rangesText(newLay.excludedRanges)}`);
+    console.log(`   新: left=${fmt(newLay.left)} right=${fmt(newLay.right)} 除外レンジ=${rangesText(newLay.excludedRanges)} 集計内開始=${newLay.mainZoneStartCol === null ? "-" : a1(newLay.mainZoneStartCol)}`);
     if (changed) {
       console.log(`   1行目マーカー: ${oldLay.arrowCols.map((c) => `${a1(c)}:${head[0][c]}`).join(" / ")}`);
       diffs.push({ project: t.project, tab, old: oldLay, next: newLay });
@@ -138,12 +138,21 @@ function layout(head, useArrowBoundary) {
   const excludeMarkerCols = markers.filter((m) => m.type === "exclude").map((m) => m.col);
   const excludeZoneStartCol = excludeMarkerCols.length ? Math.min(...excludeMarkerCols) : null;
 
+  const patternStartCols = markers
+    .filter((m) => m.type === "patternstart" && (excludeZoneStartCol === null || m.col < excludeZoneStartCol))
+    .map((m) => m.col);
+  // 旧ロジックには無かった条件。新ロジックのときだけ適用する
+  const mainZoneStartCol = useArrowBoundary && patternStartCols.length ? Math.min(...patternStartCols) : null;
+
   const cr00Candidates = idCells.filter((x) => x.id.toLowerCase() === TEMPLATE_ID).map((x) => x.col).sort((a, b) => a - b);
-  const leftCandidates = cr00Candidates.filter((col) => (excludeZoneStartCol === null || col < excludeZoneStartCol) && !isExcludedCol(col));
+  const leftCandidates = cr00Candidates.filter((col) => {
+    if (mainZoneStartCol !== null && col < mainZoneStartCol) return false;
+    return (excludeZoneStartCol === null || col < excludeZoneStartCol) && !isExcludedCol(col);
+  });
   const rightCandidates = excludeZoneStartCol === null ? [] : cr00Candidates.filter((col) => col >= excludeZoneStartCol && !isExcludedCol(col));
 
   return {
-    idRow, cr00Candidates, excludeZoneStartCol, excludedRanges, arrowCols, markers,
+    idRow, cr00Candidates, excludeZoneStartCol, excludedRanges, arrowCols, markers, mainZoneStartCol,
     left: leftCandidates.length ? leftCandidates[0] : null,
     right: rightCandidates.length ? rightCandidates[0] : null,
   };
