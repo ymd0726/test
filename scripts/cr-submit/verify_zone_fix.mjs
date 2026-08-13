@@ -32,6 +32,12 @@ const NONPATTERN_MARKERS = [
 ];
 const PATTERN_START_MARKERS = ["CR別→", "cr→", "CR一覧→"];
 
+// Sheets API がまれに応答を返さないまま止まる（実測: 全案件スキャンが1時間経っても終わらない）ため、
+// 1リクエストごとに時間制限を掛け、失敗時は少しだけ待って数回再試行する。
+// ※ トップレベルawaitのループより前に評価される必要があるのでここで宣言する
+const REQ_TIMEOUT_MS = 60_000;
+const REQ_MAX_ATTEMPTS = 3;
+
 const args = parseArgs(process.argv.slice(2));
 const only = args.only ? String(args.only).split(",").map((s) => s.trim()).filter(Boolean) : null;
 
@@ -174,11 +180,6 @@ async function resolveTabs(t) {
   if (hits.length === 0) throw new Error("cr00を含むタブがありません");
   return hits;
 }
-
-// Sheets API がまれに応答を返さないまま止まる（実測: 全案件スキャンが1時間経っても終わらない）ため、
-// 1リクエストごとに時間制限を掛け、失敗時は指数バックオフで数回だけ再試行する。
-const REQ_TIMEOUT_MS = 60_000;
-const REQ_MAX_ATTEMPTS = 3;
 
 async function withTimeoutRetry(label, fn) {
   let lastErr;
