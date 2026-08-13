@@ -425,12 +425,28 @@ function submitLayout_(sheet) {
   }
   markers.sort(function (a, b) { return a.col - b.col; });
 
-  // 非パターンゾーンの除外レンジ（そのマーカー列 〜 次のマーカー列の直前 or 末尾）
+  // ゾーンの境界は「1行目の“→”で終わる全マーカー」で取る（BUG-144）。
+  // 以前は上で分類できた既知マーカーだけを境界にしていたため、未知の文言
+  // （jdem の「当たりcr→」「追加CR→」「停止CR→」「認知→」等）が境界として効かず、
+  // 非パターンゾーン（訴求別→ col39）が次の既知マーカー＝集計外CR→(col1894) まで
+  // 際限なく広がり、集計内の本物の cr00（col96台 / 1762）を両方とも除外して
+  // 「集計内(親)ゾーンの cr00 テンプレが見つかりません」になっていた。
+  // 文言を都度リストへ足す運用では取りこぼすため、境界判定は文言に依存させない。
+  var arrowCols = [];
+  for (var ac = 0; ac < row1.length; ac++) {
+    var av = String(row1[ac] || '').trim();
+    if (av && av.charAt(av.length - 1) === '→') arrowCols.push(ac);
+  }
+  function nextArrowColAfter(col) {
+    for (var i = 0; i < arrowCols.length; i++) if (arrowCols[i] > col) return arrowCols[i];
+    return Infinity;
+  }
+
+  // 非パターンゾーンの除外レンジ（そのマーカー列 〜 次の“→”マーカー列の直前 or 末尾）
   var excludedRanges = [];
-  markers.forEach(function (m, i) {
+  markers.forEach(function (m) {
     if (m.type !== 'nonpattern') return;
-    var nextCol = (i + 1 < markers.length) ? markers[i + 1].col : Infinity;
-    excludedRanges.push([m.col, nextCol]);
+    excludedRanges.push([m.col, nextArrowColAfter(m.col)]);
   });
   function isExcludedCol(col) {
     return excludedRanges.some(function (rg) { return col >= rg[0] && col < rg[1]; });

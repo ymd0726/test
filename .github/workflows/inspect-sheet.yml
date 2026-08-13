@@ -21,6 +21,10 @@ on:
         description: "true で各crブロックのサムネ表示セル（結合セル）有無を診断（tab指定時のみ有効）"
         required: false
         default: "false"
+      verifyZones:
+        description: "true でレジストリ全案件のゾーン判定（旧/新）を比較（sheet/tab入力は無視）"
+        required: false
+        default: "false"
 
 jobs:
   inspect:
@@ -38,6 +42,10 @@ jobs:
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: |
+          if [ "${{ github.event.inputs.verifyZones }}" = "true" ]; then
+            node verify_zone_fix.mjs
+            exit $?
+          fi
           DUMP=""
           if [ "${{ github.event.inputs.dump }}" = "true" ]; then DUMP="--dump"; fi
           if [ "${{ github.event.inputs.merges }}" = "true" ]; then DUMP="$DUMP --merges"; fi
