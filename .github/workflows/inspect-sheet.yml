@@ -25,6 +25,10 @@ on:
         description: "true でレジストリ全案件のゾーン判定（旧/新）を比較（sheet/tab入力は無視）"
         required: false
         default: "false"
+      verifyOnly:
+        description: "verifyZones時、対象案件をカンマ区切りで限定（例 nrn,ssh）。空なら全案件"
+        required: false
+        default: ""
 
 jobs:
   inspect:
@@ -43,7 +47,9 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: |
           if [ "${{ github.event.inputs.verifyZones }}" = "true" ]; then
-            node verify_zone_fix.mjs
+            ONLY=""
+            if [ -n "${{ github.event.inputs.verifyOnly }}" ]; then ONLY="--only ${{ github.event.inputs.verifyOnly }}"; fi
+            node verify_zone_fix.mjs $ONLY
             exit $?
           fi
           DUMP=""
