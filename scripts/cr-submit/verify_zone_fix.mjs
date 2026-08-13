@@ -32,11 +32,12 @@ const NONPATTERN_MARKERS = [
 ];
 const PATTERN_START_MARKERS = ["CR別→", "cr→", "CR一覧→"];
 
-// Sheets API がまれに応答を返さないまま止まる（実測: 全案件スキャンが1時間経っても終わらない）ため、
-// 1リクエストごとに時間制限を掛け、失敗時は少しだけ待って数回再試行する。
+// Sheets API がまれに応答を返さないまま止まるため、1リクエストごとに時間制限を掛ける。
+// ただし hyd のような巨大シートは正常でも 1リクエスト7分半かかる実測があるので、
+// 制限は「ハングの打ち切り」に足りる長さにする（短くすると正常な読み取りを殺してしまう）。
 // ※ トップレベルawaitのループより前に評価される必要があるのでここで宣言する
-const REQ_TIMEOUT_MS = 60_000;
-const REQ_MAX_ATTEMPTS = 3;
+const REQ_TIMEOUT_MS = 10 * 60_000;
+const REQ_MAX_ATTEMPTS = 2;
 
 const args = parseArgs(process.argv.slice(2));
 const only = args.only ? String(args.only).split(",").map((s) => s.trim()).filter(Boolean) : null;
