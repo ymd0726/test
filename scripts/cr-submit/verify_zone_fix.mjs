@@ -114,6 +114,10 @@ for (const d of diffs) {
 console.log(`読み取り失敗: ${errors.length}`);
 for (const e of errors) console.log(`  - ${e.project}/${e.tab || "-"}: ${e.error}`);
 
+// 時間制限のタイマーや gaxios のソケットが残っているとプロセスが終了せず、
+// 集計は済んでいるのにワークフローが「実行中」のまま何時間も残る（実測）。明示的に終了する。
+process.exit(errors.length ? 1 : 0);
+
 // ------------------------------------------------------------
 function layout(head, useArrowBoundary) {
   const row1 = head[0] || [];
@@ -204,10 +208,11 @@ async function resolveTabs(t) {
 async function withTimeoutRetry(label, fn) {
   let lastErr;
   for (let attempt = 1; attempt <= REQ_MAX_ATTEMPTS; attempt++) {
+    let timer;
     try {
       return await Promise.race([
         fn(),
-        new Promise((_, reject) => setTimeout(() => reject(new Error(`timeout ${REQ_TIMEOUT_MS}ms`)), REQ_TIMEOUT_MS)),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`timeout ${REQ_TIMEOUT_MS}ms`)), REQ_TIMEOUT_MS); }),
       ]);
     } catch (e) {
       lastErr = e;
@@ -216,6 +221,8 @@ async function withTimeoutRetry(label, fn) {
         console.log(`   … ${label} 失敗(${attempt}/${REQ_MAX_ATTEMPTS}): ${e.message || e} → ${waitMs}ms後に再試行`);
         await new Promise((r) => setTimeout(r, waitMs));
       }
+    } finally {
+      clearTimeout(timer);
     }
   }
   throw lastErr;
