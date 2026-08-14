@@ -284,6 +284,23 @@ async function callGas(target: SheetTarget, payload: GasPayload): Promise<any> {
   }
 }
 
+// BUG-141フォローアップ: callGas(stop/undo)がGAS側の重さ（kk_mak/kk_kou等の巨大シート）等で
+// 25秒タイムアウト(AbortError)や通信エラーを起こすと、直前のMeta停止(pauseAds)は既に成功して
+// いても生の例外がそのまま「❌ エラー: AbortError: The operation was aborted」とSlackに表示され、
+// Meta側の成否が分からず利用者が手動で確認・再実行する必要があった（cr79_05/cr95_06で発生）。
+// 例外を既存のGasResult形状（{success:false,message}）に変換し、stopLines()等が
+// 「✅Meta広告:成功／❌集計表:失敗（理由・再実行案内）」という分かりやすい形を組み立てられるようにする。
+async function callGasSafe(target: SheetTarget, payload: GasPayload): Promise<any> {
+  try {
+    return await callGas(target, payload);
+  } catch (e) {
+    return {
+      success: false,
+      message: `集計表への書き込みでエラー（${e}）。Meta広告側は上記の通り実行済みです。もう一度実行すると集計表のみ再試行されます。`,
+    };
+  }
+}
+
 // project未指定時に find で案件を探索（MCP用）
 async function findProjects(creativeName: string): Promise<Project[]> {
   const checks = await Promise.all(
@@ -482,9 +499,11 @@ async function doStop(env: Env, p: Project, creative: string, date: string): Pro
   }
 
   // B. 集計表記録（複数集計対象の案件は cr名で対象タブを判定）。Metaが一部/全部失敗しても必ず実行する。
+  // BUG-141フォローアップ: callGasSafe()でGAS側の例外(タイムアウト等)を吸収し、Meta側の結果は
+  // 保持したまま「集計表のみ失敗」として返す（生の例外が呼び出し元にthrowされるのを防ぐ）。
   const target = await pickSheet(p, creative);
   out.sheet = target
-    ? await callGas(target, { action: "stop", creativeName: creative, stopDate: date })
+    ? await callGasSafe(target, { action: "stop", creativeName: creative, stopDate: date })
     : { success: false, message: "集計表に該当crが見つかりません(複数対象)" };
 
   // C. 親子連動チェック（BUG-112）。集計表停止が成功した場合のみ・失敗しても本処理は止めない
@@ -499,7 +518,7 @@ async function doUndo(env: Env, p: Project, creative: string, memoMode: "full" |
   // B. 集計表undo（先に実行。これが成功＝我々が停止した証拠）
   const target = await pickSheet(p, creative);
   out.sheet = target
-    ? await callGas(target, { action: "undo", creativeName: creative, memoMode })
+    ? await callGasSafe(target, { action: "undo", creativeName: creative, memoMode })
     : { success: false, message: "集計表に該当crが見つかりません(複数対象)" };
   // A. 集計表undoが成功した時のみMeta広告をACTIVEに戻す（無関係なPAUSE広告を誤って動かさない）
   const token = metaToken(env, p);
@@ -1298,7 +1317,7 @@ function handleSlackInteract(env: Env, ctx: ExecutionContext, bodyText: string, 
               if (paused < ids.length) { metaErr = `${ids.length - paused}件の停止に失敗`; metaErrDetail = r.errors; }
             } catch (e) { metaErr = String(e); metaErrDetail = [String(e)]; }
           }
-          const sheet = target ? await callGas(target, { action: "stop", creativeName: v.c, stopDate: v.d }) : { success: false, message: "集計表に該当crなし(複数対象)" };
+          const sheet = target ? await callGasSafe(target, { action: "stop", creativeName: v.c, stopDate: v.d }) : { success: false, message: "集計表に該当crなし(複数対象)" };
           // BUG-112: 子CRの集計表停止が成功したら、兄弟の子が全員停止済みかチェックし、
           // 該当すれば親CRも自動停止する（失敗しても本処理は止めない）
           let cascade: CascadeResult | undefined;
@@ -1330,7 +1349,7 @@ function handleSlackInteract(env: Env, ctx: ExecutionContext, bodyText: string, 
               if (resumed < ids.length) { metaErr = `${ids.length - resumed}件の再開に失敗`; metaErrDetail = r.errors; }
             } catch (e) { metaErr = String(e); metaErrDetail = [String(e)]; }
           }
-          const sheet = target ? await callGas(target, { action: "undo", creativeName: v.c, memoMode: v.m || "tag" }) : { success: false, message: "集計表に該当crなし(複数対象)" };
+          const sheet = target ? await callGasSafe(target, { action: "undo", creativeName: v.c, memoMode: v.m || "tag" }) : { success: false, message: "集計表に該当crなし(複数対象)" };
           const extra = (metaErr ? `\n⚠️ Meta再開に失敗（${metaErr}）：${metaErrDetail.join(" / ") || "詳細不明"}` : "");
           let note = extra + runLogWarn;
           if (resumed || sheet?.success) {
