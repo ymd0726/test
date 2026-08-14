@@ -1,0 +1,20 @@
+{
+  "sheet": "1J1BxvhD7EdfK6iDErRSmwBBXGq56QESnLIAhgfROCB4",
+  "tab": "data",
+  "note": "rcl(Dr.Recella/meta_total)向けに当たり候補(消化予算シェア方式・3段階)の判定設定を新設。data!R1:S9は空を確認済み。閾値はプレースホルダで、実データの消化予算シェア分布をdry-runで確認後に調整予定。",
+  "edits": [
+    { "cell": "R1", "expectedBefore": "", "after": "🌱当たり候補 判定設定（S列の数値を編集。消化予算シェア方式）", "note": "見出し" },
+    { "cell": "R2", "expectedBefore": "", "after": "🌱 1段階目 CPA上限倍率（目標CPA×）", "note": "1段階目CPAラベル" },
+    { "cell": "S2", "expectedBefore": "", "after": "0.9", "note": "1段階目CPA上限倍率=0.9倍" },
+    { "cell": "R3", "expectedBefore": "", "after": "🌱 1段階目 消化予算シェア下限", "note": "1段階目シェアラベル" },
+    { "cell": "S3", "expectedBefore": "", "after": "0.01", "note": "1段階目シェア下限=1%（暫定。分布確認後に調整）" },
+    { "cell": "R4", "expectedBefore": "", "after": "🌱🌱 2段階目 CPA上限倍率（目標CPA×）", "note": "2段階目CPAラベル" },
+    { "cell": "S4", "expectedBefore": "", "after": "0.75", "note": "2段階目CPA上限倍率=0.75倍" },
+    { "cell": "R5", "expectedBefore": "", "after": "🌱🌱 2段階目 消化予算シェア下限", "note": "2段階目シェアラベル" },
+    { "cell": "S5", "expectedBefore": "", "after": "0.03", "note": "2段階目シェア下限=3%（暫定。分布確認後に調整）" },
+    { "cell": "R6", "expectedBefore": "", "after": "🌱🌱🌱 3段階目(小当たり) CPA上限倍率（目標CPA×。1.0超=許容ライン）", "note": "3段階目CPAラベル" },
+    { "cell": "S6", "expectedBefore": "", "after": "1.2", "note": "3段階目CPA上限倍率=1.2倍" },
+    { "cell": "R7", "expectedBefore": "", "after": "🌱🌱🌱 3段階目(小当たり) 消化予算シェア下限", "note": "3段階目シェアラベル" },
+    { "cell": "S7", "expectedBefore": "", "after": "0.05", "note": "3段階目シェア下限=5%（暫定。分布確認後に調整）" }
+  ]
+}
