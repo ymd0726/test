@@ -1,0 +1,22 @@
+{
+  "sheet": "1oEK8JCJg2NcseWmnxLtfNFCe5A7XGJ_DJSj7c2EW1sg",
+  "tab": "data",
+  "note": "nrnで確定した並び(段階ごとにCPA→シェアの順)にjdeも揃える。実質cv下限(旧R3/R5)は消化予算シェア方式移行済み(kk_mak)+今回移行(kk_kou)により未使用のため、シェア下限の移動先として再利用。R6:S7(kk_mak用ラベル)はkk_kouと共通の設定になるためラベルから(kk_mak用)を外して移動。R8:S9は移動済みのため空にする。数値は移動のみで変更なし。",
+  "edits": [
+    { "cell": "R1", "expectedBefore": "🌱当たり候補 判定設定（S列の数値を編集）", "after": "🌱当たり候補 判定設定（S列の数値を編集。消化予算シェア方式）", "note": "見出し" },
+    { "cell": "R2", "expectedBefore": "当たり候補🌱 CPA係数(目標CPA×)", "after": "🌱 1段階目 CPA上限倍率（目標CPA×）", "note": "1段階目CPAラベル整理" },
+    { "cell": "R3", "expectedBefore": "当たり候補🌱 実質cv下限", "after": "🌱 1段階目 消化予算シェア下限", "note": "未使用の実質cv下限ラベルをシェア下限に置き換え" },
+    { "cell": "S3", "expectedBefore": "3", "after": "0.01", "note": "1段階目シェア下限=1%（旧S6から移動）" },
+    { "cell": "R4", "expectedBefore": "当たり候補🌱🌱 CPA係数(目標CPA×)", "after": "🌱🌱 2段階目 CPA上限倍率（目標CPA×）", "note": "2段階目CPAラベル整理" },
+    { "cell": "R5", "expectedBefore": "当たり候補🌱🌱 実質cv下限", "after": "🌱🌱 2段階目 消化予算シェア下限", "note": "未使用の実質cv下限ラベルをシェア下限に置き換え" },
+    { "cell": "S5", "expectedBefore": "5", "after": "0.03", "note": "2段階目シェア下限=3%（旧S7から移動）" },
+    { "cell": "R6", "expectedBefore": "当たり候補🌱 消化予算シェア下限(kk_mak用)", "after": "🌱🌱🌱 3段階目(小当たり) CPA上限倍率（目標CPA×。1.0超=許容ライン）", "note": "3段階目CPAラベルをここに移動" },
+    { "cell": "S6", "expectedBefore": "0.01", "after": "1.2", "note": "3段階目CPA上限倍率=1.2倍（旧S9から移動）" },
+    { "cell": "R7", "expectedBefore": "当たり候補🌱🌱 消化予算シェア下限(kk_mak用)", "after": "🌱🌱🌱 3段階目(小当たり) 消化予算シェア下限", "note": "3段階目シェアラベルをここに移動" },
+    { "cell": "S7", "expectedBefore": "0.03", "after": "0.05", "note": "3段階目シェア下限=5%（旧S8から移動）" },
+    { "cell": "R8", "expectedBefore": "当たり候補🌱🌱🌱 小当たり 消化予算シェア下限(kk_mak用。CPA基準は🌱🌱と共通)", "after": "", "note": "移動済みのため空に" },
+    { "cell": "S8", "expectedBefore": "0.05", "after": "", "note": "移動済みのため空に" },
+    { "cell": "R9", "expectedBefore": "当たり候補🌱🌱🌱 小当たり CPA上限倍率(目標CPA×。1.0超=許容ライン)", "after": "", "note": "移動済みのため空に" },
+    { "cell": "S9", "expectedBefore": "1.2", "after": "", "note": "移動済みのため空に" }
+  ]
+}
