@@ -80,16 +80,18 @@ const SPENDLINE = args.spendlineCell;           // 消化ラインセル（例 W
 // 判定基準は data 設定シートのセルを参照（編集はそこで完結）。既定 data!S2:S5。
 const SETTINGS_TAB = args.settingsTab || "data";
 const SETTINGS_COL = (args.settingsCol || "S").toUpperCase();
-const PRE_CPA_ROW = 2;   // 1段階目🌱 CPA係数
-const PRE_CV_ROW = 3;    // 1段階目🌱 実質cv下限（cvモード用）
-const CAND_CPA_ROW = 4;  // 2段階目🌱🌱 CPA係数
-const CAND_CV_ROW = 5;   // 2段階目🌱🌱 実質cv下限（cvモード用）
-// 消化予算シェアモード（--share-col 指定時）は S3/S5 と別行を使う。
-// 既存タブ（cvモードのまま）の S3/S5 の意味を変えないため。
-const PRE_SHARE_ROW = 6;  // 1段階目🌱 消化予算シェア下限（シェアモード用）
-const CAND_SHARE_ROW = 7; // 2段階目🌱🌱 消化予算シェア下限（シェアモード用）
-const TOP_SHARE_ROW = 8;  // 3段階目🌱🌱🌱「小当たり」消化予算シェア下限（シェアモード専用）
-const TOP_CPA_ROW = 9;    // 3段階目🌱🌱🌱「小当たり」CPA上限倍率（目標CPA×。1.0超=目標より多少悪くても許容）
+// 各設定値の行番号はタブごとに違ってよいので --xxx-row で上書き可能にしてある
+// （既定値は既存タブ／cvモード互換のため変更しない。新規タブは並び順を自由に決めてよい）。
+const PRE_CPA_ROW = Number(args.preCpaRow || 2);     // 1段階目🌱 CPA係数
+const PRE_CV_ROW = Number(args.preCvRow || 3);       // 1段階目🌱 実質cv下限（cvモード用）
+const CAND_CPA_ROW = Number(args.candCpaRow || 4);   // 2段階目🌱🌱 CPA係数
+const CAND_CV_ROW = Number(args.candCvRow || 5);     // 2段階目🌱🌱 実質cv下限（cvモード用）
+// 消化予算シェアモード（--share-col 指定時）は既定でS3/S5と別行を使う。
+// 既存タブ（cvモードのまま）のS3/S5の意味を変えないため。
+const PRE_SHARE_ROW = Number(args.preShareRow || 6);   // 1段階目🌱 消化予算シェア下限（シェアモード用）
+const CAND_SHARE_ROW = Number(args.candShareRow || 7); // 2段階目🌱🌱 消化予算シェア下限（シェアモード用）
+const TOP_SHARE_ROW = Number(args.topShareRow || 8);   // 3段階目🌱🌱🌱「小当たり」消化予算シェア下限（シェアモード専用）
+const TOP_CPA_ROW = Number(args.topCpaRow || 9);       // 3段階目🌱🌱🌱「小当たり」CPA上限倍率（目標CPA×。1.0超=目標より多少悪くても許容）
 const APPLY = args.apply || process.env.APPLY === "1";
 const UNDO_OUT = args.undoOut || "undo_log.json";
 // --clear-old-row が TIER_ROW と同じ場合（例: メモ列に残った旧形式の残骸を、消化金額列は
@@ -463,6 +465,14 @@ function parseArgs(argv) {
     else if (a === "--tier-row") out.tierRow = argv[++i];
     else if (a === "--clear-old-row") out.clearOldRow = argv[++i];
     else if (a === "--share-col") out.shareCol = argv[++i];
+    else if (a === "--pre-cpa-row") out.preCpaRow = argv[++i];
+    else if (a === "--cand-cpa-row") out.candCpaRow = argv[++i];
+    else if (a === "--pre-cv-row") out.preCvRow = argv[++i];
+    else if (a === "--cand-cv-row") out.candCvRow = argv[++i];
+    else if (a === "--pre-share-row") out.preShareRow = argv[++i];
+    else if (a === "--cand-share-row") out.candShareRow = argv[++i];
+    else if (a === "--top-share-row") out.topShareRow = argv[++i];
+    else if (a === "--top-cpa-row") out.topCpaRow = argv[++i];
     else if (a === "--metric-row") out.metricRow = argv[++i];
     else if (a === "--settings-tab") out.settingsTab = argv[++i];
     else if (a === "--settings-col") out.settingsCol = argv[++i];
