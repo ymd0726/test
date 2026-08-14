@@ -124,6 +124,28 @@ WHERE "案件名" LIKE '%nrn%'
 | jde | kk_kou | 1103 | 1104 | 1101 | W5 | ○（share_col=C、2026-08-14移行） |
 | nrn | meta_total | 1005 | 1010 | 1008 | Z5 | ○（share_col=C） |
 | brm | meta_total | 1104 | 1101 | 1099 | Z5 | ○（share_col=C、2026-08-14新規） |
+| ssh | meta_total | 1014 | 1011 | 1009 | W6 | ○（share_col=C、id_row=7） |
+| aty | meta_total | 1126 | 1131 | 1129 | X5 | ○（share_col=C） |
+| una | meta_total | 1011 | 1006 | 1009 | AA5 | ○（share_col=C） |
+| una | meta_total_銀座店 | 2 | 1012 | 1010 | AG5 | ○（share_col=C、data設定はmeta_totalと共有） |
+| blr | meta_total | 1101 | 1096 | 1099 | W5 | ○（share_col=C） |
+| grm | meta_total | 2（消化金額列） | 7 | 1011 | Z5 | ○（share_col=C、noroshi_col=disc） |
+| als | meta_total | 2 | 5 | 1009 | X5 | ○（share_col=C、id_row=7） |
+| bla | meta_face | 1005 | 1010 | 1008 | W5(=6000) | ○（share_col=C、dataはmeta_bodyと共有） |
+| bla | meta_body | 1005 | 1010 | 1008 | W5(=15000) | ○（share_col=C、dataはmeta_faceと共有） |
+| fpl | meta_total | 2 | 8 | 522(実体は768参照) | W5 | ○（share_col=C、id_row=7） |
+| rcl | meta_total | 784 | 773 | 771 | AC5 | ○（share_col=C、id_row=5） |
+| hyd | meta_total | 1141 | 1136 | 1139 | X5 | ○（share_col=C） |
+| nrc | meta_total | 6（消化金額列） | 2 | 771 | AC5 | ○（share_col=C、noroshi_col=disc、id_row=5） |
+| gen | meta_total | 7 | 1035（グリッド最終行） | 771 | AC5 | ○（share_col=C、id_row=5） |
+| bbt | meta_total | 2（消化金額列） | 617 | 615 | Y5 | ○（share_col=C、noroshi_col=disc、**settings_col=U**） |
+| sdb | meta_total | 2（消化金額列） | 765 | 771 | AC5 | ○（share_col=C、noroshi_col=disc、id_row=5） |
+| evs | meta_total | 2（消化金額列） | 773 | 771 | AC5 | ○（share_col=C、noroshi_col=disc、id_row=5） |
+| jdem | meta_total | 5（消化金額列） | 1132 | 1135 | AE5 | ○（share_col=C、noroshi_col=disc） |
+| lcl | meta_body_n26_lcl | 785 | 780 | 783 | AI5 | ○（**share_col=D**、dataはn44_rjfと共有） |
+| n44_rjf | meta_face_n44_rjf | 未確定(要再実測) | 未確定(要再実測) | 未確定(要再実測) | 未確定 | ○（22/22ブロック適用成功を確認済み。詳細行番号はセッション中断のため未記録。undo log: run 31782711402） |
+| pom | meta_total_02 | 2 | 3 | 1153 | Z5 | ○（share_col=C） |
+| fp | meta_total | 未確定(要再実測) | 未確定(要再実測) | 未確定(要再実測) | W5(推定10000) | ○（82/81ブロック適用成功を確認済み。詳細行番号はセッション中断のため未記録。undo log: run 31782755396） |
 
 いずれも `--noroshi-col memo`（判定テキストのみメモ列に出す。中間コードは常に消化金額列）。
 中間コードはグレー、判定テキストは黒。中間コードは `0`/`1`/`2` のプレーンな数値のみ
@@ -158,6 +180,16 @@ S列の意味を変える変更を適用すること。設定シートを再利�
 `settings_row_overrides`経由で指定。ラベル=T列・数値=U列、行はR:S運用と同じ1〜7の
 tier-groupedレイアウト）。**新しい案件に展開する際は、まずdataタブのR1:S9が
 本当に空いているか確認してから使う。埋まっていれば`--settings-col`で別列に逃がす。**
+
+**⚠️ 2026-08-14の全稼働案件横展開で判明した追加の罠（並行エージェント多数の実測に基づく）**
+
+1. **`inspect-sheet.yml --dump`（`--rows`一括ダンプ）には偽陰性のバグがある**: 値が`0`や`-`になる数式セルを「非空セル」として拾わないことが複数案件（fpl/rcl/sdb等）で確認された。metric_row付近（数百〜1000番台の行）を調べる際は`--rows`を信用せず、必ず`--cells`でピンポイント読取して裏取りすること。
+2. **グリッド範囲外セルの指定はGoogle API 400エラーになる**（gen案件で確認。「Range exceeds grid limits」）。事前に構造サマリで実際の行数・列数を確認してから範囲を指定する。
+3. **1つのワークブック内で複数の案件タブが`data`設定シートを共有していることがある**（una/una_ginza、lcl/n44_rjf で確認）。新規に設定ブロックを作る前に、同じ`data`タブに既存の当たり候補設定（R:S列やT:U列にCPA係数・シェア下限のラベルがないか）が既にないか必ず確認し、あれば新規作成せず流用する（`settings_row_overrides`だけ揃えれば良い）。
+4. **CLDB記載のスプレッドシートが読み取り専用のIMPORTRANGEミラーであることがある**（una_ginza案件の元スプレッドシート`1icFYUtazAwq8yDGx6ySC04KvLw8Q3WQ6i_HvIhqE20k`で発覚。行1の数セルが`=IMPORTRANGE(...)`で全列にスピルしており、実データは別ワークブックの別タブに存在した）。担当タブが全面的にスピル値ばかりで固有の数式を持つセルがほぼ無い場合はミラーを疑い、`formulas=true`で行1〜数行をダンプして`IMPORTRANGE`の有無を確認する。書き込み対象は参照元の本物のタブを探して切り替える。
+5. **タブ名に「CR」を含んでいても実データが入っているとは限らない**（rob/rofの`meta_CR_BODY`/`meta_CR_FACE`はテンプレ列だけで実クリエイティブ行がほぼ空、実データは店舗別集計の`meta_bo_total`/`meta_fc_total`側にあったが、そちらはCR単位ではなく店舗単位の集計でありatari-kouhoの前提（cr00ブロック＋ID行＋COUNTIF親子集計）に一致しなかった。この案件は**構造不一致のため対応保留**。店舗別集計をどう扱うかはユーザー判断が必要）。
+6. **中間行のtier判定式は3→2→1の順でIF評価するため、CPAが非常に優秀でもシェアが高いだけでtier3(🌱🌱🌱・小当たり)が先に確定することがある**（sdb案件で確認。tier3はCPA効率を問わない緩い判定のため、この挙動は仕様どおりでバグではない。ユーザーへの説明時は「バッジの段階＝優秀さの順位ではない」ことを申し添えるとよい）。
+7. **並行して多数のGitHub Actionsをdispatchしていると、`list_workflow_runs`の結果から自分のrunを一意に特定しづらい。** dispatch直後に`status=queued/in_progress`で絞り込む、または`get_job_logs`の内容（対象スプレッドシートID・タブ名）で裏取りするのが安全。
 
 #### 行番号は案件ごとに実測する（規則性を当てにしない）
 kk_mak には kk_kou に無い「当月着地」行があり、行構成が単純な1行ズレではない。
