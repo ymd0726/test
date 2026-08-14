@@ -45,6 +45,10 @@ on:
         description: "消化予算シェアモードの全体消化列（例: C。指定時は実質cvの代わりにシェア%で判定。下限は data!S6/S7）。空なら従来の実質cvモード"
         required: false
         default: ""
+      settings_row_overrides:
+        description: "data設定シートの行番号を並び替えたい時のみ。--pre-cpa-row/--cand-cpa-row/--pre-share-row/--cand-share-row/--top-share-row/--top-cpa-row をスペース区切りで（例: --pre-share-row 3 --cand-share-row 5 --top-cpa-row 6 --top-share-row 7）。空なら既定(S2/S4/S6/S7/S8/S9)のまま"
+        required: false
+        default: ""
       clear_old_row:
         description: "行移動時に旧行の当たり式を空にする。カンマ区切りで複数可（例: 2,1103。空なら掃除しない）"
         required: false
@@ -90,6 +94,7 @@ jobs:
           NOROSHI_COL: ${{ github.event.inputs.noroshi_col }}
           TIER_ROW: ${{ github.event.inputs.tier_row }}
           SHARE_COL: ${{ github.event.inputs.share_col }}
+          SETTINGS_ROW_OVERRIDES: ${{ github.event.inputs.settings_row_overrides }}
           CLEAR_OLD_ROW: ${{ github.event.inputs.clear_old_row }}
           ID_ROW: ${{ github.event.inputs.id_row }}
           SETTINGS_TAB: ${{ github.event.inputs.settings_tab }}
@@ -104,7 +109,7 @@ jobs:
           node noroshi.mjs --sheet "$SHEET" --tab "$TAB" \
             --target-cell "$TARGET_CELL" --spendline-cell "$SPENDLINE_CELL" \
             --metric-row "$METRIC_ROW" --noroshi-row "$NOROSHI_ROW" --noroshi-col "$NOROSHI_COL" --tier-row "$TIER_ROW" --id-row "$ID_ROW" \
-            --settings-tab "$SETTINGS_TAB" $CLEAR_FLAG $SHARE_FLAG $APPLY_FLAG --undo-out undo_log.json
+            --settings-tab "$SETTINGS_TAB" $CLEAR_FLAG $SHARE_FLAG $SETTINGS_ROW_OVERRIDES $APPLY_FLAG --undo-out undo_log.json
       - name: Upload undo log
         if: github.event.inputs.mode == 'apply'
         uses: actions/upload-artifact@v4
