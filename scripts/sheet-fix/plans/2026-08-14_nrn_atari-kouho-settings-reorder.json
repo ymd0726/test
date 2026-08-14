@@ -1,0 +1,19 @@
+{
+  "sheet": "1Q7iph8TxZ5C5ouBb3vjvyNMNgLUmP-Uj1stCO9TewFA",
+  "tab": "data",
+  "note": "当たり候補の判定設定を段階ごと(CPA→シェアの順)にまとめて並べ替え。R2:S2とR4:S4はそのまま、R3/S3・R5/S5に消化予算シェア下限を移動、R6:S7に3段階目(小当たり)のCPA上限倍率とシェア下限を移動、R8:S9は空にする。ノロシ側の設定行オーバーライドと一致させて後続で式を再適用する必要あり。",
+  "edits": [
+    { "cell": "R3", "expectedBefore": "", "after": "🌱 1段階目 消化予算シェア下限", "note": "1段階目シェアラベルをここに移動" },
+    { "cell": "S3", "expectedBefore": "", "after": "0.01", "note": "1段階目シェア下限=1%（旧S6から移動）" },
+    { "cell": "R5", "expectedBefore": "", "after": "🌱🌱 2段階目 消化予算シェア下限", "note": "2段階目シェアラベルをここに移動" },
+    { "cell": "S5", "expectedBefore": "", "after": "0.03", "note": "2段階目シェア下限=3%（旧S7から移動）" },
+    { "cell": "R6", "expectedBefore": "🌱 1段階目 消化予算シェア下限", "after": "🌱🌱🌱 3段階目(小当たり) CPA上限倍率（目標CPA×。1.0超=許容ライン）", "note": "3段階目CPAラベルをここに移動" },
+    { "cell": "S6", "expectedBefore": "0.01", "after": "1.2", "note": "3段階目CPA上限倍率=1.2倍（旧S9から移動）" },
+    { "cell": "R7", "expectedBefore": "🌱🌱 2段階目 消化予算シェア下限", "after": "🌱🌱🌱 3段階目(小当たり) 消化予算シェア下限", "note": "3段階目シェアラベルをここに移動" },
+    { "cell": "S7", "expectedBefore": "0.03", "after": "0.05", "note": "3段階目シェア下限=5%（旧S8から移動）" },
+    { "cell": "R8", "expectedBefore": "🌱🌱🌱 3段階目(小当たり) 消化予算シェア下限（CPA基準は独立・R9参照）", "after": "", "note": "移動済みのため空に" },
+    { "cell": "S8", "expectedBefore": "0.05", "after": "", "note": "移動済みのため空に" },
+    { "cell": "R9", "expectedBefore": "🌱🌱🌱 3段階目(小当たり) CPA上限倍率（目標CPA×。1.0超=許容ライン）", "after": "", "note": "移動済みのため空に" },
+    { "cell": "S9", "expectedBefore": "1.2", "after": "", "note": "移動済みのため空に" }
+  ]
+}
