@@ -255,11 +255,25 @@ function cascadeNotifyLine(cascade: CascadeResult | undefined, bold: (s: string)
   return `👨‍👧 親CR ${bold(cascade.parentId)} も自動停止しました（子CR ${children} が全て停止／メモ:「子供が全て停止」）`;
 }
 
-async function callGas(target: SheetTarget, payload: GasPayload): Promise<any> {
-  // ハング防止: 各fetchに25秒タイムアウト（GASが重い/固まっても無限に待たない）
+// GAS呼び出しのタイムアウト（BUG-147提案⑥(a)）。
+// 従来は一律25秒だったが、kk_mak が 列数2304・ブロック数148 まで拡大し（BUG-113時点は
+// 2190列・99ブロック）、stop の1回で findNameCol が 8行×2304列＝約18,000セル、さらに
+// findDailyAndMonthlyRow がA列全行を読むため25秒に収まらず AbortError になっていた
+// （jdekmakのcr79_05/cr95_06、BUG-141続報）。
+//
+// ⚠️ これは「まず効くか測る」ための延長であって根治ではない。本命はGAS側の読み取り最適化
+// （findNameColが読んだ8行×全列に resolveBlockCols が必要な1行目も含まれているのに読み直している等）
+// で、そちらはGASの手動再デプロイが必要なため別対応とする。
+// 延長対象は失敗が実害になる stop/undo のみ。find(pickSheet/findProjectsで全シート並列に叩く)や
+// ベストエフォートの cascade/regray は 25秒 のまま据え置き、waitUntil 全体が延びるのを防ぐ。
+const GAS_TIMEOUT_CRITICAL_MS = 50000; // stop / undo
+const GAS_TIMEOUT_DEFAULT_MS = 25000;  // find / cascade / regray / budget
+
+async function callGas(target: SheetTarget, payload: GasPayload, timeoutMs = GAS_TIMEOUT_DEFAULT_MS): Promise<any> {
+  // ハング防止（GASが重い/固まっても無限に待たない）
   const withTimeout = async (url: string, init?: RequestInit) => {
     const ctl = new AbortController();
-    const t = setTimeout(() => ctl.abort(), 25000);
+    const t = setTimeout(() => ctl.abort(), timeoutMs);
     try { return await fetch(url, { ...init, signal: ctl.signal }); } finally { clearTimeout(t); }
   };
   const res = await withTimeout(COMMON_GAS_URL, {
@@ -290,9 +304,10 @@ async function callGas(target: SheetTarget, payload: GasPayload): Promise<any> {
 // Meta側の成否が分からず利用者が手動で確認・再実行する必要があった（cr79_05/cr95_06で発生）。
 // 例外を既存のGasResult形状（{success:false,message}）に変換し、stopLines()等が
 // 「✅Meta広告:成功／❌集計表:失敗（理由・再実行案内）」という分かりやすい形を組み立てられるようにする。
+// callGasSafe は stop/undo からのみ呼ばれる＝失敗が実害になる経路なので、長い方のタイムアウトを使う。
 async function callGasSafe(target: SheetTarget, payload: GasPayload): Promise<any> {
   try {
-    return await callGas(target, payload);
+    return await callGas(target, payload, GAS_TIMEOUT_CRITICAL_MS);
   } catch (e) {
     return {
       success: false,
