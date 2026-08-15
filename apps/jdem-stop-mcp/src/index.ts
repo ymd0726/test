@@ -255,11 +255,25 @@ function cascadeNotifyLine(cascade: CascadeResult | undefined, bold: (s: string)
   return `👨‍👧 親CR ${bold(cascade.parentId)} も自動停止しました（子CR ${children} が全て停止／メモ:「子供が全て停止」）`;
 }
 
-async function callGas(target: SheetTarget, payload: GasPayload): Promise<any> {
-  // ハング防止: 各fetchに25秒タイムアウト（GASが重い/固まっても無限に待たない）
+// GAS呼び出しのタイムアウト（BUG-147提案⑥(a)）。
+// 従来は一律25秒だったが、kk_mak が 列数2304・ブロック数148 まで拡大し（BUG-113時点は
+// 2190列・99ブロック）、stop の1回で findNameCol が 8行×2304列＝約18,000セル、さらに
+// findDailyAndMonthlyRow がA列全行を読むため25秒に収まらず AbortError になっていた
+// （jdekmakのcr79_05/cr95_06、BUG-141続報）。
+//
+// ⚠️ これは「まず効くか測る」ための延長であって根治ではない。本命はGAS側の読み取り最適化
+// （findNameColが読んだ8行×全列に resolveBlockCols が必要な1行目も含まれているのに読み直している等）
+// で、そちらはGASの手動再デプロイが必要なため別対応とする。
+// 延長対象は失敗が実害になる stop/undo のみ。find(pickSheet/findProjectsで全シート並列に叩く)や
+// ベストエフォートの cascade/regray は 25秒 のまま据え置き、waitUntil 全体が延びるのを防ぐ。
+const GAS_TIMEOUT_CRITICAL_MS = 50000; // stop / undo
+const GAS_TIMEOUT_DEFAULT_MS = 25000;  // find / cascade / regray / budget
+
+async function callGas(target: SheetTarget, payload: GasPayload, timeoutMs = GAS_TIMEOUT_DEFAULT_MS): Promise<any> {
+  // ハング防止（GASが重い/固まっても無限に待たない）
   const withTimeout = async (url: string, init?: RequestInit) => {
     const ctl = new AbortController();
-    const t = setTimeout(() => ctl.abort(), 25000);
+    const t = setTimeout(() => ctl.abort(), timeoutMs);
     try { return await fetch(url, { ...init, signal: ctl.signal }); } finally { clearTimeout(t); }
   };
   const res = await withTimeout(COMMON_GAS_URL, {
@@ -290,9 +304,10 @@ async function callGas(target: SheetTarget, payload: GasPayload): Promise<any> {
 // Meta側の成否が分からず利用者が手動で確認・再実行する必要があった（cr79_05/cr95_06で発生）。
 // 例外を既存のGasResult形状（{success:false,message}）に変換し、stopLines()等が
 // 「✅Meta広告:成功／❌集計表:失敗（理由・再実行案内）」という分かりやすい形を組み立てられるようにする。
+// callGasSafe は stop/undo からのみ呼ばれる＝失敗が実害になる経路なので、長い方のタイムアウトを使う。
 async function callGasSafe(target: SheetTarget, payload: GasPayload): Promise<any> {
   try {
-    return await callGas(target, payload);
+    return await callGas(target, payload, GAS_TIMEOUT_CRITICAL_MS);
   } catch (e) {
     return {
       success: false,
@@ -606,6 +621,16 @@ function placementGroups(places: AdPlacement[] | undefined): string[] {
 }
 const placementLines = (places: AdPlacement[] | undefined): string[] => placementGroups(places).map((g) => `　└ ${g}`);
 
+// BUG-147提案③: 実際に止めたMeta広告名の行。cr名(cr95_06)と広告名(jde_mak_cr95_06_…)は別物で、
+// 命名ミスや想定外の広告を掴んでいた場合に通知だけで気付けるようにする。
+// 広告名は長いので1件のときだけ全文（60字で打ち切り）、複数件は先頭＋「他N件」に畳む。
+const truncAdName = (s: string) => (s.length > 60 ? `${s.slice(0, 60)}…` : s);
+function adNameLines(places: AdPlacement[] | undefined): string[] {
+  const names = (places || []).map((p) => p.name).filter((n): n is string => !!n);
+  if (!names.length) return []; // 広告名が取れなければ行自体を出さない（従来の見た目に戻る）
+  return [`　└ 広告: ${truncAdName(names[0])}${names.length > 1 ? ` 他${names.length - 1}件` : ""}`];
+}
+
 async function metaSetStatus(token: string, adId: string, status: "PAUSED" | "ACTIVE"): Promise<void> {
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), 12000); // 1広告12秒でタイムアウト（ハング防止）
@@ -784,6 +809,7 @@ function fmtPublicStop(out: StopResult, creative: string, date: string, by: stri
     lines.push("・Meta: 未連携");
   }
   if (out.meta?.paused) { // BUG-147
+    lines.push(...adNameLines(out.meta.places));
     lines.push(...placementLines(out.meta.places));
     lines.push(...(out.meta.metricsLines || []));
     lines.push(...adsetZeroLines(out.meta.adsets));
@@ -1425,9 +1451,10 @@ function stopLines(creative: string, date: string, paused: number, sheet: any, m
   const lines = [`🛑 *${creative}* を停止しました${by ? `　${by}` : ""}`];
   lines.push(!metaOn ? "・Meta: 未連携" : paused > 0 ? `✅ Meta広告: ${paused}件 停止（PAUSE）` : "・Meta広告: 変更なし（集計表のみ）");
   if (paused > 0) {
+    lines.push(...adNameLines(cx?.places));         // 実際に止めた広告名
     lines.push(...placementLines(cx?.places));      // どのCP/ASを止めたか
     lines.push(...(cx?.metricsLines || []));        // 停止判定の根拠数値
-    lines.push(...adsetZeroLines(cx?.adsets)); // そのASの配信が0になったか
+    lines.push(...adsetZeroLines(cx?.adsets));      // そのASの配信が0になったか
   }
   lines.push(sheet?.success ? `✅ 集計表: 記録・グレー化（${date}）` : `❌ 集計表: ${sheet?.message || "失敗"}`);
   { const line = cascadeNotifyLine(cascade, (s) => `*${s}*`); if (line) lines.push(line); }
@@ -1505,6 +1532,32 @@ function handleSlackCommand(env: Env, ctx: ExecutionContext, bodyText: string, s
     })(),
   );
   return new Response("", { status: 200 });
+}
+
+// BUG-147提案④: 停止直後の結果メッセージに「取消」ボタンを付ける。
+// 従来は誤停止に気付いても `/cr-undo <cr名>` を手打ちする必要があった。
+//
+// ⚠️ 付ける先は response_url の ephemeral（＝停止を実行した本人にしか見えないメッセージ）に限定する。
+//    チャンネル全員向け通知(chat.postMessage)に付けると誰でも押せてしまうため。
+// memoMode は "full"（セルごと復元）。直後の誤操作訂正なので、停止前の状態に完全に戻すのが正しい。
+// 押下後は既存のundo経路がそのまま走る（集計表復元＋渡した広告IDだけACTIVE復帰）。
+// undo側も replace_original でこのメッセージを置き換えるため、ボタンは押下後に消える。
+function undoableStopResult(text: string, project: string, creative: string, adIds: string[], paused: number, sheetOk: boolean): unknown {
+  if (!paused && !sheetOk) return { replace_original: true, text }; // 何も実行できていない＝取り消す対象がない
+  const value = JSON.stringify({ a: "undo", p: project, c: creative, m: "full", ad: adIds });
+  // Slackのbutton valueは2000字上限。多数の広告を止めた場合は溢れるので、
+  // 中途半端に広告IDを落として「集計表だけ戻る」事故を起こさないようボタン自体を出さない。
+  if (value.length > 1800) return { replace_original: true, text: `${text}\n（取消は \`/cr-undo ${creative}\` で実行できます）` };
+  return {
+    replace_original: true,
+    text,
+    blocks: [
+      { type: "section", text: { type: "mrkdwn", text } },
+      { type: "actions", elements: [
+        { type: "button", text: { type: "plain_text", text: "↩️ この停止を取り消す" }, action_id: "do_undo_after_stop", value },
+      ] },
+    ],
+  };
 }
 
 async function postResponse(url: string, body: unknown): Promise<void> {
@@ -1613,7 +1666,7 @@ function handleSlackInteract(env: Env, ctx: ExecutionContext, bodyText: string, 
             const r = await notifySlack(env, project.channelId, stopLines(v.c, v.d, paused, sheet, metaOn, `by <@${userId}>`, cascade, cx) + extra);
             if (!r.ok) note += inviteNote(r.error);
           }
-          await postResponse(responseUrl, { replace_original: true, text: stopLines(v.c, v.d, paused, sheet, metaOn, "", cascade, cx) + note });
+          await postResponse(responseUrl, undoableStopResult(stopLines(v.c, v.d, paused, sheet, metaOn, "", cascade, cx) + note, project.name, v.c, ids, paused, !!sheet?.success));
           await logToNotion(env, { creative: v.c, user: userName, userId, action: "停止", project: project.name, route: "Slack", metaCount: paused, sheetResult: sheetResultLabel(sheet) });
           await updateRunLog(env.NOTION_TOKEN, runLogId, {
             status: !metaErr && sheetResultLabel(sheet) !== "失敗" ? "完了" : "一部失敗",
