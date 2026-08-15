@@ -143,9 +143,9 @@ WHERE "案件名" LIKE '%nrn%'
 | evs | meta_total | 2（消化金額列） | 773 | 771 | AC5 | ○（share_col=C、noroshi_col=disc、id_row=5） |
 | jdem | meta_total | 5（消化金額列） | 1132 | 1135 | AE5 | ○（share_col=C、noroshi_col=disc） |
 | lcl | meta_body_n26_lcl | 785 | 780 | 783 | AI5 | ○（**share_col=D**、dataはn44_rjfと共有） |
-| n44_rjf | meta_face_n44_rjf | 未確定(要再実測) | 未確定(要再実測) | 未確定(要再実測) | 未確定 | ○（22/22ブロック適用成功を確認済み。詳細行番号はセッション中断のため未記録。undo log: run 31782711402） |
+| n44_rjf | meta_face_n44_rjf | 9 | 7 | 783 | AH5 | ○（share_col=C、dataはlclと共有。undo log: run 31782711402） |
 | pom | meta_total_02 | 2 | 3 | 1153 | Z5 | ○（share_col=C） |
-| fp | meta_total | 未確定(要再実測) | 未確定(要再実測) | 未確定(要再実測) | W5(推定10000) | ○（82/81ブロック適用成功を確認済み。詳細行番号はセッション中断のため未記録。undo log: run 31782755396） |
+| fp | meta_total | 2 | 1136 | 1134 | W5 | ○（share_col=C。undo log: run 31782755396） |
 
 いずれも `--noroshi-col memo`（判定テキストのみメモ列に出す。中間コードは常に消化金額列）。
 中間コードはグレー、判定テキストは黒。中間コードは `0`/`1`/`2` のプレーンな数値のみ
