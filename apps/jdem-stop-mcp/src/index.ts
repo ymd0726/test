@@ -1534,6 +1534,32 @@ function handleSlackCommand(env: Env, ctx: ExecutionContext, bodyText: string, s
   return new Response("", { status: 200 });
 }
 
+// BUG-147提案④: 停止直後の結果メッセージに「取消」ボタンを付ける。
+// 従来は誤停止に気付いても `/cr-undo <cr名>` を手打ちする必要があった。
+//
+// ⚠️ 付ける先は response_url の ephemeral（＝停止を実行した本人にしか見えないメッセージ）に限定する。
+//    チャンネル全員向け通知(chat.postMessage)に付けると誰でも押せてしまうため。
+// memoMode は "full"（セルごと復元）。直後の誤操作訂正なので、停止前の状態に完全に戻すのが正しい。
+// 押下後は既存のundo経路がそのまま走る（集計表復元＋渡した広告IDだけACTIVE復帰）。
+// undo側も replace_original でこのメッセージを置き換えるため、ボタンは押下後に消える。
+function undoableStopResult(text: string, project: string, creative: string, adIds: string[], paused: number, sheetOk: boolean): unknown {
+  if (!paused && !sheetOk) return { replace_original: true, text }; // 何も実行できていない＝取り消す対象がない
+  const value = JSON.stringify({ a: "undo", p: project, c: creative, m: "full", ad: adIds });
+  // Slackのbutton valueは2000字上限。多数の広告を止めた場合は溢れるので、
+  // 中途半端に広告IDを落として「集計表だけ戻る」事故を起こさないようボタン自体を出さない。
+  if (value.length > 1800) return { replace_original: true, text: `${text}\n（取消は \`/cr-undo ${creative}\` で実行できます）` };
+  return {
+    replace_original: true,
+    text,
+    blocks: [
+      { type: "section", text: { type: "mrkdwn", text } },
+      { type: "actions", elements: [
+        { type: "button", text: { type: "plain_text", text: "↩️ この停止を取り消す" }, action_id: "do_undo_after_stop", value },
+      ] },
+    ],
+  };
+}
+
 async function postResponse(url: string, body: unknown): Promise<void> {
   if (!url) return;
   try {
@@ -1640,7 +1666,7 @@ function handleSlackInteract(env: Env, ctx: ExecutionContext, bodyText: string, 
             const r = await notifySlack(env, project.channelId, stopLines(v.c, v.d, paused, sheet, metaOn, `by <@${userId}>`, cascade, cx) + extra);
             if (!r.ok) note += inviteNote(r.error);
           }
-          await postResponse(responseUrl, { replace_original: true, text: stopLines(v.c, v.d, paused, sheet, metaOn, "", cascade, cx) + note });
+          await postResponse(responseUrl, undoableStopResult(stopLines(v.c, v.d, paused, sheet, metaOn, "", cascade, cx) + note, project.name, v.c, ids, paused, !!sheet?.success));
           await logToNotion(env, { creative: v.c, user: userName, userId, action: "停止", project: project.name, route: "Slack", metaCount: paused, sheetResult: sheetResultLabel(sheet) });
           await updateRunLog(env.NOTION_TOKEN, runLogId, {
             status: !metaErr && sheetResultLabel(sheet) !== "失敗" ? "完了" : "一部失敗",
