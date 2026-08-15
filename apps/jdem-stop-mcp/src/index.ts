@@ -1298,7 +1298,16 @@ function handleSlackInteract(env: Env, ctx: ExecutionContext, bodyText: string, 
   ctx.waitUntil(
     (async () => {
       try {
-        await postResponse(responseUrl, { replace_original: true, text: `⏳ *${v.c}* を${v.a === "undo" ? "取消" : "停止"}実行中…` });
+        // BUG-146: ids.length===0 は「集計表だけ記録」ボタン／Meta未連携／既存Meta広告なしの
+        // いずれかで、Metaには一切触れず集計表のみを更新する実行。従来は通常の停止と同じ
+        // 「実行中…」表示だったため、実際にはMetaを操作していないのに操作中であるかのように
+        // 見えていた（cr00等の集計表のみ運用CRで顕著）。進捗メッセージの時点で判別できるようにする。
+        const isSheetOnlyRun = ids.length === 0;
+        const progressVerb = v.a === "undo" ? "取消" : "停止";
+        const progressText = isSheetOnlyRun
+          ? `⏳ *${v.c}* の集計表${progressVerb}処理中…（Meta広告は操作しません）`
+          : `⏳ *${v.c}* を${progressVerb}実行中…`;
+        await postResponse(responseUrl, { replace_original: true, text: progressText });
         const inviteNote = (err?: string) => `\n⚠️ チャンネルへの全員通知に失敗（${err}）。このチャンネルで \`/invite @cr停止\` を実行してください。`;
         // 実行ログDB（TOOL-40）: 開始時に「実行中」で作成。途中死してもチェッカーが検出できる
         const runLogId = await createRunLog(env.NOTION_TOKEN, { tool: "cr停止くん", action: v.a === "undo" ? "取消" : "停止", project: project.name, crName: v.c, userName, userId, route: "Slack" });
