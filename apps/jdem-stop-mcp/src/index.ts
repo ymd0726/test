@@ -336,6 +336,11 @@ interface MetaAd { id: string; name: string; effective_status: string; adsetId?:
 // 広告が「どのCP・どのAS配下か」の情報（表示用・実行ログ用）
 interface AdPlacement { id: string; name?: string; adsetId?: string; adsetName?: string; campaignId?: string; campaignName?: string }
 
+// 停止判定の根拠数値（BUG-147提案A）。spendは常に正確、cvは下記のヒューリスティックで特定できた時のみ。
+interface AdMetrics { spend: number; cv: number | null; cvLabel?: string }
+// 広告セット単位の「配信中CRの残数」（BUG-147提案B）
+interface AdsetActivity { adsetId: string; adsetName?: string; activeBefore: number; remainingActive: number }
+
 // タイムアウト付き fetch→json（ハング防止）
 async function fetchJsonTimeout(url: string, ms: number): Promise<any> {
   const ctl = new AbortController();
@@ -425,6 +430,159 @@ async function fetchAdPlacements(token: string, ids: string[]): Promise<AdPlacem
   }
 }
 
+// ============================================================
+// 停止判定の根拠数値（BUG-147提案A）
+// Slackの停止判定投稿では毎回担当者が手で「消化金額48815円で0CV」等と書いている。
+// Meta Graph APIは既に叩いているので、停止時点の実績を通知に自動で載せる。
+// ============================================================
+// insightsの actions[] からどれを「CV」と見なすかの優先順位。
+// 当社案件（美容サロン等のリード獲得）は Metaのカスタムコンバージョン(form_submit等)で
+// 計測しているケースが多いため custom を最優先にしている。
+// ⚠️ どの action_type を採用したかは必ずメッセージにラベル表示する（数値の検証可能性を担保する。
+//    停止判断に使う数字なので、誤ったCVを黙って出すより「判定不可」の方が安全という方針）。
+const CV_ACTION_PRIORITY: RegExp[] = [
+  /^offsite_conversion\.custom\./,
+  /^offsite_conversion\.fb_pixel_lead$/,
+  /^onsite_conversion\.lead_grouped$/,
+  /^lead$/,
+  /^offsite_conversion\.fb_pixel_complete_registration$/,
+  /^complete_registration$/,
+  /^offsite_conversion\.fb_pixel_purchase$/,
+  /^purchase$/,
+  /^offsite_conversion\.fb_pixel_custom$/,
+];
+
+// actions[] から採用するCVを1つ選ぶ。優先度が同じ層に複数あれば値が最大のものを採る。
+function pickCvAction(actions: any[] | undefined): { value: number; label: string } | null {
+  if (!Array.isArray(actions) || !actions.length) return null;
+  for (const re of CV_ACTION_PRIORITY) {
+    const hits = actions.filter((a) => re.test(String(a?.action_type || "")));
+    if (!hits.length) continue;
+    const best = hits.reduce((m, a) => (Number(a.value || 0) > Number(m.value || 0) ? a : m));
+    return { value: Number(best.value || 0), label: String(best.action_type || "") };
+  }
+  return null;
+}
+
+// 広告ID群の実績を1回のGraph API呼び出しでまとめて取得（期間はdatePresetで指定）。
+// 表示用の付加情報なので、失敗しても停止処理は止めず空Mapを返す。
+async function fetchAdMetrics(token: string, ids: string[], datePreset: string): Promise<Map<string, AdMetrics>> {
+  const out = new Map<string, AdMetrics>();
+  if (!ids.length) return out;
+  try {
+    const fields = `insights.date_preset(${datePreset}){spend,actions}`;
+    const u = `https://graph.facebook.com/${GRAPH}/?ids=${encodeURIComponent(ids.join(","))}&fields=${encodeURIComponent(fields)}&access_token=${encodeURIComponent(token)}`;
+    const d = await fetchJsonTimeout(u, 10000);
+    if (!d || d.error) return out;
+    for (const id of ids) {
+      const row = d?.[id]?.insights?.data?.[0];
+      if (!row) continue;
+      const cv = pickCvAction(row.actions);
+      out.set(id, { spend: Number(row.spend || 0), cv: cv ? cv.value : null, cvLabel: cv?.label });
+    }
+  } catch {
+    /* 実績は表示用。取れなくても停止処理は続行 */
+  }
+  return out;
+}
+
+const yen = (n: number) => `¥${Math.round(n).toLocaleString("en-US")}`;
+
+// action_type をSlack表示用の短いラベルに（生の値は実行ログの詳細JSONに残す）。
+// 「どのイベントの数字か」が読み取れれば運用者が数値の妥当性を判断できる、という趣旨。
+function cvLabelJa(actionType: string | undefined): string {
+  const t = String(actionType || "");
+  if (/^offsite_conversion\.custom\./.test(t)) return "カスタムCV";
+  if (/lead/.test(t)) return "リード";
+  if (/complete_registration/.test(t)) return "登録完了";
+  if (/purchase/.test(t)) return "購入";
+  if (/fb_pixel_custom$/.test(t)) return "カスタムイベント";
+  return t || "?";
+}
+
+// 複数広告分を合算して「¥48,815 / 0CV / CPA -」の形にする
+function metricsSummary(m: Map<string, AdMetrics>, ids: string[]): { text: string; cvLabel?: string } | null {
+  const rows = ids.map((id) => m.get(id)).filter((x): x is AdMetrics => !!x);
+  if (!rows.length) return null;
+  const spend = rows.reduce((s, r) => s + r.spend, 0);
+  const known = rows.filter((r) => r.cv !== null);
+  // 一部の広告でCVを特定できない場合、合算すると過小なCPAを出してしまうため「判定不可」に倒す
+  if (known.length !== rows.length) return { text: `${yen(spend)} / CV判定不可` };
+  const cv = known.reduce((s, r) => s + (r.cv || 0), 0);
+  const cpa = cv > 0 ? yen(spend / cv) : "-";
+  return { text: `${yen(spend)} / ${cv}CV / CPA ${cpa}`, cvLabel: known.find((r) => r.cvLabel)?.cvLabel };
+}
+
+// 「📊 通算 … ｜ 直近30日 …」の1行。両期間とも取得できなければ行を出さない。
+function metricsLine(lifetime: Map<string, AdMetrics>, recent: Map<string, AdMetrics>, ids: string[]): string[] {
+  const lt = metricsSummary(lifetime, ids);
+  const rc = metricsSummary(recent, ids);
+  if (!lt && !rc) return [];
+  const parts: string[] = [];
+  if (lt) parts.push(`通算 ${lt.text}`);
+  if (rc) parts.push(`直近30日 ${rc.text}`);
+  const label = lt?.cvLabel || rc?.cvLabel;
+  return [`　📊 ${parts.join(" ｜ ")}${label ? `（CV=${cvLabelJa(label)}）` : ""}`];
+}
+
+// ============================================================
+// 広告セットの配信中CR残数チェック（BUG-147提案B）
+// 2026-07-27にhiroyoさんが「cr214_02を停止したため、1軍が0になってしまいました」と報告。
+// 停止でその広告セットの配信が止まってしまうケースを、停止前の確認画面と完了通知で警告する。
+// ============================================================
+// 対象広告セットの配信中(ACTIVE)広告数を数える。stoppedIdsは「今回止める/止めた広告」で、
+// Meta側の反映遅延に左右されないよう手元で除外して残数を出す。失敗時は空配列（警告を出さない）。
+async function fetchAdsetActivity(token: string, adsetIds: string[], stoppedIds: string[]): Promise<AdsetActivity[]> {
+  const uniq = [...new Set(adsetIds.filter(Boolean))];
+  if (!uniq.length) return [];
+  try {
+    const fields = "name,ads.limit(200){id,effective_status}";
+    const u = `https://graph.facebook.com/${GRAPH}/?ids=${encodeURIComponent(uniq.join(","))}&fields=${encodeURIComponent(fields)}&access_token=${encodeURIComponent(token)}`;
+    const d = await fetchJsonTimeout(u, 10000);
+    if (!d || d.error) return [];
+    const stopped = new Set(stoppedIds);
+    const out: AdsetActivity[] = [];
+    for (const adsetId of uniq) {
+      const node = d?.[adsetId];
+      if (!node) continue;
+      const ads: any[] = node?.ads?.data || [];
+      const active = ads.filter((a) => String(a?.effective_status) === "ACTIVE");
+      out.push({
+        adsetId,
+        adsetName: node?.name,
+        activeBefore: active.length,
+        remainingActive: active.filter((a) => !stopped.has(String(a.id))).length,
+      });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+// 残数0になった広告セットの警告行（停止後の通知用）。0件のASが無ければ行なし。
+function adsetZeroLines(acts: AdsetActivity[] | undefined): string[] {
+  const zero = (acts || []).filter((a) => a.remainingActive === 0 && a.activeBefore > 0);
+  if (!zero.length) return [];
+  return [`　⚠️ 広告セット${zero.map((a) => `「${a.adsetName || a.adsetId}」`).join("、")}の配信中CRが0件になりました（要確認）`];
+}
+
+// 「この広告群を止めたら配信中が0件になる広告セット」の名前一覧（停止前の確認画面用）。
+// 確認画面では止める対象がボタンごとに違う（1件だけ／配信中を全部）ため、activeBefore から都度計算する。
+function adsetsGoingZero(adsets: AdsetActivity[] | undefined, stopping: MetaAd[]): string[] {
+  if (!adsets?.length) return [];
+  const cnt = new Map<string, number>();
+  for (const a of stopping) if (a.adsetId) cnt.set(a.adsetId, (cnt.get(a.adsetId) || 0) + 1);
+  return adsets
+    .filter((act) => {
+      const n = cnt.get(act.adsetId) || 0;
+      return n > 0 && act.activeBefore > 0 && act.activeBefore - n <= 0;
+    })
+    .map((act) => act.adsetName || act.adsetId);
+}
+const zeroWarn = (names: string[]): string =>
+  names.length ? `\n⚠️ *この停止で広告セット${names.map((n) => `「${n}」`).join("、")}の配信中CRが0件になります*` : "";
+
 // 停止/再開した広告が「どのCP・どのAS配下だったか」の行を組む（BUG-147）。
 // 同一CP/ASにまとまっていれば1行、複数キャンペーン/広告セットにまたがる場合はグループごとに1行
 // （どこを止めたのかが1行で分からないと、別CPの同名crを巻き込んでいないか確認できないため）。
@@ -481,7 +639,7 @@ const resumeAds = (token: string, ids: string[]) => setAdsStatus(token, ids, "AC
 // ============================================================
 interface StopResult {
   alreadyStopped?: boolean;
-  meta?: { configured: boolean; found: number; paused?: number; adNames?: string[]; adIds?: string[]; errors?: string[]; places?: AdPlacement[] };
+  meta?: { configured: boolean; found: number; paused?: number; adNames?: string[]; adIds?: string[]; errors?: string[]; places?: AdPlacement[]; metricsLines?: string[]; adsets?: AdsetActivity[] };
   sheet?: any;
   cascade?: CascadeResult;
 }
@@ -534,9 +692,22 @@ async function doStop(env: Env, p: Project, creative: string, date: string): Pro
       // BUG-109: 直列awaitで無防備にthrowすると1件失敗しただけでB.集計表記録まで
       // 到達できず（claude.ai/MCP経由のstop_creativeで発生）、失敗理由も分からなかった。
       // setAdsStatus（Promise.allSettled）で並列実行しつつ成功件数と実際のエラー文言を取得する。
-      const r = await setAdsStatus(token, active.map((a) => a.id), "PAUSED");
-      // BUG-147: metaFindAds が既にCP/ASを引いているので、ここでは追加のAPI呼び出しなしで通知に載せられる
-      out.meta = { configured: true, found: ads.length, paused: r.success, adNames: active.map((a) => a.name), adIds: active.map((a) => a.id), errors: r.errors, places: active.map(adPlacementOf) };
+      const activeIds = active.map((a) => a.id);
+      const r = await setAdsStatus(token, activeIds, "PAUSED");
+      // BUG-147: metaFindAds が既にCP/ASを引いているので、CP/AS行は追加のAPI呼び出しなしで出せる。
+      // 根拠数値(提案A)とAS残数(提案B)だけ追加取得する（全て並列・失敗しても停止処理は止めない）。
+      const [lifetime, recent, adsets] = await Promise.all([
+        fetchAdMetrics(token, activeIds, "maximum"),
+        fetchAdMetrics(token, activeIds, "last_30d"),
+        fetchAdsetActivity(token, active.map((a) => a.adsetId || ""), activeIds),
+      ]);
+      out.meta = {
+        configured: true, found: ads.length, paused: r.success,
+        adNames: active.map((a) => a.name), adIds: activeIds, errors: r.errors,
+        places: active.map(adPlacementOf),
+        metricsLines: metricsLine(lifetime, recent, activeIds),
+        adsets,
+      };
     }
   } else {
     out.meta = { configured: false, found: 0 };
@@ -612,7 +783,11 @@ function fmtPublicStop(out: StopResult, creative: string, date: string, by: stri
   } else {
     lines.push("・Meta: 未連携");
   }
-  if (out.meta?.paused) lines.push(...placementLines(out.meta.places)); // BUG-147: どのCP/ASを止めたか
+  if (out.meta?.paused) { // BUG-147
+    lines.push(...placementLines(out.meta.places));
+    lines.push(...(out.meta.metricsLines || []));
+    lines.push(...adsetZeroLines(out.meta.adsets));
+  }
   lines.push(out.sheet?.success ? `✅ 集計表: 記録・グレー化（${date}）` : `❌ 集計表: ${out.sheet?.message || "失敗"}`);
   { const line = cascadeNotifyLine(out.cascade, (s) => `*${s}*`); if (line) lines.push(line); }
   return lines.join("\n");
@@ -724,7 +899,12 @@ function stopRunPatch(out: StopResult) {
     adsetIds: adsetIdsOf(out.meta?.places), // BUG-147
     sheetTabs: out.sheet?.sheet ? [String(out.sheet.sheet)] : [],
     detail: out.meta?.errors?.length || out.meta?.places?.length
-      ? { metaError: out.meta?.errors || [], placements: out.meta?.places?.length ? out.meta.places : undefined }
+      ? {
+          metaError: out.meta?.errors || [],
+          placements: out.meta?.places?.length ? out.meta.places : undefined,
+          metrics: out.meta?.metricsLines?.length ? out.meta.metricsLines : undefined,
+          adsets: out.meta?.adsets?.length ? out.meta.adsets : undefined,
+        }
       : undefined,
   };
 }
@@ -1103,7 +1283,7 @@ function adLine(a: MetaAd): string {
 }
 
 // Meta連携あり: 検索結果から停止確認ブロックを組む（2件以上は広告ごと個別選択）
-function buildStopBlocks(project: string, creative: string, date: string, ads: MetaAd[]) {
+function buildStopBlocks(project: string, creative: string, date: string, ads: MetaAd[], adsets?: AdsetActivity[]) {
   // 集計表だけ記録（Metaは触らない）ボタン共通
   const sheetOnlyBtn = { type: "button", text: { type: "plain_text", text: "集計表だけ記録" }, action_id: "do_stop_sheet", value: JSON.stringify({ a: "stop", p: project, c: creative, d: date, ad: [] }) };
   const cancelBtn = { type: "button", text: { type: "plain_text", text: "キャンセル" }, action_id: "cancel", value: JSON.stringify({ a: "cancel" }) };
@@ -1136,7 +1316,7 @@ function buildStopBlocks(project: string, creative: string, date: string, ads: M
     return {
       response_type: "ephemeral",
       blocks: [
-        { type: "section", text: { type: "mrkdwn", text: `*${project}* で以下を停止します（${date}）。よろしいですか？\n${adLine(a)}` } },
+        { type: "section", text: { type: "mrkdwn", text: `*${project}* で以下を停止します（${date}）。よろしいですか？\n${adLine(a)}${zeroWarn(adsetsGoingZero(adsets, [a]))}` } },
         { type: "actions", elements: [
           { type: "button", style: "danger", text: { type: "plain_text", text: "停止する" }, action_id: "do_stop", value: JSON.stringify({ a: "stop", p: project, c: creative, d: date, ad: [a.id] }) },
           sheetOnlyBtn,
@@ -1152,13 +1332,19 @@ function buildStopBlocks(project: string, creative: string, date: string, ads: M
     { type: "divider" },
   ];
   for (const a of ads) {
-    const sec: any = { type: "section", text: { type: "mrkdwn", text: adLine(a) } };
+    // BUG-147提案B: この1件を止めるとASの配信が0になる場合は、その広告の行に警告を出す
+    const warn = a.effective_status !== "PAUSED" ? zeroWarn(adsetsGoingZero(adsets, [a])) : "";
+    const sec: any = { type: "section", text: { type: "mrkdwn", text: adLine(a) + warn } };
     if (a.effective_status !== "PAUSED") {
       sec.accessory = { type: "button", style: "danger", text: { type: "plain_text", text: "この広告を停止" }, action_id: `do_stop_${a.id}`, value: JSON.stringify({ a: "stop", p: project, c: creative, d: date, ad: [a.id] }) };
     }
     blocks.push(sec);
   }
   blocks.push({ type: "divider" });
+  { // 「配信中をすべて停止」を押した場合に0件になるASの警告（個別停止時とは対象が異なるため別途計算）
+    const w = zeroWarn(adsetsGoingZero(adsets, active));
+    if (w) blocks.push({ type: "section", text: { type: "mrkdwn", text: `「配信中をすべて停止」の場合:${w}` } });
+  }
   blocks.push({ type: "actions", elements: [
     { type: "button", style: "danger", text: { type: "plain_text", text: `配信中をすべて停止 (${active.length}件)` }, action_id: "do_stop_all", value: JSON.stringify({ a: "stop", p: project, c: creative, d: date, ad: active.map((x) => x.id) }) },
     sheetOnlyBtn,
@@ -1232,10 +1418,17 @@ function simpleUndoConfirm(project: string, creative: string) {
 }
 
 // 実行結果メッセージ（Slack専用・明示ID版）
-function stopLines(creative: string, date: string, paused: number, sheet: any, metaOn: boolean, by: string, cascade?: CascadeResult, places?: AdPlacement[]): string {
+// BUG-147: 停止時に付ける付加情報（CP/AS・停止判定の根拠数値・AS残数警告）
+interface StopContext { places?: AdPlacement[]; metricsLines?: string[]; adsets?: AdsetActivity[] }
+
+function stopLines(creative: string, date: string, paused: number, sheet: any, metaOn: boolean, by: string, cascade?: CascadeResult, cx?: StopContext): string {
   const lines = [`🛑 *${creative}* を停止しました${by ? `　${by}` : ""}`];
   lines.push(!metaOn ? "・Meta: 未連携" : paused > 0 ? `✅ Meta広告: ${paused}件 停止（PAUSE）` : "・Meta広告: 変更なし（集計表のみ）");
-  if (paused > 0) lines.push(...placementLines(places)); // BUG-147: どのCP/ASを止めたか
+  if (paused > 0) {
+    lines.push(...placementLines(cx?.places));      // どのCP/ASを止めたか
+    lines.push(...(cx?.metricsLines || []));        // 停止判定の根拠数値
+    lines.push(...adsetZeroLines(cx?.adsets)); // そのASの配信が0になったか
+  }
   lines.push(sheet?.success ? `✅ 集計表: 記録・グレー化（${date}）` : `❌ 集計表: ${sheet?.message || "失敗"}`);
   { const line = cascadeNotifyLine(cascade, (s) => `*${s}*`); if (line) lines.push(line); }
   return lines.join("\n");
@@ -1293,7 +1486,18 @@ function handleSlackCommand(env: Env, ctx: ExecutionContext, bodyText: string, s
       try {
         await postResponse(responseUrl, { response_type: "ephemeral", text: `🔎 *${creative}* のMeta広告を検索中…` });
         const ads = await metaFindAds(token, project.metaAdAccountId!, creative);
-        const blocks = command === "/cr-undo" ? buildUndoBlocks(project.name, creative, ads) : buildStopBlocks(project.name, creative, stopDate, ads);
+        let blocks: any;
+        if (command === "/cr-undo") {
+          blocks = buildUndoBlocks(project.name, creative, ads);
+        } else {
+          // BUG-147提案B: 「押す前」に、この停止でその広告セットの配信が0件になるかを警告する
+          // （事後に気付くと配信が止まったまま時間が経つため。取得失敗時は警告なしで従来通り）。
+          const active = ads.filter((a) => a.effective_status !== "PAUSED");
+          const adsets = active.length
+            ? await fetchAdsetActivity(token, active.map((a) => a.adsetId || ""), active.map((a) => a.id))
+            : [];
+          blocks = buildStopBlocks(project.name, creative, stopDate, ads, adsets);
+        }
         await postResponse(responseUrl, blocks);
       } catch (e) {
         await postResponse(responseUrl, { response_type: "ephemeral", text: `❌ Meta検索エラー: ${e}` });
@@ -1383,10 +1587,20 @@ function handleSlackInteract(env: Env, ctx: ExecutionContext, bodyText: string, 
             } catch (e) { metaErr = String(e); metaErrDetail = [String(e)]; }
           }
           // BUG-147: Slackのボタンvalueには文字数上限がありCP/AS名まで積めないため、ここで広告IDから
-          // 引き直す。集計表(GAS)呼び出しと並行させて実測の待ち時間を増やさない（失敗時は[]）。
-          const placesP = paused > 0 ? fetchAdPlacements(token!, ids) : Promise.resolve([] as AdPlacement[]);
+          // 引き直す。併せて停止判定の根拠数値(提案A)とAS残数(提案B)も取得する。
+          // 全て集計表(GAS)呼び出しと並行させて実測の待ち時間を増やさない（失敗時は空・警告なし）。
+          const cxP: Promise<StopContext> = paused > 0 ? (async () => {
+            const places = await fetchAdPlacements(token!, ids);
+            const [lifetime, recent, adsets] = await Promise.all([
+              fetchAdMetrics(token!, ids, "maximum"),
+              fetchAdMetrics(token!, ids, "last_30d"),
+              fetchAdsetActivity(token!, places.map((p) => p.adsetId || ""), ids),
+            ]);
+            return { places, metricsLines: metricsLine(lifetime, recent, ids), adsets };
+          })() : Promise.resolve({} as StopContext);
           const sheet = target ? await callGasSafe(target, { action: "stop", creativeName: v.c, stopDate: v.d }) : { success: false, message: "集計表に該当crなし(複数対象)" };
-          const places = await placesP;
+          const cx = await cxP;
+          const places = cx.places || [];
           // BUG-112: 子CRの集計表停止が成功したら、兄弟の子が全員停止済みかチェックし、
           // 該当すれば親CRも自動停止する（失敗しても本処理は止めない）
           let cascade: CascadeResult | undefined;
@@ -1396,10 +1610,10 @@ function handleSlackInteract(env: Env, ctx: ExecutionContext, bodyText: string, 
           const extra = (metaErr ? `\n⚠️ Meta停止に失敗（${metaErr}）：${metaErrDetail.join(" / ") || "詳細不明"}` : "");
           let note = extra + runLogWarn;
           if (paused || sheet?.success) {
-            const r = await notifySlack(env, project.channelId, stopLines(v.c, v.d, paused, sheet, metaOn, `by <@${userId}>`, cascade, places) + extra);
+            const r = await notifySlack(env, project.channelId, stopLines(v.c, v.d, paused, sheet, metaOn, `by <@${userId}>`, cascade, cx) + extra);
             if (!r.ok) note += inviteNote(r.error);
           }
-          await postResponse(responseUrl, { replace_original: true, text: stopLines(v.c, v.d, paused, sheet, metaOn, "", cascade, places) + note });
+          await postResponse(responseUrl, { replace_original: true, text: stopLines(v.c, v.d, paused, sheet, metaOn, "", cascade, cx) + note });
           await logToNotion(env, { creative: v.c, user: userName, userId, action: "停止", project: project.name, route: "Slack", metaCount: paused, sheetResult: sheetResultLabel(sheet) });
           await updateRunLog(env.NOTION_TOKEN, runLogId, {
             status: !metaErr && sheetResultLabel(sheet) !== "失敗" ? "完了" : "一部失敗",
@@ -1409,7 +1623,7 @@ function handleSlackInteract(env: Env, ctx: ExecutionContext, bodyText: string, 
             adsetIds: adsetIdsOf(places), // BUG-147: 実行ログDBの「広告セットID」列（従来ずっと空だった）
             sheetTabs: sheet?.sheet ? [String(sheet.sheet)] : target?.sheetName ? [target.sheetName] : [],
             detail: metaErrDetail.length || cascade?.triggered || places.length
-              ? { metaError: metaErrDetail, cascade: cascade?.triggered ? cascade : undefined, placements: places.length ? places : undefined }
+              ? { metaError: metaErrDetail, cascade: cascade?.triggered ? cascade : undefined, placements: places.length ? places : undefined, metrics: cx.metricsLines?.length ? cx.metricsLines : undefined, adsets: cx.adsets?.length ? cx.adsets : undefined }
               : undefined,
           });
         } else {
