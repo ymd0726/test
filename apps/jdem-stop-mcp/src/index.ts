@@ -606,6 +606,16 @@ function placementGroups(places: AdPlacement[] | undefined): string[] {
 }
 const placementLines = (places: AdPlacement[] | undefined): string[] => placementGroups(places).map((g) => `　└ ${g}`);
 
+// BUG-147提案③: 実際に止めたMeta広告名の行。cr名(cr95_06)と広告名(jde_mak_cr95_06_…)は別物で、
+// 命名ミスや想定外の広告を掴んでいた場合に通知だけで気付けるようにする。
+// 広告名は長いので1件のときだけ全文（60字で打ち切り）、複数件は先頭＋「他N件」に畳む。
+const truncAdName = (s: string) => (s.length > 60 ? `${s.slice(0, 60)}…` : s);
+function adNameLines(places: AdPlacement[] | undefined): string[] {
+  const names = (places || []).map((p) => p.name).filter((n): n is string => !!n);
+  if (!names.length) return []; // 広告名が取れなければ行自体を出さない（従来の見た目に戻る）
+  return [`　└ 広告: ${truncAdName(names[0])}${names.length > 1 ? ` 他${names.length - 1}件` : ""}`];
+}
+
 async function metaSetStatus(token: string, adId: string, status: "PAUSED" | "ACTIVE"): Promise<void> {
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), 12000); // 1広告12秒でタイムアウト（ハング防止）
@@ -784,6 +794,7 @@ function fmtPublicStop(out: StopResult, creative: string, date: string, by: stri
     lines.push("・Meta: 未連携");
   }
   if (out.meta?.paused) { // BUG-147
+    lines.push(...adNameLines(out.meta.places));
     lines.push(...placementLines(out.meta.places));
     lines.push(...(out.meta.metricsLines || []));
     lines.push(...adsetZeroLines(out.meta.adsets));
@@ -1425,9 +1436,10 @@ function stopLines(creative: string, date: string, paused: number, sheet: any, m
   const lines = [`🛑 *${creative}* を停止しました${by ? `　${by}` : ""}`];
   lines.push(!metaOn ? "・Meta: 未連携" : paused > 0 ? `✅ Meta広告: ${paused}件 停止（PAUSE）` : "・Meta広告: 変更なし（集計表のみ）");
   if (paused > 0) {
+    lines.push(...adNameLines(cx?.places));         // 実際に止めた広告名
     lines.push(...placementLines(cx?.places));      // どのCP/ASを止めたか
     lines.push(...(cx?.metricsLines || []));        // 停止判定の根拠数値
-    lines.push(...adsetZeroLines(cx?.adsets)); // そのASの配信が0になったか
+    lines.push(...adsetZeroLines(cx?.adsets));      // そのASの配信が0になったか
   }
   lines.push(sheet?.success ? `✅ 集計表: 記録・グレー化（${date}）` : `❌ 集計表: ${sheet?.message || "失敗"}`);
   { const line = cascadeNotifyLine(cascade, (s) => `*${s}*`); if (line) lines.push(line); }
