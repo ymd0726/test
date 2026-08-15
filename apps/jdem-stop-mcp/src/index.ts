@@ -331,7 +331,10 @@ function adNameMatches(adName: string, creative: string): boolean {
   return re.test(String(adName).toLowerCase());
 }
 
-interface MetaAd { id: string; name: string; effective_status: string; adsetName?: string; campaignName?: string }
+interface MetaAd { id: string; name: string; effective_status: string; adsetId?: string; adsetName?: string; campaignId?: string; campaignName?: string }
+
+// 広告が「どのCP・どのAS配下か」の情報（表示用・実行ログ用）
+interface AdPlacement { id: string; name?: string; adsetId?: string; adsetName?: string; campaignId?: string; campaignName?: string }
 
 // タイムアウト付き fetch→json（ハング防止）
 async function fetchJsonTimeout(url: string, ms: number): Promise<any> {
@@ -391,19 +394,59 @@ async function metaFindAds(token: string, adAccountId: string, creative: string)
     }
   }
 
-  // ③ 一致した広告だけ CP名/AS名 を取得（軽量・表示用）
+  // ③ 一致した広告だけ CP/AS を取得（軽量・表示用）
   if (matched.length) {
-    try {
-      const ids = matched.map((m) => m.id).join(",");
-      const u2 = `https://graph.facebook.com/${GRAPH}/?ids=${encodeURIComponent(ids)}&fields=adset{name},campaign{name}&access_token=${encodeURIComponent(token)}`;
-      const d2 = await fetchJsonTimeout(u2, 8000);
-      matched = matched.map((m) => ({ ...m, adsetName: d2?.[m.id]?.adset?.name, campaignName: d2?.[m.id]?.campaign?.name }));
-    } catch {
-      /* CP/AS名は表示用なので取れなくても続行 */
-    }
+    const byId = new Map((await fetchAdPlacements(token, matched.map((m) => m.id))).map((p) => [p.id, p]));
+    matched = matched.map((m) => ({ ...m, adsetId: byId.get(m.id)?.adsetId, adsetName: byId.get(m.id)?.adsetName, campaignId: byId.get(m.id)?.campaignId, campaignName: byId.get(m.id)?.campaignName }));
   }
   return matched;
 }
+
+// 広告ID群のCP/AS（id・名前）を1回のGraph API呼び出しでまとめて取得する。
+// BUG-147: Slack通知に「どのCP・どのASで止めたか」を出すために使う。Slackのボタンvalueには
+// 文字数上限があり CP/AS名まで積めないため、ボタン押下後の実行時に広告IDから引き直す。
+// 表示・記録用の付加情報なので、失敗しても停止処理は止めず空配列を返す。
+async function fetchAdPlacements(token: string, ids: string[]): Promise<AdPlacement[]> {
+  if (!ids.length) return [];
+  try {
+    const u = `https://graph.facebook.com/${GRAPH}/?ids=${encodeURIComponent(ids.join(","))}&fields=name,adset{id,name},campaign{id,name}&access_token=${encodeURIComponent(token)}`;
+    const d = await fetchJsonTimeout(u, 8000);
+    if (!d || d.error) return [];
+    return ids.map((id) => ({
+      id,
+      name: d?.[id]?.name,
+      adsetId: d?.[id]?.adset?.id,
+      adsetName: d?.[id]?.adset?.name,
+      campaignId: d?.[id]?.campaign?.id,
+      campaignName: d?.[id]?.campaign?.name,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+// 停止/再開した広告が「どのCP・どのAS配下だったか」の行を組む（BUG-147）。
+// 同一CP/ASにまとまっていれば1行、複数キャンペーン/広告セットにまたがる場合はグループごとに1行
+// （どこを止めたのかが1行で分からないと、別CPの同名crを巻き込んでいないか確認できないため）。
+// 実行ログDBの「広告セットID」列用（重複除去）。どのASを触ったかを後から追える。
+const adsetIdsOf = (places: AdPlacement[] | undefined): string[] =>
+  [...new Set((places || []).map((p) => p.adsetId).filter((x): x is string => !!x))];
+
+const adPlacementOf = (a: MetaAd): AdPlacement =>
+  ({ id: a.id, name: a.name, adsetId: a.adsetId, adsetName: a.adsetName, campaignId: a.campaignId, campaignName: a.campaignName });
+
+function placementGroups(places: AdPlacement[] | undefined): string[] {
+  if (!places?.length) return [];
+  if (!places.some((p) => p.campaignName || p.adsetName)) return []; // 全て取得失敗なら出さない
+  const groups = new Map<string, number>();
+  for (const p of places) {
+    const key = `CP: ${p.campaignName || "?"} ／ AS: ${p.adsetName || "?"}`;
+    groups.set(key, (groups.get(key) || 0) + 1);
+  }
+  if (groups.size === 1) return [[...groups.keys()][0]];
+  return [...groups.entries()].map(([k, n]) => `${k}（${n}件）`);
+}
+const placementLines = (places: AdPlacement[] | undefined): string[] => placementGroups(places).map((g) => `　└ ${g}`);
 
 async function metaSetStatus(token: string, adId: string, status: "PAUSED" | "ACTIVE"): Promise<void> {
   const ctl = new AbortController();
@@ -438,7 +481,7 @@ const resumeAds = (token: string, ids: string[]) => setAdsStatus(token, ids, "AC
 // ============================================================
 interface StopResult {
   alreadyStopped?: boolean;
-  meta?: { configured: boolean; found: number; paused?: number; adNames?: string[]; adIds?: string[]; errors?: string[] };
+  meta?: { configured: boolean; found: number; paused?: number; adNames?: string[]; adIds?: string[]; errors?: string[]; places?: AdPlacement[] };
   sheet?: any;
   cascade?: CascadeResult;
 }
@@ -492,7 +535,8 @@ async function doStop(env: Env, p: Project, creative: string, date: string): Pro
       // 到達できず（claude.ai/MCP経由のstop_creativeで発生）、失敗理由も分からなかった。
       // setAdsStatus（Promise.allSettled）で並列実行しつつ成功件数と実際のエラー文言を取得する。
       const r = await setAdsStatus(token, active.map((a) => a.id), "PAUSED");
-      out.meta = { configured: true, found: ads.length, paused: r.success, adNames: active.map((a) => a.name), adIds: active.map((a) => a.id), errors: r.errors };
+      // BUG-147: metaFindAds が既にCP/ASを引いているので、ここでは追加のAPI呼び出しなしで通知に載せられる
+      out.meta = { configured: true, found: ads.length, paused: r.success, adNames: active.map((a) => a.name), adIds: active.map((a) => a.id), errors: r.errors, places: active.map(adPlacementOf) };
     }
   } else {
     out.meta = { configured: false, found: 0 };
@@ -526,7 +570,7 @@ async function doUndo(env: Env, p: Project, creative: string, memoMode: "full" |
     const ads = await metaFindAds(token, p.metaAdAccountId, creative);
     const paused = ads.filter((a) => a.effective_status === "PAUSED");
     const r = await setAdsStatus(token, paused.map((a) => a.id), "ACTIVE");
-    out.meta = { resumed: r.success, adNames: paused.map((a) => a.name), adIds: paused.map((a) => a.id), errors: r.errors };
+    out.meta = { resumed: r.success, adNames: paused.map((a) => a.name), adIds: paused.map((a) => a.id), errors: r.errors, places: paused.map(adPlacementOf) };
   }
   return out;
 }
@@ -539,6 +583,7 @@ function fmtStop(out: StopResult, creative: string, date: string): string {
   const parts: string[] = [];
   if (out.meta?.configured) {
     parts.push(out.meta.found === 0 ? "⚠️Meta広告が見つかりません" : `Meta ${out.meta.paused}件停止`);
+    if (out.meta.paused) parts.push(...placementGroups(out.meta.places)); // BUG-147: どのCP/ASを止めたか
     if (out.meta.errors?.length) parts.push(`⚠️Meta失敗理由: ${out.meta.errors.join(" / ")}`);
   } else {
     parts.push("Meta未連携");
@@ -552,6 +597,7 @@ function fmtUndo(out: any, creative: string, memoMode: string): string {
   const parts: string[] = [];
   if (out.meta) {
     parts.push(`Meta ${out.meta.resumed}件再開`);
+    if (out.meta.resumed) parts.push(...placementGroups(out.meta.places)); // BUG-147: どのCP/ASを再開したか
     if (out.meta.errors?.length) parts.push(`⚠️Meta失敗理由: ${out.meta.errors.join(" / ")}`);
   }
   parts.push(`集計表 復元(${memoMode})`);
@@ -566,6 +612,7 @@ function fmtPublicStop(out: StopResult, creative: string, date: string, by: stri
   } else {
     lines.push("・Meta: 未連携");
   }
+  if (out.meta?.paused) lines.push(...placementLines(out.meta.places)); // BUG-147: どのCP/ASを止めたか
   lines.push(out.sheet?.success ? `✅ 集計表: 記録・グレー化（${date}）` : `❌ 集計表: ${out.sheet?.message || "失敗"}`);
   { const line = cascadeNotifyLine(out.cascade, (s) => `*${s}*`); if (line) lines.push(line); }
   return lines.join("\n");
@@ -573,6 +620,7 @@ function fmtPublicStop(out: StopResult, creative: string, date: string, by: stri
 function fmtPublicUndo(out: any, creative: string, memoMode: string, by: string): string {
   const lines = [`↩️ *${creative}* の停止を取り消しました　${by}`];
   if (out.meta) lines.push(`✅ Meta広告: ${out.meta.resumed}件 再開（ACTIVE）`);
+  if (out.meta?.resumed) lines.push(...placementLines(out.meta.places)); // BUG-147: どのCP/ASを再開したか
   lines.push(`✅ 集計表: 復元（${memoMode}）`);
   return lines.join("\n");
 }
@@ -673,8 +721,11 @@ function stopRunPatch(out: StopResult) {
     metaResult,
     sheetResult,
     adIds: out.meta?.adIds || [],
+    adsetIds: adsetIdsOf(out.meta?.places), // BUG-147
     sheetTabs: out.sheet?.sheet ? [String(out.sheet.sheet)] : [],
-    detail: out.meta?.errors?.length ? { metaError: out.meta.errors } : undefined,
+    detail: out.meta?.errors?.length || out.meta?.places?.length
+      ? { metaError: out.meta?.errors || [], placements: out.meta?.places?.length ? out.meta.places : undefined }
+      : undefined,
   };
 }
 function undoRunPatch(out: any) {
@@ -684,7 +735,10 @@ function undoRunPatch(out: any) {
     metaResult: out.meta ? "成功" : "未実行",
     sheetResult,
     adIds: out.meta?.adIds || [],
-    detail: out.meta?.errors?.length ? { metaError: out.meta.errors } : undefined,
+    adsetIds: adsetIdsOf(out.meta?.places), // BUG-147
+    detail: out.meta?.errors?.length || out.meta?.places?.length
+      ? { metaError: out.meta?.errors || [], placements: out.meta?.places?.length ? out.meta.places : undefined }
+      : undefined,
   };
 }
 
@@ -1178,16 +1232,18 @@ function simpleUndoConfirm(project: string, creative: string) {
 }
 
 // 実行結果メッセージ（Slack専用・明示ID版）
-function stopLines(creative: string, date: string, paused: number, sheet: any, metaOn: boolean, by: string, cascade?: CascadeResult): string {
+function stopLines(creative: string, date: string, paused: number, sheet: any, metaOn: boolean, by: string, cascade?: CascadeResult, places?: AdPlacement[]): string {
   const lines = [`🛑 *${creative}* を停止しました${by ? `　${by}` : ""}`];
   lines.push(!metaOn ? "・Meta: 未連携" : paused > 0 ? `✅ Meta広告: ${paused}件 停止（PAUSE）` : "・Meta広告: 変更なし（集計表のみ）");
+  if (paused > 0) lines.push(...placementLines(places)); // BUG-147: どのCP/ASを止めたか
   lines.push(sheet?.success ? `✅ 集計表: 記録・グレー化（${date}）` : `❌ 集計表: ${sheet?.message || "失敗"}`);
   { const line = cascadeNotifyLine(cascade, (s) => `*${s}*`); if (line) lines.push(line); }
   return lines.join("\n");
 }
-function undoLines(creative: string, memoMode: string, resumed: number, sheet: any, metaOn: boolean, by: string): string {
+function undoLines(creative: string, memoMode: string, resumed: number, sheet: any, metaOn: boolean, by: string, places?: AdPlacement[]): string {
   const lines = [`↩️ *${creative}* の停止を取り消しました${by ? `　${by}` : ""}`];
   if (metaOn) lines.push(`✅ Meta広告: ${resumed}件 再開（ACTIVE）`);
+  if (metaOn && resumed > 0) lines.push(...placementLines(places)); // BUG-147: どのCP/ASを再開したか
   lines.push(sheet?.success ? `✅ 集計表: 復元（${memoMode}）` : `⚠️ 集計表: ${sheet?.message || "取消情報なし"}`);
   return lines.join("\n");
 }
@@ -1326,7 +1382,11 @@ function handleSlackInteract(env: Env, ctx: ExecutionContext, bodyText: string, 
               if (paused < ids.length) { metaErr = `${ids.length - paused}件の停止に失敗`; metaErrDetail = r.errors; }
             } catch (e) { metaErr = String(e); metaErrDetail = [String(e)]; }
           }
+          // BUG-147: Slackのボタンvalueには文字数上限がありCP/AS名まで積めないため、ここで広告IDから
+          // 引き直す。集計表(GAS)呼び出しと並行させて実測の待ち時間を増やさない（失敗時は[]）。
+          const placesP = paused > 0 ? fetchAdPlacements(token!, ids) : Promise.resolve([] as AdPlacement[]);
           const sheet = target ? await callGasSafe(target, { action: "stop", creativeName: v.c, stopDate: v.d }) : { success: false, message: "集計表に該当crなし(複数対象)" };
+          const places = await placesP;
           // BUG-112: 子CRの集計表停止が成功したら、兄弟の子が全員停止済みかチェックし、
           // 該当すれば親CRも自動停止する（失敗しても本処理は止めない）
           let cascade: CascadeResult | undefined;
@@ -1336,18 +1396,21 @@ function handleSlackInteract(env: Env, ctx: ExecutionContext, bodyText: string, 
           const extra = (metaErr ? `\n⚠️ Meta停止に失敗（${metaErr}）：${metaErrDetail.join(" / ") || "詳細不明"}` : "");
           let note = extra + runLogWarn;
           if (paused || sheet?.success) {
-            const r = await notifySlack(env, project.channelId, stopLines(v.c, v.d, paused, sheet, metaOn, `by <@${userId}>`, cascade) + extra);
+            const r = await notifySlack(env, project.channelId, stopLines(v.c, v.d, paused, sheet, metaOn, `by <@${userId}>`, cascade, places) + extra);
             if (!r.ok) note += inviteNote(r.error);
           }
-          await postResponse(responseUrl, { replace_original: true, text: stopLines(v.c, v.d, paused, sheet, metaOn, "", cascade) + note });
+          await postResponse(responseUrl, { replace_original: true, text: stopLines(v.c, v.d, paused, sheet, metaOn, "", cascade, places) + note });
           await logToNotion(env, { creative: v.c, user: userName, userId, action: "停止", project: project.name, route: "Slack", metaCount: paused, sheetResult: sheetResultLabel(sheet) });
           await updateRunLog(env.NOTION_TOKEN, runLogId, {
             status: !metaErr && sheetResultLabel(sheet) !== "失敗" ? "完了" : "一部失敗",
             metaResult: !metaOn ? "未実行" : ids.length === 0 ? "対象なし" : metaErr ? "失敗" : "成功",
             sheetResult: sheetResultLabel(sheet),
             adIds: ids,
+            adsetIds: adsetIdsOf(places), // BUG-147: 実行ログDBの「広告セットID」列（従来ずっと空だった）
             sheetTabs: sheet?.sheet ? [String(sheet.sheet)] : target?.sheetName ? [target.sheetName] : [],
-            detail: metaErrDetail.length || cascade?.triggered ? { metaError: metaErrDetail, cascade: cascade?.triggered ? cascade : undefined } : undefined,
+            detail: metaErrDetail.length || cascade?.triggered || places.length
+              ? { metaError: metaErrDetail, cascade: cascade?.triggered ? cascade : undefined, placements: places.length ? places : undefined }
+              : undefined,
           });
         } else {
           let resumed = 0;
@@ -1358,22 +1421,27 @@ function handleSlackInteract(env: Env, ctx: ExecutionContext, bodyText: string, 
               if (resumed < ids.length) { metaErr = `${ids.length - resumed}件の再開に失敗`; metaErrDetail = r.errors; }
             } catch (e) { metaErr = String(e); metaErrDetail = [String(e)]; }
           }
+          const placesP = resumed > 0 ? fetchAdPlacements(token!, ids) : Promise.resolve([] as AdPlacement[]);
           const sheet = target ? await callGasSafe(target, { action: "undo", creativeName: v.c, memoMode: v.m || "tag" }) : { success: false, message: "集計表に該当crなし(複数対象)" };
+          const places = await placesP;
           const extra = (metaErr ? `\n⚠️ Meta再開に失敗（${metaErr}）：${metaErrDetail.join(" / ") || "詳細不明"}` : "");
           let note = extra + runLogWarn;
           if (resumed || sheet?.success) {
-            const r = await notifySlack(env, project.channelId, undoLines(v.c, v.m || "tag", resumed, sheet, metaOn, `by <@${userId}>`) + extra);
+            const r = await notifySlack(env, project.channelId, undoLines(v.c, v.m || "tag", resumed, sheet, metaOn, `by <@${userId}>`, places) + extra);
             if (!r.ok) note += inviteNote(r.error);
           }
-          await postResponse(responseUrl, { replace_original: true, text: undoLines(v.c, v.m || "tag", resumed, sheet, metaOn, "") + note });
+          await postResponse(responseUrl, { replace_original: true, text: undoLines(v.c, v.m || "tag", resumed, sheet, metaOn, "", places) + note });
           await logToNotion(env, { creative: v.c, user: userName, userId, action: "取消", project: project.name, route: "Slack", metaCount: resumed, sheetResult: sheetResultLabel(sheet) });
           await updateRunLog(env.NOTION_TOKEN, runLogId, {
             status: !metaErr && sheetResultLabel(sheet) !== "失敗" ? "完了" : "一部失敗",
             metaResult: !metaOn ? "未実行" : ids.length === 0 ? "対象なし" : metaErr ? "失敗" : "成功",
             sheetResult: sheetResultLabel(sheet),
             adIds: ids,
+            adsetIds: adsetIdsOf(places), // BUG-147: 実行ログDBの「広告セットID」列（従来ずっと空だった）
             sheetTabs: target?.sheetName ? [target.sheetName] : [],
-            detail: metaErrDetail.length ? { metaError: metaErrDetail } : undefined,
+            detail: metaErrDetail.length || places.length
+              ? { metaError: metaErrDetail, placements: places.length ? places : undefined }
+              : undefined,
           });
         }
       } catch (e) {
