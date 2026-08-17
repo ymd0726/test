@@ -265,19 +265,45 @@ function cascadeNotifyLine(cascade: CascadeResult | undefined, bold: (s: string)
   return `👨‍👧 親CR ${bold(cascade.parentId)} も自動停止しました（子CR ${children} が全て停止／メモ:「子供が全て停止」）`;
 }
 
-// GAS呼び出しのタイムアウト（BUG-147提案⑥(a)）。
-// 従来は一律25秒だったが、kk_mak が 列数2304・ブロック数148 まで拡大し（BUG-113時点は
-// 2190列・99ブロック）、stop の1回で findNameCol が 8行×2304列＝約18,000セル、さらに
-// findDailyAndMonthlyRow がA列全行を読むため25秒に収まらず AbortError になっていた
-// （jdekmakのcr79_05/cr95_06、BUG-141続報）。
-//
-// ⚠️ これは「まず効くか測る」ための延長であって根治ではない。本命はGAS側の読み取り最適化
-// （findNameColが読んだ8行×全列に resolveBlockCols が必要な1行目も含まれているのに読み直している等）
-// で、そちらはGASの手動再デプロイが必要なため別対応とする。
-// 延長対象は失敗が実害になる stop/undo のみ。find(pickSheet/findProjectsで全シート並列に叩く)や
-// ベストエフォートの cascade/regray は 25秒 のまま据え置き、waitUntil 全体が延びるのを防ぐ。
-const GAS_TIMEOUT_CRITICAL_MS = 50000; // stop / undo
+// GAS呼び出しのタイムアウト。
+// BUG-147提案⑥(a) で stop/undo だけ 25秒→50秒 に延ばしたが、BUG-159 で**この延長が
+// 悪化要因だったと判明したため25秒へ戻した**。理由は下の「実行時間バジェット」を参照。
+const GAS_TIMEOUT_CRITICAL_MS = 25000; // stop / undo
 const GAS_TIMEOUT_DEFAULT_MS = 25000;  // find / cascade / regray / budget
+
+// ============================================================
+// 実行時間バジェット（BUG-159）
+// ============================================================
+// Slack経路の停止/取消は ctx.waitUntil() の中で全部やりきる作りだが、Workerの1回の実行には
+// 上限があり、超えると**残りの処理が問答無用で打ち切られる**（＝結果通知もupdateRunLogも
+// 実行されず、Slackが「⏳ 停止実行中…」のまま固まり、実行ログも「実行中」のまま残る）。
+//
+// BUG-159 の実測: jdem/cr42_03 は 08-13 の claude.ai/MCP経由（waitUntilを使わない通常の
+// リクエスト）では「Meta成功／集計表失敗」を最後まで記録できていたのに、08-18 の Slack経由
+// では 結果_Meta すら null のまま「実行中」で残っていた。同じcrで経路だけが違う。
+// この間に入った変更が v3.13 のGASタイムアウト 25→50秒 で、遅い集計表では
+// 「50秒待つ→その後の通知・ログ更新に到達する前に打ち切られる」形になっていた。
+// （v3.11/v3.12 で足したCP/AS・実績・AS残数の取得も、わずかだが尾を伸ばしている）
+//
+// 対策は2つ。①50秒を25秒に戻す ②**全体の時間予算**を持ち、重い処理に割ける時間を
+// 「終端処理ぶんを引いた残り」に制限する。これにより最悪でも
+// 「集計表は時間切れだったが、結果はSlackに出るし実行ログも終端化される」に着地する。
+//
+// ⚠️ 構造的な根治は、cr入稿くんが既に採用している self-chaining continuation
+//    （`src/submit/continuation.ts`: 1ホップ=1単位の仕事に分割して自分自身へPOST）に
+//    停止フローも寄せること。本対応は「黙って固まる」のを止めるまでに留める。
+const RUN_BUDGET_MS = 45000;   // waitUntil 内でやりきる全体の目安
+const TAIL_RESERVE_MS = 15000; // 結果通知・実行ログ終端化のために必ず残す分
+
+interface RunBudget { allow(maxMs: number): number; elapsed(): number }
+function startRunBudget(): RunBudget {
+  const t0 = Date.now();
+  return {
+    // この処理に割ってよい時間。0なら「もう時間が無いのでスキップ」の判断に使う
+    allow: (maxMs: number) => Math.max(0, Math.min(maxMs, RUN_BUDGET_MS - TAIL_RESERVE_MS - (Date.now() - t0))),
+    elapsed: () => Date.now() - t0,
+  };
+}
 
 async function callGas(target: SheetTarget, payload: GasPayload, timeoutMs = GAS_TIMEOUT_DEFAULT_MS): Promise<any> {
   // ハング防止（GASが重い/固まっても無限に待たない）
@@ -314,10 +340,15 @@ async function callGas(target: SheetTarget, payload: GasPayload, timeoutMs = GAS
 // Meta側の成否が分からず利用者が手動で確認・再実行する必要があった（cr79_05/cr95_06で発生）。
 // 例外を既存のGasResult形状（{success:false,message}）に変換し、stopLines()等が
 // 「✅Meta広告:成功／❌集計表:失敗（理由・再実行案内）」という分かりやすい形を組み立てられるようにする。
-// callGasSafe は stop/undo からのみ呼ばれる＝失敗が実害になる経路なので、長い方のタイムアウトを使う。
-async function callGasSafe(target: SheetTarget, payload: GasPayload): Promise<any> {
+// callGasSafe は stop/undo からのみ呼ばれる＝失敗が実害になる経路。
+// budget を渡すと「終端処理ぶんを残した上での残り時間」まで縮められる（BUG-159）。
+async function callGasSafe(target: SheetTarget, payload: GasPayload, budget?: RunBudget): Promise<any> {
+  const ms = budget ? budget.allow(GAS_TIMEOUT_CRITICAL_MS) : GAS_TIMEOUT_CRITICAL_MS;
+  if (ms <= 0) {
+    return { success: false, message: "実行時間の上限に達したため集計表の記録をスキップしました。もう一度実行すると集計表のみ再試行されます。" };
+  }
   try {
-    return await callGas(target, payload, GAS_TIMEOUT_CRITICAL_MS);
+    return await callGas(target, payload, ms);
   } catch (e) {
     return {
       success: false,
@@ -682,10 +713,10 @@ interface StopResult {
 // BUG-112: 子CR(crN_NN)の集計表停止が成功した直後に呼ぶ。兄弟の子が全員停止済みになっていれば
 // GAS側が親(crN)も集計表停止する（メモ「子供が全て停止」）。親は「子持ち親はMeta未入稿」が原則だが、
 // 命名規則の例外（実は親にも広告がある）に備え、triggeredの場合はここでMeta側も念のため探して止める。
-async function cascadeCheckAndStopParent(env: Env, p: Project, target: SheetTarget, childCreative: string, date: string): Promise<CascadeResult | undefined> {
+async function cascadeCheckAndStopParent(env: Env, p: Project, target: SheetTarget, childCreative: string, date: string, timeoutMs = GAS_TIMEOUT_DEFAULT_MS): Promise<CascadeResult | undefined> {
   let cascade: CascadeResult;
   try {
-    cascade = await callGas(target, { action: "cascade_check", creativeName: childCreative, stopDate: date });
+    cascade = await callGas(target, { action: "cascade_check", creativeName: childCreative, stopDate: date }, timeoutMs);
   } catch (e) {
     return { triggered: false, reason: `cascade_check失敗: ${e}` };
   }
@@ -1620,6 +1651,10 @@ function handleSlackInteract(env: Env, ctx: ExecutionContext, bodyText: string, 
   // 即ACK（cold-start耐性）。進捗・結果は response_url 経由。
   ctx.waitUntil(
     (async () => {
+      // BUG-159: Workerの1回の実行時間には上限があり、超えると結果通知もupdateRunLogも
+      // 打ち切られてSlackが「⏳実行中…」のまま固まる。重い処理に割ける時間を制限して
+      // 終端処理へ必ず到達させる。
+      const budget = startRunBudget();
       try {
         // BUG-146: ids.length===0 は「集計表だけ記録」ボタン／Meta未連携／既存Meta広告なしの
         // いずれかで、Metaには一切触れず集計表のみを更新する実行。従来は通常の停止と同じ
@@ -1661,34 +1696,46 @@ function handleSlackInteract(env: Env, ctx: ExecutionContext, bodyText: string, 
             ]);
             return { places, metricsLines: metricsLine(lifetime, recent, ids), adsets };
           })() : Promise.resolve({} as StopContext);
-          const sheet = target ? await callGasSafe(target, { action: "stop", creativeName: v.c, stopDate: v.d }) : { success: false, message: "集計表に該当crなし(複数対象)" };
+          const sheet = target ? await callGasSafe(target, { action: "stop", creativeName: v.c, stopDate: v.d }, budget) : { success: false, message: "集計表に該当crなし(複数対象)" };
           const cx = await cxP;
           const places = cx.places || [];
           // BUG-112: 子CRの集計表停止が成功したら、兄弟の子が全員停止済みかチェックし、
           // 該当すれば親CRも自動停止する（失敗しても本処理は止めない）
+          // BUG-159: 残り時間が無ければスキップ。ベストエフォートの処理のために結果通知が
+          // 打ち切られる方が実害が大きいため。スキップしたことは黙らずメッセージに出す。
           let cascade: CascadeResult | undefined;
+          let cascadeSkipped = false;
           if (target && sheet?.success) {
-            try { cascade = await cascadeCheckAndStopParent(env, project as Project, target, v.c, v.d); } catch { /* ベストエフォート */ }
+            const ms = budget.allow(GAS_TIMEOUT_DEFAULT_MS);
+            if (ms > 0) {
+              try { cascade = await cascadeCheckAndStopParent(env, project as Project, target, v.c, v.d, ms); } catch { /* ベストエフォート */ }
+            } else {
+              cascadeSkipped = true;
+            }
           }
-          const extra = (metaErr ? `\n⚠️ Meta停止に失敗（${metaErr}）：${metaErrDetail.join(" / ") || "詳細不明"}` : "");
+          const extra = (metaErr ? `\n⚠️ Meta停止に失敗（${metaErr}）：${metaErrDetail.join(" / ") || "詳細不明"}` : "")
+            + (cascadeSkipped ? "\n⚠️ 実行時間の都合で親子連動チェックをスキップしました（親CRの自動停止は行われていません）" : "");
           let note = extra + runLogWarn;
           if (paused || sheet?.success) {
             const r = await notifySlack(env, project.channelId, stopLines(v.c, v.d, paused, sheet, metaOn, `by <@${userId}>`, cascade, cx) + extra);
             if (!r.ok) note += inviteNote(r.error);
           }
-          await postResponse(responseUrl, undoableStopResult(stopLines(v.c, v.d, paused, sheet, metaOn, "", cascade, cx) + note, project.name, v.c, ids, paused, !!sheet?.success));
-          await logToNotion(env, { creative: v.c, user: userName, userId, action: "停止", project: project.name, route: "Slack", metaCount: paused, sheetResult: sheetResultLabel(sheet) });
-          await updateRunLog(env.NOTION_TOKEN, runLogId, {
-            status: !metaErr && sheetResultLabel(sheet) !== "失敗" ? "完了" : "一部失敗",
-            metaResult: !metaOn ? "未実行" : ids.length === 0 ? "対象なし" : metaErr ? "失敗" : "成功",
-            sheetResult: sheetResultLabel(sheet),
-            adIds: ids,
-            adsetIds: adsetIdsOf(places), // BUG-147: 実行ログDBの「広告セットID」列（従来ずっと空だった）
-            sheetTabs: sheet?.sheet ? [String(sheet.sheet)] : target?.sheetName ? [target.sheetName] : [],
-            detail: metaErrDetail.length || cascade?.triggered || places.length
-              ? { metaError: metaErrDetail, cascade: cascade?.triggered ? cascade : undefined, placements: places.length ? places : undefined, metrics: cx.metricsLines?.length ? cx.metricsLines : undefined, adsets: cx.adsets?.length ? cx.adsets : undefined }
-              : undefined,
-          });
+          // BUG-159: 終端処理は互いに独立なので並列化し、打ち切られる前に確実に終わらせる
+          await Promise.all([
+            postResponse(responseUrl, undoableStopResult(stopLines(v.c, v.d, paused, sheet, metaOn, "", cascade, cx) + note, project.name, v.c, ids, paused, !!sheet?.success)),
+            logToNotion(env, { creative: v.c, user: userName, userId, action: "停止", project: project.name, route: "Slack", metaCount: paused, sheetResult: sheetResultLabel(sheet) }),
+            updateRunLog(env.NOTION_TOKEN, runLogId, {
+              status: !metaErr && sheetResultLabel(sheet) !== "失敗" ? "完了" : "一部失敗",
+              metaResult: !metaOn ? "未実行" : ids.length === 0 ? "対象なし" : metaErr ? "失敗" : "成功",
+              sheetResult: sheetResultLabel(sheet),
+              adIds: ids,
+              adsetIds: adsetIdsOf(places), // BUG-147: 実行ログDBの「広告セットID」列（従来ずっと空だった）
+              sheetTabs: sheet?.sheet ? [String(sheet.sheet)] : target?.sheetName ? [target.sheetName] : [],
+              detail: metaErrDetail.length || cascade?.triggered || places.length || cascadeSkipped
+                ? { metaError: metaErrDetail, cascade: cascade?.triggered ? cascade : undefined, cascadeSkipped: cascadeSkipped || undefined, placements: places.length ? places : undefined, metrics: cx.metricsLines?.length ? cx.metricsLines : undefined, adsets: cx.adsets?.length ? cx.adsets : undefined, elapsedMs: budget.elapsed() }
+                : { elapsedMs: budget.elapsed() },
+            }),
+          ]);
         } else {
           let resumed = 0;
           if (metaOn && ids.length) {
@@ -1699,7 +1746,7 @@ function handleSlackInteract(env: Env, ctx: ExecutionContext, bodyText: string, 
             } catch (e) { metaErr = String(e); metaErrDetail = [String(e)]; }
           }
           const placesP = resumed > 0 ? fetchAdPlacements(token!, ids) : Promise.resolve([] as AdPlacement[]);
-          const sheet = target ? await callGasSafe(target, { action: "undo", creativeName: v.c, memoMode: v.m || "tag" }) : { success: false, message: "集計表に該当crなし(複数対象)" };
+          const sheet = target ? await callGasSafe(target, { action: "undo", creativeName: v.c, memoMode: v.m || "tag" }, budget) : { success: false, message: "集計表に該当crなし(複数対象)" };
           const places = await placesP;
           const extra = (metaErr ? `\n⚠️ Meta再開に失敗（${metaErr}）：${metaErrDetail.join(" / ") || "詳細不明"}` : "");
           let note = extra + runLogWarn;
@@ -1707,19 +1754,22 @@ function handleSlackInteract(env: Env, ctx: ExecutionContext, bodyText: string, 
             const r = await notifySlack(env, project.channelId, undoLines(v.c, v.m || "tag", resumed, sheet, metaOn, `by <@${userId}>`, places) + extra);
             if (!r.ok) note += inviteNote(r.error);
           }
-          await postResponse(responseUrl, { replace_original: true, text: undoLines(v.c, v.m || "tag", resumed, sheet, metaOn, "", places) + note });
-          await logToNotion(env, { creative: v.c, user: userName, userId, action: "取消", project: project.name, route: "Slack", metaCount: resumed, sheetResult: sheetResultLabel(sheet) });
-          await updateRunLog(env.NOTION_TOKEN, runLogId, {
-            status: !metaErr && sheetResultLabel(sheet) !== "失敗" ? "完了" : "一部失敗",
-            metaResult: !metaOn ? "未実行" : ids.length === 0 ? "対象なし" : metaErr ? "失敗" : "成功",
-            sheetResult: sheetResultLabel(sheet),
-            adIds: ids,
-            adsetIds: adsetIdsOf(places), // BUG-147: 実行ログDBの「広告セットID」列（従来ずっと空だった）
-            sheetTabs: target?.sheetName ? [target.sheetName] : [],
-            detail: metaErrDetail.length || places.length
-              ? { metaError: metaErrDetail, placements: places.length ? places : undefined }
-              : undefined,
-          });
+          // BUG-159: 終端処理は互いに独立なので並列化し、打ち切られる前に確実に終わらせる
+          await Promise.all([
+            postResponse(responseUrl, { replace_original: true, text: undoLines(v.c, v.m || "tag", resumed, sheet, metaOn, "", places) + note }),
+            logToNotion(env, { creative: v.c, user: userName, userId, action: "取消", project: project.name, route: "Slack", metaCount: resumed, sheetResult: sheetResultLabel(sheet) }),
+            updateRunLog(env.NOTION_TOKEN, runLogId, {
+              status: !metaErr && sheetResultLabel(sheet) !== "失敗" ? "完了" : "一部失敗",
+              metaResult: !metaOn ? "未実行" : ids.length === 0 ? "対象なし" : metaErr ? "失敗" : "成功",
+              sheetResult: sheetResultLabel(sheet),
+              adIds: ids,
+              adsetIds: adsetIdsOf(places), // BUG-147: 実行ログDBの「広告セットID」列（従来ずっと空だった）
+              sheetTabs: target?.sheetName ? [target.sheetName] : [],
+              detail: metaErrDetail.length || places.length
+                ? { metaError: metaErrDetail, placements: places.length ? places : undefined, elapsedMs: budget.elapsed() }
+                : { elapsedMs: budget.elapsed() },
+            }),
+          ]);
         }
       } catch (e) {
         await postResponse(responseUrl, { replace_original: true, text: `❌ エラー: ${e}` });
