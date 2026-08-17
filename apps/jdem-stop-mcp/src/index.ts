@@ -25,7 +25,8 @@ import { z } from "zod";
 
 // ── cr入稿くん（/cr-in）──
 import { handleCrInCommand, handleCrInInteraction } from "./submit/command";
-import { handleContinue, CONTINUE_PATH } from "./submit/continuation";
+// signHmac/verifyHmac は停止フローのcontinuation（BUG-159）でも同じ署名方式を使う
+import { handleContinue, CONTINUE_PATH, signHmac, verifyHmac } from "./submit/continuation";
 import type { SubmitEnv, SubmitProject } from "./submit/types";
 
 // ── 翌日自動チェックくん（TOOL-40）──
@@ -1610,6 +1611,193 @@ async function postResponse(url: string, body: unknown): Promise<void> {
   }
 }
 
+// ============================================================
+// 停止/取消の self-chaining continuation（BUG-159 の根治）
+// ============================================================
+// BUG-159 の一次対応（実行時間バジェット）は「打ち切られる前に切り上げる」だけで、
+// 重い集計表(GAS)を持つ案件では集計表の記録そのものを諦めることになる。
+// cr入稿くん（src/submit/continuation.ts）が既に採用している「1ホップ=1単位の仕事をして、
+// 残りは署名付きで自分自身へPOSTして繋ぐ」方式に寄せ、各ホップが**それぞれ新しい実行時間**を
+// 持てるようにする。これで集計表に十分な時間を与えつつ、結果通知も確実に届く。
+//
+//   hop0(ボタン押下) … 進捗表示・実行ログ作成・Meta停止/再開 → chain
+//   sheet            … 集計表(GAS)の記録/復元 ＋ CP/AS・実績・AS残数の取得 → chain
+//   cascade          … 親子連動チェック（停止時のみ） → chain
+//   finish           … Slack通知・結果表示・Notionログ・実行ログ終端化
+//
+// 連鎖に失敗した場合は、その実行の残り時間で続きをインラインで実行する
+// （＝従来と同じ挙動にフォールバックし、最低限 finish まで必ず到達させる）。
+export const STOP_CONTINUE_PATH = "/internal/cr-stop/continue";
+
+type StopStep = "sheet" | "cascade" | "finish";
+const STOP_NEXT: Record<StopStep, StopStep | null> = { sheet: "cascade", cascade: "finish", finish: null };
+
+interface StopChainState {
+  step: StopStep;
+  action: "stop" | "undo";
+  project: string;
+  creative: string;
+  date: string;
+  memoMode?: "full" | "tag";
+  adIds: string[];
+  responseUrl: string;
+  userId: string;
+  userName: string;
+  runLogId: string | null;
+  runLogWarn: string;
+  metaOn: boolean;
+  affected: number; // 停止できた/再開できた件数
+  metaErr: string;
+  metaErrDetail: string[];
+  startedAt: number;
+  target?: SheetTarget; // sheetホップで解決した対象タブ（後続ホップでの再解決を避ける）
+  sheet?: any;
+  cx?: StopContext;
+  cascade?: CascadeResult;
+  cascadeSkipped?: boolean;
+  chainWarn?: string;
+}
+
+// CP/AS・停止判定の根拠数値・AS残数をまとめて取る（BUG-147）。集計表(GAS)と並行して呼ぶ前提。
+async function buildStopContext(token: string, ids: string[]): Promise<StopContext> {
+  const places = await fetchAdPlacements(token, ids);
+  const [lifetime, recent, adsets] = await Promise.all([
+    fetchAdMetrics(token, ids, "maximum"),
+    fetchAdMetrics(token, ids, "last_30d"),
+    fetchAdsetActivity(token, places.map((p) => p.adsetId || ""), ids),
+  ]);
+  return { places, metricsLines: metricsLine(lifetime, recent, ids), adsets };
+}
+
+async function stopHopSheet(s: StopChainState, env: Env, budget: RunBudget): Promise<void> {
+  const p = projectByName(s.project);
+  if (!p) { s.sheet = { success: false, message: `案件不明: ${s.project}` }; return; }
+  const token = metaToken(env, p);
+  s.target = (await pickSheet(p, s.creative)) || undefined;
+  // 付加情報の取得は集計表(GAS)と並行させ、実測の待ち時間を増やさない（失敗しても停止処理は止めない）
+  const cxP: Promise<StopContext> =
+    s.affected > 0 && token
+      ? s.action === "stop"
+        ? buildStopContext(token, s.adIds)
+        : fetchAdPlacements(token, s.adIds).then((places) => ({ places }) as StopContext)
+      : Promise.resolve({} as StopContext);
+  s.sheet = s.target
+    ? await callGasSafe(
+        s.target,
+        s.action === "stop"
+          ? { action: "stop", creativeName: s.creative, stopDate: s.date }
+          : { action: "undo", creativeName: s.creative, memoMode: s.memoMode || "tag" },
+        budget,
+      )
+    : { success: false, message: "集計表に該当crなし(複数対象)" };
+  s.cx = await cxP;
+}
+
+async function stopHopCascade(s: StopChainState, env: Env, budget: RunBudget): Promise<void> {
+  // BUG-112: 子CRの集計表停止が成功したときだけ、兄弟の子が全員停止済みかを見て親も止める
+  if (s.action !== "stop" || !s.target || !s.sheet?.success) return;
+  const p = projectByName(s.project);
+  if (!p) return;
+  const ms = budget.allow(GAS_TIMEOUT_DEFAULT_MS);
+  if (ms <= 0) { s.cascadeSkipped = true; return; }
+  try { s.cascade = await cascadeCheckAndStopParent(env, p, s.target, s.creative, s.date, ms); } catch { /* ベストエフォート */ }
+}
+
+async function stopHopFinish(s: StopChainState, env: Env): Promise<void> {
+  const p = projectByName(s.project);
+  const isStop = s.action === "stop";
+  const places = s.cx?.places || [];
+  const inviteNote = (err?: string) => `\n⚠️ チャンネルへの全員通知に失敗（${err}）。このチャンネルで \`/invite @cr停止\` を実行してください。`;
+  const extra =
+    (s.metaErr ? `\n⚠️ Meta${isStop ? "停止" : "再開"}に失敗（${s.metaErr}）：${s.metaErrDetail.join(" / ") || "詳細不明"}` : "")
+    + (s.cascadeSkipped ? "\n⚠️ 実行時間の都合で親子連動チェックをスキップしました（親CRの自動停止は行われていません）" : "")
+    + (s.chainWarn || "");
+  let note = extra + s.runLogWarn;
+  if ((s.affected || s.sheet?.success) && p) {
+    const text = isStop
+      ? stopLines(s.creative, s.date, s.affected, s.sheet, s.metaOn, `by <@${s.userId}>`, s.cascade, s.cx) + extra
+      : undoLines(s.creative, s.memoMode || "tag", s.affected, s.sheet, s.metaOn, `by <@${s.userId}>`, places) + extra;
+    const r = await notifySlack(env, p.channelId, text);
+    if (!r.ok) note += inviteNote(r.error);
+  }
+  const selfText = isStop
+    ? stopLines(s.creative, s.date, s.affected, s.sheet, s.metaOn, "", s.cascade, s.cx) + note
+    : undoLines(s.creative, s.memoMode || "tag", s.affected, s.sheet, s.metaOn, "", places) + note;
+  // 終端処理は互いに独立なので並列化する（BUG-159）
+  await Promise.all([
+    postResponse(s.responseUrl, isStop
+      ? undoableStopResult(selfText, s.project, s.creative, s.adIds, s.affected, !!s.sheet?.success)
+      : { replace_original: true, text: selfText }),
+    logToNotion(env, { creative: s.creative, user: s.userName, userId: s.userId, action: isStop ? "停止" : "取消", project: s.project, route: "Slack", metaCount: s.affected, sheetResult: sheetResultLabel(s.sheet) }),
+    updateRunLog(env.NOTION_TOKEN, s.runLogId, {
+      status: !s.metaErr && sheetResultLabel(s.sheet) !== "失敗" ? "完了" : "一部失敗",
+      metaResult: !s.metaOn ? "未実行" : s.adIds.length === 0 ? "対象なし" : s.metaErr ? "失敗" : "成功",
+      sheetResult: sheetResultLabel(s.sheet),
+      adIds: s.adIds,
+      adsetIds: adsetIdsOf(places),
+      sheetTabs: s.sheet?.sheet ? [String(s.sheet.sheet)] : s.target?.sheetName ? [s.target.sheetName] : [],
+      detail: {
+        metaError: s.metaErrDetail,
+        cascade: s.cascade?.triggered ? s.cascade : undefined,
+        cascadeSkipped: s.cascadeSkipped || undefined,
+        placements: places.length ? places : undefined,
+        metrics: s.cx?.metricsLines?.length ? s.cx.metricsLines : undefined,
+        adsets: s.cx?.adsets?.length ? s.cx.adsets : undefined,
+        elapsedMs: Date.now() - s.startedAt, // 全ホップ合計の所要時間
+      },
+    }),
+  ]);
+}
+
+/** 次のホップを自分自身へPOST（署名付き）。cr入稿くんと同じくService Binding優先。 */
+async function chainStop(state: StopChainState, env: Env, senv: SubmitEnv): Promise<void> {
+  const body = JSON.stringify(state);
+  const sig = await signHmac(env.SHARED_SECRET, body);
+  const init: RequestInit = { method: "POST", headers: { "content-type": "application/json", "x-continuation-signature": sig }, body };
+  const self = (env as any).SELF_WORKER;
+  const res = self
+    ? await self.fetch(`https://self${STOP_CONTINUE_PATH}`, init)
+    : await fetchTimeout(`${(senv as any).SELF_URL}${STOP_CONTINUE_PATH}`, init, 10000);
+  if (!res.ok) throw new Error(`stop continuation連鎖失敗: ${res.status}`);
+}
+
+/** 連鎖できなかった場合に、この実行の残り時間で続きをやりきる（必ず finish まで到達させる） */
+async function runStopRemainingInline(s: StopChainState, env: Env, budget: RunBudget): Promise<void> {
+  if (s.step === "sheet") { try { await stopHopSheet(s, env, budget); } catch (e) { s.chainWarn = (s.chainWarn || "") + `\n⚠️ 集計表処理でエラー: ${e}`; } s.step = "cascade"; }
+  if (s.step === "cascade") { try { await stopHopCascade(s, env, budget); } catch { /* ベストエフォート */ } s.step = "finish"; }
+  await stopHopFinish(s, env);
+}
+
+async function runStopHop(s: StopChainState, env: Env, senv: SubmitEnv): Promise<void> {
+  const budget = startRunBudget(); // ホップごとに新しい実行時間予算
+  try {
+    if (s.step === "finish") { await stopHopFinish(s, env); return; }
+    if (s.step === "sheet") await stopHopSheet(s, env, budget);
+    else await stopHopCascade(s, env, budget);
+  } catch (e) {
+    s.chainWarn = (s.chainWarn || "") + `\n⚠️ 処理中にエラー: ${e}`;
+  }
+  const next = STOP_NEXT[s.step];
+  if (!next) return;
+  const ns: StopChainState = { ...s, step: next };
+  try {
+    await chainStop(ns, env, senv);
+  } catch (e) {
+    ns.chainWarn = (ns.chainWarn || "") + `\n⚠️ 継続処理の連鎖に失敗したため同一実行内で続行しました（${e}）`;
+    await runStopRemainingInline(ns, env, budget);
+  }
+}
+
+export async function handleStopContinue(request: Request, env: Env, ctx: ExecutionContext, senv: SubmitEnv): Promise<Response> {
+  const body = await request.text();
+  const sig = request.headers.get("x-continuation-signature") || "";
+  if (!(await verifyHmac(env.SHARED_SECRET, body, sig))) return new Response("forbidden", { status: 403 });
+  let state: StopChainState;
+  try { state = JSON.parse(body) as StopChainState; } catch { return new Response("bad request", { status: 400 }); }
+  ctx.waitUntil(runStopHop(state, env, senv));
+  return new Response("ok");
+}
+
 function handleSlackInteract(env: Env, ctx: ExecutionContext, bodyText: string, senv: SubmitEnv): Response {
   const params = new URLSearchParams(bodyText);
   let payload: any = {};
@@ -1649,127 +1837,57 @@ function handleSlackInteract(env: Env, ctx: ExecutionContext, bodyText: string, 
   const ids: string[] = Array.isArray(v.ad) ? v.ad : [];
 
   // 即ACK（cold-start耐性）。進捗・結果は response_url 経由。
+  // hop0: 進捗表示・実行ログ作成・Meta停止/再開まで。以降は continuation で繋ぐ（BUG-159）。
   ctx.waitUntil(
     (async () => {
-      // BUG-159: Workerの1回の実行時間には上限があり、超えると結果通知もupdateRunLogも
-      // 打ち切られてSlackが「⏳実行中…」のまま固まる。重い処理に割ける時間を制限して
-      // 終端処理へ必ず到達させる。
+      const startedAt = Date.now();
       const budget = startRunBudget();
+      const isStop = v.a !== "undo";
       try {
         // BUG-146: ids.length===0 は「集計表だけ記録」ボタン／Meta未連携／既存Meta広告なしの
         // いずれかで、Metaには一切触れず集計表のみを更新する実行。従来は通常の停止と同じ
         // 「実行中…」表示だったため、実際にはMetaを操作していないのに操作中であるかのように
         // 見えていた（cr00等の集計表のみ運用CRで顕著）。進捗メッセージの時点で判別できるようにする。
-        const isSheetOnlyRun = ids.length === 0;
-        const progressVerb = v.a === "undo" ? "取消" : "停止";
-        const progressText = isSheetOnlyRun
-          ? `⏳ *${v.c}* の集計表${progressVerb}処理中…（Meta広告は操作しません）`
-          : `⏳ *${v.c}* を${progressVerb}実行中…`;
-        await postResponse(responseUrl, { replace_original: true, text: progressText });
-        const inviteNote = (err?: string) => `\n⚠️ チャンネルへの全員通知に失敗（${err}）。このチャンネルで \`/invite @cr停止\` を実行してください。`;
+        const progressVerb = isStop ? "停止" : "取消";
+        await postResponse(responseUrl, {
+          replace_original: true,
+          text: ids.length === 0
+            ? `⏳ *${v.c}* の集計表${progressVerb}処理中…（Meta広告は操作しません）`
+            : `⏳ *${v.c}* を${progressVerb}実行中…`,
+        });
         // 実行ログDB（TOOL-40）: 開始時に「実行中」で作成。途中死してもチェッカーが検出できる
-        const runLogId = await createRunLog(env.NOTION_TOKEN, { tool: "cr停止くん", action: v.a === "undo" ? "取消" : "停止", project: project.name, crName: v.c, userName, userId, route: "Slack" });
-        const runLogWarn = !runLogId && env.NOTION_TOKEN ? "\n⚠️ 実行ログの記録に失敗（翌日自動チェックの対象外になります）" : "";
-        // Meta失敗は集計表を止めない（権限不足等でも集計表記録は実行し、Metaエラーは併記）
+        const runLogId = await createRunLog(env.NOTION_TOKEN, { tool: "cr停止くん", action: isStop ? "停止" : "取消", project: project.name, crName: v.c, userName, userId, route: "Slack" });
+
+        // Meta実停止/再開。失敗しても集計表の記録は必ず行う（権限不足等でもエラーを併記して継続）
+        let affected = 0;
         let metaErr = "";
-        // 実際のGraph APIエラー文言（BUG-109: 従来は件数しか分からず原因切り分けができなかった）
         let metaErrDetail: string[] = [];
-        const target = await pickSheet(project, v.c); // 複数集計対象の案件は cr名で対象タブを判定
-        if (v.a === "stop") {
-          let paused = 0;
-          if (metaOn && ids.length) {
-            try {
-              const r = await pauseAds(token!, ids);
-              paused = r.success;
-              if (paused < ids.length) { metaErr = `${ids.length - paused}件の停止に失敗`; metaErrDetail = r.errors; }
-            } catch (e) { metaErr = String(e); metaErrDetail = [String(e)]; }
-          }
-          // BUG-147: Slackのボタンvalueには文字数上限がありCP/AS名まで積めないため、ここで広告IDから
-          // 引き直す。併せて停止判定の根拠数値(提案A)とAS残数(提案B)も取得する。
-          // 全て集計表(GAS)呼び出しと並行させて実測の待ち時間を増やさない（失敗時は空・警告なし）。
-          const cxP: Promise<StopContext> = paused > 0 ? (async () => {
-            const places = await fetchAdPlacements(token!, ids);
-            const [lifetime, recent, adsets] = await Promise.all([
-              fetchAdMetrics(token!, ids, "maximum"),
-              fetchAdMetrics(token!, ids, "last_30d"),
-              fetchAdsetActivity(token!, places.map((p) => p.adsetId || ""), ids),
-            ]);
-            return { places, metricsLines: metricsLine(lifetime, recent, ids), adsets };
-          })() : Promise.resolve({} as StopContext);
-          const sheet = target ? await callGasSafe(target, { action: "stop", creativeName: v.c, stopDate: v.d }, budget) : { success: false, message: "集計表に該当crなし(複数対象)" };
-          const cx = await cxP;
-          const places = cx.places || [];
-          // BUG-112: 子CRの集計表停止が成功したら、兄弟の子が全員停止済みかチェックし、
-          // 該当すれば親CRも自動停止する（失敗しても本処理は止めない）
-          // BUG-159: 残り時間が無ければスキップ。ベストエフォートの処理のために結果通知が
-          // 打ち切られる方が実害が大きいため。スキップしたことは黙らずメッセージに出す。
-          let cascade: CascadeResult | undefined;
-          let cascadeSkipped = false;
-          if (target && sheet?.success) {
-            const ms = budget.allow(GAS_TIMEOUT_DEFAULT_MS);
-            if (ms > 0) {
-              try { cascade = await cascadeCheckAndStopParent(env, project as Project, target, v.c, v.d, ms); } catch { /* ベストエフォート */ }
-            } else {
-              cascadeSkipped = true;
-            }
-          }
-          const extra = (metaErr ? `\n⚠️ Meta停止に失敗（${metaErr}）：${metaErrDetail.join(" / ") || "詳細不明"}` : "")
-            + (cascadeSkipped ? "\n⚠️ 実行時間の都合で親子連動チェックをスキップしました（親CRの自動停止は行われていません）" : "");
-          let note = extra + runLogWarn;
-          if (paused || sheet?.success) {
-            const r = await notifySlack(env, project.channelId, stopLines(v.c, v.d, paused, sheet, metaOn, `by <@${userId}>`, cascade, cx) + extra);
-            if (!r.ok) note += inviteNote(r.error);
-          }
-          // BUG-159: 終端処理は互いに独立なので並列化し、打ち切られる前に確実に終わらせる
-          await Promise.all([
-            postResponse(responseUrl, undoableStopResult(stopLines(v.c, v.d, paused, sheet, metaOn, "", cascade, cx) + note, project.name, v.c, ids, paused, !!sheet?.success)),
-            logToNotion(env, { creative: v.c, user: userName, userId, action: "停止", project: project.name, route: "Slack", metaCount: paused, sheetResult: sheetResultLabel(sheet) }),
-            updateRunLog(env.NOTION_TOKEN, runLogId, {
-              status: !metaErr && sheetResultLabel(sheet) !== "失敗" ? "完了" : "一部失敗",
-              metaResult: !metaOn ? "未実行" : ids.length === 0 ? "対象なし" : metaErr ? "失敗" : "成功",
-              sheetResult: sheetResultLabel(sheet),
-              adIds: ids,
-              adsetIds: adsetIdsOf(places), // BUG-147: 実行ログDBの「広告セットID」列（従来ずっと空だった）
-              sheetTabs: sheet?.sheet ? [String(sheet.sheet)] : target?.sheetName ? [target.sheetName] : [],
-              detail: metaErrDetail.length || cascade?.triggered || places.length || cascadeSkipped
-                ? { metaError: metaErrDetail, cascade: cascade?.triggered ? cascade : undefined, cascadeSkipped: cascadeSkipped || undefined, placements: places.length ? places : undefined, metrics: cx.metricsLines?.length ? cx.metricsLines : undefined, adsets: cx.adsets?.length ? cx.adsets : undefined, elapsedMs: budget.elapsed() }
-                : { elapsedMs: budget.elapsed() },
-            }),
-          ]);
-        } else {
-          let resumed = 0;
-          if (metaOn && ids.length) {
-            try {
-              const r = await resumeAds(token!, ids);
-              resumed = r.success;
-              if (resumed < ids.length) { metaErr = `${ids.length - resumed}件の再開に失敗`; metaErrDetail = r.errors; }
-            } catch (e) { metaErr = String(e); metaErrDetail = [String(e)]; }
-          }
-          const placesP = resumed > 0 ? fetchAdPlacements(token!, ids) : Promise.resolve([] as AdPlacement[]);
-          const sheet = target ? await callGasSafe(target, { action: "undo", creativeName: v.c, memoMode: v.m || "tag" }, budget) : { success: false, message: "集計表に該当crなし(複数対象)" };
-          const places = await placesP;
-          const extra = (metaErr ? `\n⚠️ Meta再開に失敗（${metaErr}）：${metaErrDetail.join(" / ") || "詳細不明"}` : "");
-          let note = extra + runLogWarn;
-          if (resumed || sheet?.success) {
-            const r = await notifySlack(env, project.channelId, undoLines(v.c, v.m || "tag", resumed, sheet, metaOn, `by <@${userId}>`, places) + extra);
-            if (!r.ok) note += inviteNote(r.error);
-          }
-          // BUG-159: 終端処理は互いに独立なので並列化し、打ち切られる前に確実に終わらせる
-          await Promise.all([
-            postResponse(responseUrl, { replace_original: true, text: undoLines(v.c, v.m || "tag", resumed, sheet, metaOn, "", places) + note }),
-            logToNotion(env, { creative: v.c, user: userName, userId, action: "取消", project: project.name, route: "Slack", metaCount: resumed, sheetResult: sheetResultLabel(sheet) }),
-            updateRunLog(env.NOTION_TOKEN, runLogId, {
-              status: !metaErr && sheetResultLabel(sheet) !== "失敗" ? "完了" : "一部失敗",
-              metaResult: !metaOn ? "未実行" : ids.length === 0 ? "対象なし" : metaErr ? "失敗" : "成功",
-              sheetResult: sheetResultLabel(sheet),
-              adIds: ids,
-              adsetIds: adsetIdsOf(places), // BUG-147: 実行ログDBの「広告セットID」列（従来ずっと空だった）
-              sheetTabs: target?.sheetName ? [target.sheetName] : [],
-              detail: metaErrDetail.length || places.length
-                ? { metaError: metaErrDetail, placements: places.length ? places : undefined, elapsedMs: budget.elapsed() }
-                : { elapsedMs: budget.elapsed() },
-            }),
-          ]);
+        if (metaOn && ids.length) {
+          try {
+            const r = isStop ? await pauseAds(token!, ids) : await resumeAds(token!, ids);
+            affected = r.success;
+            if (affected < ids.length) { metaErr = `${ids.length - affected}件の${isStop ? "停止" : "再開"}に失敗`; metaErrDetail = r.errors; }
+          } catch (e) { metaErr = String(e); metaErrDetail = [String(e)]; }
+        }
+
+        const state: StopChainState = {
+          step: "sheet",
+          action: isStop ? "stop" : "undo",
+          project: project.name,
+          creative: v.c,
+          date: v.d,
+          memoMode: v.m === "full" ? "full" : v.m === "tag" ? "tag" : undefined,
+          adIds: ids,
+          responseUrl, userId, userName, runLogId,
+          runLogWarn: !runLogId && env.NOTION_TOKEN ? "\n⚠️ 実行ログの記録に失敗（翌日自動チェックの対象外になります）" : "",
+          metaOn, affected, metaErr, metaErrDetail, startedAt,
+        };
+        // 集計表(GAS)以降は別ホップへ。連鎖できなければこの実行の残り時間でやりきる
+        try {
+          await chainStop(state, env, senv);
+        } catch (e) {
+          state.chainWarn = `\n⚠️ 継続処理の連鎖に失敗したため同一実行内で続行しました（${e}）`;
+          await runStopRemainingInline(state, env, budget);
         }
       } catch (e) {
         await postResponse(responseUrl, { replace_original: true, text: `❌ エラー: ${e}` });
@@ -1795,6 +1913,11 @@ export default {
       }
       const senv = submitEnvOf(env, url.origin);
       return url.pathname === "/slack/command" ? handleSlackCommand(env, ctx, bodyText, senv) : handleSlackInteract(env, ctx, bodyText, senv);
+    }
+
+    // --- cr停止くん: continuation（HMAC署名で自己検証。Slack署名不要）BUG-159 ---
+    if (url.pathname === STOP_CONTINUE_PATH && request.method === "POST") {
+      return handleStopContinue(request, env, ctx, submitEnvOf(env, url.origin));
     }
 
     // --- cr入稿くん: continuation（HMAC署名で自己検証。Slack署名不要）---
