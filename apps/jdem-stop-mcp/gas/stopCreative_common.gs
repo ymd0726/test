@@ -222,7 +222,23 @@ function stopCreative(ssId, sheetName, creativeName, stopDate, customNote) {
   var note = customNote ? String(customNote) : (stopDate + CONFIG.MEMO_SUFFIX);
   var undo = { creativeName: creativeName, sheetName: sheet.getName(), note: note, checkbox: null, paint: null, memoDaily: null, memoMonthly: null };
 
-  var checkboxSet = false;
+  // ============================================================
+  // 【重要】ここから「読み取りフェーズ」→「書き込みフェーズ」の順に厳密に分ける（BUG-159 性能対応）
+  // ------------------------------------------------------------
+  // 旧実装は 書き込み→読み取り→書き込み→読み取り… と交互に行っていた。Apps Scriptでは
+  // 書き込み後に読み取りを行うと、その都度 保留中の書き込みをflushしてシートを再計算する。
+  // 当社の集計表は jdem=2428列 / kk_mak=2304列 と巨大で、判定式(3行目)・即停止CR数などの
+  // 数式を大量に持つため、この再計算1回が非常に重い。旧実装は1回の停止で
+  //   ①チェックON後の getBackgrounds ②findDailyAndMonthlyRow(A列全行)
+  //   ③日次メモの getValue ④月次メモの getValue
+  // と4回も再計算を誘発しており、これがGAS呼び出しの25秒タイムアウト
+  // （BUG-141続報のjdekmak / BUG-159のjdem）の主因だった。
+  // 読み取りを全て先に済ませることで、再計算の誘発を0回にする。
+  // ⚠️ この関数に手を入れるときは、この読み書きの順序を崩さないこと。
+  // ============================================================
+
+  // ---- 読み取りフェーズ（この間は一切書き込まない）----
+  var checkboxTarget = null; // { row, value }
   for (var i = 0; i < CONFIG.CHECKBOX_SEARCH_ROWS.length; i++) {
     var row = CONFIG.CHECKBOX_SEARCH_ROWS[i];
     var cell = sheet.getRange(row, memoCol);
@@ -230,34 +246,46 @@ function stopCreative(ssId, sheetName, creativeName, stopDate, customNote) {
     var isCheckbox = rule && rule.getCriteriaType() === SpreadsheetApp.DataValidationCriteria.CHECKBOX;
     var val = cell.getValue();
     if (isCheckbox || val === false || val === 'FALSE' || val === true || val === 'TRUE') {
-      undo.checkbox = { row: row, col: memoCol, value: val };
-      cell.setValue(true); checkboxSet = true; break;
+      checkboxTarget = { row: row, value: val };
+      break;
     }
   }
 
   var paintNumRows = CONFIG.PAINT_END_ROW - CONFIG.PAINT_START_ROW + 1;
   var paintRange = sheet.getRange(CONFIG.PAINT_START_ROW, leftCol, paintNumRows, numCols);
-  undo.paint = { row: CONFIG.PAINT_START_ROW, col: leftCol, numRows: paintNumRows, numCols: numCols, backgrounds: paintRange.getBackgrounds() };
+  var prevBackgrounds = paintRange.getBackgrounds();
+
+  // 日次/月次メモ行の特定と既存値の取得も、書き込み前にまとめて済ませる
+  var info = stopDate ? findDailyAndMonthlyRow(sheet, stopDate) : { dailyRow: -1, monthlyRow: -1 };
+  var dCell = info.dailyRow !== -1 ? sheet.getRange(info.dailyRow, memoCol) : null;
+  var mCell = info.monthlyRow !== -1 ? sheet.getRange(info.monthlyRow, memoCol) : null;
+  var dPrev = dCell ? dCell.getValue() : null;
+  var mPrev = mCell ? mCell.getValue() : null;
+
+  // ---- 書き込みフェーズ（以降は一切読み取らない）----
+  var checkboxSet = false;
+  if (checkboxTarget) {
+    undo.checkbox = { row: checkboxTarget.row, col: memoCol, value: checkboxTarget.value };
+    sheet.getRange(checkboxTarget.row, memoCol).setValue(true);
+    checkboxSet = true;
+  }
+
+  undo.paint = { row: CONFIG.PAINT_START_ROW, col: leftCol, numRows: paintNumRows, numCols: numCols, backgrounds: prevBackgrounds };
   paintRange.setBackground(CONFIG.GRAY_COLOR);
 
   var memoDailyResult = 'Daily日付行が見つからず未記載';
   var memoMonthlyResult = 'Monthly月次行が見つからず未記載';
-  if (stopDate) {
-    var info = findDailyAndMonthlyRow(sheet, stopDate);
-    if (info.dailyRow !== -1) {
-      var dCell = sheet.getRange(info.dailyRow, memoCol);
-      var dExisting = String(dCell.getValue()).trim();
-      undo.memoDaily = { row: info.dailyRow, col: memoCol, value: dCell.getValue() };
-      dCell.setValue(dExisting ? dExisting + ' / ' + note : note);
-      memoDailyResult = columnToLetter(memoCol) + info.dailyRow + 'に「' + note + '」を記載';
-    }
-    if (info.monthlyRow !== -1) {
-      var mCell = sheet.getRange(info.monthlyRow, memoCol);
-      var mExisting = String(mCell.getValue()).trim();
-      undo.memoMonthly = { row: info.monthlyRow, col: memoCol, value: mCell.getValue() };
-      mCell.setValue(mExisting ? mExisting + ' / ' + note : note);
-      memoMonthlyResult = columnToLetter(memoCol) + info.monthlyRow + 'に「' + note + '」を記載';
-    }
+  if (dCell) {
+    var dExisting = String(dPrev).trim();
+    undo.memoDaily = { row: info.dailyRow, col: memoCol, value: dPrev };
+    dCell.setValue(dExisting ? dExisting + ' / ' + note : note);
+    memoDailyResult = columnToLetter(memoCol) + info.dailyRow + 'に「' + note + '」を記載';
+  }
+  if (mCell) {
+    var mExisting = String(mPrev).trim();
+    undo.memoMonthly = { row: info.monthlyRow, col: memoCol, value: mPrev };
+    mCell.setValue(mExisting ? mExisting + ' / ' + note : note);
+    memoMonthlyResult = columnToLetter(memoCol) + info.monthlyRow + 'に「' + note + '」を記載';
   }
 
   PropertiesService.getScriptProperties().setProperty(UNDO_KEY_PREFIX + ssId + '_' + creativeName, JSON.stringify(undo));
