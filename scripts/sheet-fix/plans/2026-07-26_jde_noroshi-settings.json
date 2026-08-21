@@ -1,0 +1,16 @@
+{
+  "sheet": "1oEK8JCJg2NcseWmnxLtfNFCe5A7XGJ_DJSj7c2EW1sg",
+  "tab": "data",
+  "note": "当たりのろし設定ブロックを新設（R=ラベル/S=値）。のろし式が data!S2:S5 を参照し、ここの数値編集で基準を調整できる",
+  "edits": [
+    { "cell": "R1", "expectedBefore": "", "after": "🌱🔥当たりのろし設定（S列の数値を編集）", "note": "見出し" },
+    { "cell": "R2", "expectedBefore": "", "after": "予備軍🌱 CPA係数(目標CPA×)", "note": "ラベル" },
+    { "cell": "S2", "expectedBefore": "", "after": "1", "note": "予備軍CPA係数=目標以下" },
+    { "cell": "R3", "expectedBefore": "", "after": "予備軍🌱 実質cv下限", "note": "ラベル" },
+    { "cell": "S3", "expectedBefore": "", "after": "3", "note": "予備軍cv下限" },
+    { "cell": "R4", "expectedBefore": "", "after": "候補🔥 CPA係数(目標CPA×)", "note": "ラベル" },
+    { "cell": "S4", "expectedBefore": "", "after": "0.75", "note": "候補CPA係数=目標の75%以下" },
+    { "cell": "R5", "expectedBefore": "", "after": "候補🔥 実質cv下限", "note": "ラベル" },
+    { "cell": "S5", "expectedBefore": "", "after": "5", "note": "候補cv下限" }
+  ]
+}

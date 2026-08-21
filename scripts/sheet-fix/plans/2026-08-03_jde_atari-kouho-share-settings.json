@@ -1,0 +1,11 @@
+{
+  "sheet": "1oEK8JCJg2NcseWmnxLtfNFCe5A7XGJ_DJSj7c2EW1sg",
+  "tab": "data",
+  "note": "当たり候補の量判定を実質cvから消化予算シェアに切り替えるテスト用（kk_mak）。既存の実質cv下限(S3/S5, kk_kouが引き続き使用)には触れず、新しい下限をS6/S7に追加する。初期値は仮置き（0.05/0.10=5%/10%）。dry-runで出るシェア分布を見て要調整。",
+  "edits": [
+    { "cell": "R6", "expectedBefore": "", "after": "当たり候補🌱 消化予算シェア下限(kk_mak用・要調整)", "note": "1段階目ラベル" },
+    { "cell": "S6", "expectedBefore": "", "after": "0.05", "note": "1段階目 消化予算シェア下限=5%（初期値・要調整）" },
+    { "cell": "R7", "expectedBefore": "", "after": "当たり候補🌱🌱 消化予算シェア下限(kk_mak用・要調整)", "note": "2段階目ラベル" },
+    { "cell": "S7", "expectedBefore": "", "after": "0.1", "note": "2段階目 消化予算シェア下限=10%（初期値・要調整）" }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "sheet": "1Q7iph8TxZ5C5ouBb3vjvyNMNgLUmP-Uj1stCO9TewFA",
+  "tab": "data",
+  "note": "nrn に当たり候補の判定設定ブロックを新設（R=ラベル/S=値）。基準は jde と同一。meta_total の当たり候補式が data!S2:S5 を参照するため、以後この数値編集だけで全CRに反映される",
+  "edits": [
+    { "cell": "R1", "expectedBefore": "", "after": "🌱当たり候補 判定設定（S列の数値を編集）", "note": "見出し" },
+    { "cell": "R2", "expectedBefore": "", "after": "当たり候補🌱 CPA係数(目標CPA×)", "note": "1段階目ラベル" },
+    { "cell": "S2", "expectedBefore": "", "after": "0.9", "note": "1段階目CPA係数=目標の90%以下" },
+    { "cell": "R3", "expectedBefore": "", "after": "当たり候補🌱 実質cv下限", "note": "1段階目ラベル" },
+    { "cell": "S3", "expectedBefore": "", "after": "3", "note": "1段階目cv下限" },
+    { "cell": "R4", "expectedBefore": "", "after": "当たり候補🌱🌱 CPA係数(目標CPA×)", "note": "2段階目ラベル" },
+    { "cell": "S4", "expectedBefore": "", "after": "0.75", "note": "2段階目CPA係数=目標の75%以下" },
+    { "cell": "R5", "expectedBefore": "", "after": "当たり候補🌱🌱 実質cv下限", "note": "2段階目ラベル" },
+    { "cell": "S5", "expectedBefore": "", "after": "5", "note": "2段階目cv下限" }
+  ]
+}

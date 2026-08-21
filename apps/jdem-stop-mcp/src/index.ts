@@ -25,7 +25,8 @@ import { z } from "zod";
 
 // ── cr入稿くん（/cr-in）──
 import { handleCrInCommand, handleCrInInteraction } from "./submit/command";
-import { handleContinue, CONTINUE_PATH } from "./submit/continuation";
+// signHmac/verifyHmac は停止フローのcontinuation（BUG-159）でも同じ署名方式を使う
+import { handleContinue, CONTINUE_PATH, signHmac, verifyHmac } from "./submit/continuation";
 import type { SubmitEnv, SubmitProject } from "./submit/types";
 
 // ── 翌日自動チェックくん（TOOL-40）──
@@ -185,7 +186,12 @@ const PROJECTS: Project[] = [
   // ── 株式会社リードBM（2026-07-07 Meta Ads MCPで広告名実測してアカウントID確定）──
   { name: "bbt",  channelId: "C0B3J7U8Q5N", sheets: [{ spreadsheetId: "1IoFvL9ZmbhoNRlFl_rvza8VwC0_bA1mJAT5z98-gGf8" }],
     metaAdAccountId: "1616783749463582", crdbDataSourceId: CRDB_DATA_SOURCE_ID }, // bbt_cr05_...で稼働確認済。Drive倉庫はCLDB未登録のため要登録
-  { name: "lcl",  channelId: "C08SNLK4CMP", sheets: [{ spreadsheetId: "12WYKgq0i53_ZZXlO7rLZ5zWGLzN7fbPZrGGfeB9kIT0" }],
+  // BUG-139: 集計表が n26_lcl/n44_rjf 共有スプレッドシートで、既定の"meta_total"タブは
+  // 集計サマリのみ(cr-idブロック0個)。実際のcr別ブロックは"meta_body_n26_lcl"タブ側にある
+  // (2026-08-08 構造ダンプでcr13/cr15/cr20/cr22等の実在を確認)。sheetName未指定だとGAS側
+  // resolveSheet()が既定のmeta_totalを掴んでしまい、Meta側停止は成功するのに集計表側は
+  // 常に「クリエイティブが見つかりません」になっていた(pom/rof/rob/fpと同型の原因)。
+  { name: "lcl",  channelId: "C08SNLK4CMP", sheets: [{ spreadsheetId: "12WYKgq0i53_ZZXlO7rLZ5zWGLzN7fbPZrGGfeB9kIT0", sheetName: "meta_body_n26_lcl" }],
     driveFolderId: "1K7oUiBfIYZQozePFO_g3h0z8hfeOUy8I", metaAdAccountId: "2261332077579401", crdbDataSourceId: CRDB_DATA_SOURCE_ID }, // lcl_cr24_...で稼働確認済
   { name: "aty",  channelId: "C07MTDU23A9", sheets: [{ spreadsheetId: "1Z3OIaJQgr2Nd8ElN0dB_lJ2a8Cls_J9756zaeGoJu9U" }],
     driveFolderId: "1dHweykRQzMHD-tYNZaDTVebvFACbZvdi", metaAdAccountId: "780374144048761", crdbDataSourceId: CRDB_DATA_SOURCE_ID }, // aty_cr07_...で稼働確認済
@@ -218,6 +224,10 @@ const PROJECTS: Project[] = [
   // ── n42_sdb（サロンドボヌール）2026-08-07 BUG-138で新規登録 ──
   // Meta広告アカウントは「n42_sdb」(1404743574275227, 株式会社リード既定BM)をads_get_ad_accountsで実測確定。
   // 集計表・タブ名・cr倉庫DriveはCLDB「n42_sdb_サロンドボヌール」より抽出。
+  // BUG-149: PR #21（2026-08-08）はbaseブランチがclaude/creative-submission-tool-z5vq8tで、
+  // リポジトリの実デフォルトブランチではなかったためこの変更は一度も本番に載っておらず、
+  // 同日デプロイされたBUG-139修正(PR #22, デフォルトブランチ側)が実質この登録を無かったことにしていた。
+  // 今回はデフォルトブランチに対して直接登録し直す。
   { name: "sdb",  channelId: "C0B36FX0G5U", sheets: [{ spreadsheetId: "1vW9WSgkaeoNl57tNRnWVry5o5FI39I8q9wtAztATzCA", sheetName: "meta_total" }],
     metaAdAccountId: "1404743574275227", driveFolderId: "1uCVBkDobUIFI2dq6Qmbc9jYM_LbVjBqA",
     cldbPageId: "34a35c2adb568050b145ef5af082a071", crdbDataSourceId: CRDB_DATA_SOURCE_ID },
@@ -247,13 +257,75 @@ type GasPayload =
   | { action: "stop"; creativeName: string; stopDate: string }
   | { action: "undo"; creativeName: string; memoMode: "full" | "tag" }
   | { action: "find"; creativeName: string }
-  | { action: "budget_propagate"; targetYear: number; targetMonth: number; requestBudget: number; memoText: string; prevBudget: number | null; dryRun: boolean };
+  | { action: "budget_propagate"; targetYear: number; targetMonth: number; requestBudget: number; memoText: string; prevBudget: number | null; dryRun: boolean }
+  // BUG-112: 子CR(crN_NN)を停止した直後の親子連動チェック。兄弟の子が全員停止済みなら親(crN)も停止する
+  | { action: "cascade_check"; creativeName: string; stopDate: string }
+  // BUG-112: 導入前からある「子が全員停止済みなのに親が未停止」を一括検出・停止（dryRun=trueは検出のみ）
+  | { action: "cascade_audit"; stopDate: string; dryRun: boolean }
+  // BUG-113: チェックボックスはON(停止済み)なのに背景が未グレー化のCRを検出・再グレー化（dryRun=trueは検出のみ）
+  | { action: "regray_check"; dryRun: boolean };
 
-async function callGas(target: SheetTarget, payload: GasPayload): Promise<any> {
-  // ハング防止: 各fetchに25秒タイムアウト（GASが重い/固まっても無限に待たない）
+interface CascadeResult {
+  triggered: boolean;
+  reason?: string;
+  parentId?: string;
+  childIds?: string[];
+  stopResult?: any;
+}
+
+// BUG-113: 親CR自動停止のSlack通知に「どの子CRが全て停止したから」を明記する
+// （従来は親の番号だけで、何が引き金になったか分からなかった）。
+function cascadeNotifyLine(cascade: CascadeResult | undefined, bold: (s: string) => string): string | null {
+  if (!cascade?.triggered || !cascade.parentId) return null;
+  const children = cascade.childIds?.length ? cascade.childIds.join("、") : "（子CR一覧取得失敗）";
+  return `👨‍👧 親CR ${bold(cascade.parentId)} も自動停止しました（子CR ${children} が全て停止／メモ:「子供が全て停止」）`;
+}
+
+// GAS呼び出しのタイムアウト。
+// BUG-147提案⑥(a) で stop/undo だけ 25秒→50秒 に延ばしたが、BUG-159 で**この延長が
+// 悪化要因だったと判明したため25秒へ戻した**。理由は下の「実行時間バジェット」を参照。
+const GAS_TIMEOUT_CRITICAL_MS = 25000; // stop / undo
+const GAS_TIMEOUT_DEFAULT_MS = 25000;  // find / cascade / regray / budget
+
+// ============================================================
+// 実行時間バジェット（BUG-159）
+// ============================================================
+// Slack経路の停止/取消は ctx.waitUntil() の中で全部やりきる作りだが、Workerの1回の実行には
+// 上限があり、超えると**残りの処理が問答無用で打ち切られる**（＝結果通知もupdateRunLogも
+// 実行されず、Slackが「⏳ 停止実行中…」のまま固まり、実行ログも「実行中」のまま残る）。
+//
+// BUG-159 の実測: jdem/cr42_03 は 08-13 の claude.ai/MCP経由（waitUntilを使わない通常の
+// リクエスト）では「Meta成功／集計表失敗」を最後まで記録できていたのに、08-18 の Slack経由
+// では 結果_Meta すら null のまま「実行中」で残っていた。同じcrで経路だけが違う。
+// この間に入った変更が v3.13 のGASタイムアウト 25→50秒 で、遅い集計表では
+// 「50秒待つ→その後の通知・ログ更新に到達する前に打ち切られる」形になっていた。
+// （v3.11/v3.12 で足したCP/AS・実績・AS残数の取得も、わずかだが尾を伸ばしている）
+//
+// 対策は2つ。①50秒を25秒に戻す ②**全体の時間予算**を持ち、重い処理に割ける時間を
+// 「終端処理ぶんを引いた残り」に制限する。これにより最悪でも
+// 「集計表は時間切れだったが、結果はSlackに出るし実行ログも終端化される」に着地する。
+//
+// ⚠️ 構造的な根治は、cr入稿くんが既に採用している self-chaining continuation
+//    （`src/submit/continuation.ts`: 1ホップ=1単位の仕事に分割して自分自身へPOST）に
+//    停止フローも寄せること。本対応は「黙って固まる」のを止めるまでに留める。
+const RUN_BUDGET_MS = 45000;   // waitUntil 内でやりきる全体の目安
+const TAIL_RESERVE_MS = 15000; // 結果通知・実行ログ終端化のために必ず残す分
+
+interface RunBudget { allow(maxMs: number): number; elapsed(): number }
+function startRunBudget(): RunBudget {
+  const t0 = Date.now();
+  return {
+    // この処理に割ってよい時間。0なら「もう時間が無いのでスキップ」の判断に使う
+    allow: (maxMs: number) => Math.max(0, Math.min(maxMs, RUN_BUDGET_MS - TAIL_RESERVE_MS - (Date.now() - t0))),
+    elapsed: () => Date.now() - t0,
+  };
+}
+
+async function callGas(target: SheetTarget, payload: GasPayload, timeoutMs = GAS_TIMEOUT_DEFAULT_MS): Promise<any> {
+  // ハング防止（GASが重い/固まっても無限に待たない）
   const withTimeout = async (url: string, init?: RequestInit) => {
     const ctl = new AbortController();
-    const t = setTimeout(() => ctl.abort(), 25000);
+    const t = setTimeout(() => ctl.abort(), timeoutMs);
     try { return await fetch(url, { ...init, signal: ctl.signal }); } finally { clearTimeout(t); }
   };
   const res = await withTimeout(COMMON_GAS_URL, {
@@ -275,6 +347,29 @@ async function callGas(target: SheetTarget, payload: GasPayload): Promise<any> {
     return JSON.parse(bodyText);
   } catch {
     return { success: false, message: "GASからJSON以外（権限=全員 を確認）", rawPreview: bodyText.slice(0, 200) };
+  }
+}
+
+// BUG-141フォローアップ: callGas(stop/undo)がGAS側の重さ（kk_mak/kk_kou等の巨大シート）等で
+// 25秒タイムアウト(AbortError)や通信エラーを起こすと、直前のMeta停止(pauseAds)は既に成功して
+// いても生の例外がそのまま「❌ エラー: AbortError: The operation was aborted」とSlackに表示され、
+// Meta側の成否が分からず利用者が手動で確認・再実行する必要があった（cr79_05/cr95_06で発生）。
+// 例外を既存のGasResult形状（{success:false,message}）に変換し、stopLines()等が
+// 「✅Meta広告:成功／❌集計表:失敗（理由・再実行案内）」という分かりやすい形を組み立てられるようにする。
+// callGasSafe は stop/undo からのみ呼ばれる＝失敗が実害になる経路。
+// budget を渡すと「終端処理ぶんを残した上での残り時間」まで縮められる（BUG-159）。
+async function callGasSafe(target: SheetTarget, payload: GasPayload, budget?: RunBudget): Promise<any> {
+  const ms = budget ? budget.allow(GAS_TIMEOUT_CRITICAL_MS) : GAS_TIMEOUT_CRITICAL_MS;
+  if (ms <= 0) {
+    return { success: false, message: "実行時間の上限に達したため集計表の記録をスキップしました。もう一度実行すると集計表のみ再試行されます。" };
+  }
+  try {
+    return await callGas(target, payload, ms);
+  } catch (e) {
+    return {
+      success: false,
+      message: `集計表への書き込みでエラー（${e}）。Meta広告側は上記の通り実行済みです。もう一度実行すると集計表のみ再試行されます。`,
+    };
   }
 }
 
@@ -308,7 +403,15 @@ function adNameMatches(adName: string, creative: string): boolean {
   return re.test(String(adName).toLowerCase());
 }
 
-interface MetaAd { id: string; name: string; effective_status: string; adsetName?: string; campaignName?: string }
+interface MetaAd { id: string; name: string; effective_status: string; adsetId?: string; adsetName?: string; campaignId?: string; campaignName?: string }
+
+// 広告が「どのCP・どのAS配下か」の情報（表示用・実行ログ用）
+interface AdPlacement { id: string; name?: string; adsetId?: string; adsetName?: string; campaignId?: string; campaignName?: string }
+
+// 停止判定の根拠数値（BUG-147提案A）。spendは常に正確、cvは下記のヒューリスティックで特定できた時のみ。
+interface AdMetrics { spend: number; cv: number | null; cvLabel?: string }
+// 広告セット単位の「配信中CRの残数」（BUG-147提案B）
+interface AdsetActivity { adsetId: string; adsetName?: string; activeBefore: number; remainingActive: number }
 
 // タイムアウト付き fetch→json（ハング防止）
 async function fetchJsonTimeout(url: string, ms: number): Promise<any> {
@@ -322,10 +425,30 @@ async function fetchJsonTimeout(url: string, ms: number): Promise<any> {
   }
 }
 
+// タイムアウト付き fetch（ハング防止・レスポンスは呼び出し側で読む）。
+// BUG-141: notifySlack/logToNotion/postResponse は元々このガードが無く、Slack/Notion側が
+// 応答を返さないまま固まると fetch の await が永遠に解決せず、後続の postResponse（完了通知）や
+// updateRunLog（実行ログの「実行中」解除）まで一切到達しなかった（=呼び出し元のtry/catchも無力。
+// 何も throw されないため）。ctx.waitUntil() 全体がCloudflare側のタイムアウトで強制終了されるまで
+// Slackの「⏳ 停止実行中…」が置き換わらず「途中でSlackが止まっていました」という見え方になっていた。
+async function fetchTimeout(url: string, init: RequestInit, ms: number): Promise<Response> {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), ms);
+  try {
+    return await fetch(url, { ...init, signal: ctl.signal });
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 async function metaFindAds(token: string, adAccountId: string, creative: string): Promise<MetaAd[]> {
   // ① cr番号だけ(例 cr60_11_01→cr60)で軽く検索（id/name/statusのみ＝速い・重くならない）。
   //    MetaのCONTAINは下線複数の長い文字列で0件を返す癖があるため番号で広く取る。
-  const broad = String(creative).split("_")[0] || creative;
+  //    creativeが案件プレフィックス付き(lcl_cr15_01等、CRDBページ名そのまま)だと、先頭セグメントを
+  //    素朴に取ると案件名側("lcl")を拾ってしまい、CONTAINが広がりすぎて件数の多い案件では
+  //    古い広告が limit=300/500 の取得範囲外に押し出され0件化する（BUG-108）。"cr"+数字のトークンを優先的に抽出する。
+  const crToken = String(creative).match(/cr\d+/i)?.[0];
+  const broad = crToken || String(creative).split("_")[0] || creative;
   const filtering = encodeURIComponent(JSON.stringify([{ field: "name", operator: "CONTAIN", value: broad }]));
   const url = `https://graph.facebook.com/${GRAPH}/act_${adAccountId}/ads?fields=id,name,effective_status&filtering=${filtering}&limit=300&access_token=${encodeURIComponent(token)}`;
   const data = await fetchJsonTimeout(url, 12000);
@@ -348,18 +471,221 @@ async function metaFindAds(token: string, adAccountId: string, creative: string)
     }
   }
 
-  // ③ 一致した広告だけ CP名/AS名 を取得（軽量・表示用）
+  // ③ 一致した広告だけ CP/AS を取得（軽量・表示用）
   if (matched.length) {
-    try {
-      const ids = matched.map((m) => m.id).join(",");
-      const u2 = `https://graph.facebook.com/${GRAPH}/?ids=${encodeURIComponent(ids)}&fields=adset{name},campaign{name}&access_token=${encodeURIComponent(token)}`;
-      const d2 = await fetchJsonTimeout(u2, 8000);
-      matched = matched.map((m) => ({ ...m, adsetName: d2?.[m.id]?.adset?.name, campaignName: d2?.[m.id]?.campaign?.name }));
-    } catch {
-      /* CP/AS名は表示用なので取れなくても続行 */
-    }
+    const byId = new Map((await fetchAdPlacements(token, matched.map((m) => m.id))).map((p) => [p.id, p]));
+    matched = matched.map((m) => ({ ...m, adsetId: byId.get(m.id)?.adsetId, adsetName: byId.get(m.id)?.adsetName, campaignId: byId.get(m.id)?.campaignId, campaignName: byId.get(m.id)?.campaignName }));
   }
   return matched;
+}
+
+// 広告ID群のCP/AS（id・名前）を1回のGraph API呼び出しでまとめて取得する。
+// BUG-147: Slack通知に「どのCP・どのASで止めたか」を出すために使う。Slackのボタンvalueには
+// 文字数上限があり CP/AS名まで積めないため、ボタン押下後の実行時に広告IDから引き直す。
+// 表示・記録用の付加情報なので、失敗しても停止処理は止めず空配列を返す。
+async function fetchAdPlacements(token: string, ids: string[]): Promise<AdPlacement[]> {
+  if (!ids.length) return [];
+  try {
+    const u = `https://graph.facebook.com/${GRAPH}/?ids=${encodeURIComponent(ids.join(","))}&fields=name,adset{id,name},campaign{id,name}&access_token=${encodeURIComponent(token)}`;
+    const d = await fetchJsonTimeout(u, 8000);
+    if (!d || d.error) return [];
+    return ids.map((id) => ({
+      id,
+      name: d?.[id]?.name,
+      adsetId: d?.[id]?.adset?.id,
+      adsetName: d?.[id]?.adset?.name,
+      campaignId: d?.[id]?.campaign?.id,
+      campaignName: d?.[id]?.campaign?.name,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+// ============================================================
+// 停止判定の根拠数値（BUG-147提案A）
+// Slackの停止判定投稿では毎回担当者が手で「消化金額48815円で0CV」等と書いている。
+// Meta Graph APIは既に叩いているので、停止時点の実績を通知に自動で載せる。
+// ============================================================
+// insightsの actions[] からどれを「CV」と見なすかの優先順位。
+// 当社案件（美容サロン等のリード獲得）は Metaのカスタムコンバージョン(form_submit等)で
+// 計測しているケースが多いため custom を最優先にしている。
+// ⚠️ どの action_type を採用したかは必ずメッセージにラベル表示する（数値の検証可能性を担保する。
+//    停止判断に使う数字なので、誤ったCVを黙って出すより「判定不可」の方が安全という方針）。
+const CV_ACTION_PRIORITY: RegExp[] = [
+  /^offsite_conversion\.custom\./,
+  /^offsite_conversion\.fb_pixel_lead$/,
+  /^onsite_conversion\.lead_grouped$/,
+  /^lead$/,
+  /^offsite_conversion\.fb_pixel_complete_registration$/,
+  /^complete_registration$/,
+  /^offsite_conversion\.fb_pixel_purchase$/,
+  /^purchase$/,
+  /^offsite_conversion\.fb_pixel_custom$/,
+];
+
+// actions[] から採用するCVを1つ選ぶ。優先度が同じ層に複数あれば値が最大のものを採る。
+function pickCvAction(actions: any[] | undefined): { value: number; label: string } | null {
+  if (!Array.isArray(actions) || !actions.length) return null;
+  for (const re of CV_ACTION_PRIORITY) {
+    const hits = actions.filter((a) => re.test(String(a?.action_type || "")));
+    if (!hits.length) continue;
+    const best = hits.reduce((m, a) => (Number(a.value || 0) > Number(m.value || 0) ? a : m));
+    return { value: Number(best.value || 0), label: String(best.action_type || "") };
+  }
+  return null;
+}
+
+// 広告ID群の実績を1回のGraph API呼び出しでまとめて取得（期間はdatePresetで指定）。
+// 表示用の付加情報なので、失敗しても停止処理は止めず空Mapを返す。
+async function fetchAdMetrics(token: string, ids: string[], datePreset: string): Promise<Map<string, AdMetrics>> {
+  const out = new Map<string, AdMetrics>();
+  if (!ids.length) return out;
+  try {
+    const fields = `insights.date_preset(${datePreset}){spend,actions}`;
+    const u = `https://graph.facebook.com/${GRAPH}/?ids=${encodeURIComponent(ids.join(","))}&fields=${encodeURIComponent(fields)}&access_token=${encodeURIComponent(token)}`;
+    const d = await fetchJsonTimeout(u, 10000);
+    if (!d || d.error) return out;
+    for (const id of ids) {
+      const row = d?.[id]?.insights?.data?.[0];
+      if (!row) continue;
+      const cv = pickCvAction(row.actions);
+      out.set(id, { spend: Number(row.spend || 0), cv: cv ? cv.value : null, cvLabel: cv?.label });
+    }
+  } catch {
+    /* 実績は表示用。取れなくても停止処理は続行 */
+  }
+  return out;
+}
+
+const yen = (n: number) => `¥${Math.round(n).toLocaleString("en-US")}`;
+
+// action_type をSlack表示用の短いラベルに（生の値は実行ログの詳細JSONに残す）。
+// 「どのイベントの数字か」が読み取れれば運用者が数値の妥当性を判断できる、という趣旨。
+function cvLabelJa(actionType: string | undefined): string {
+  const t = String(actionType || "");
+  if (/^offsite_conversion\.custom\./.test(t)) return "カスタムCV";
+  if (/lead/.test(t)) return "リード";
+  if (/complete_registration/.test(t)) return "登録完了";
+  if (/purchase/.test(t)) return "購入";
+  if (/fb_pixel_custom$/.test(t)) return "カスタムイベント";
+  return t || "?";
+}
+
+// 複数広告分を合算して「¥48,815 / 0CV / CPA -」の形にする
+function metricsSummary(m: Map<string, AdMetrics>, ids: string[]): { text: string; cvLabel?: string } | null {
+  const rows = ids.map((id) => m.get(id)).filter((x): x is AdMetrics => !!x);
+  if (!rows.length) return null;
+  const spend = rows.reduce((s, r) => s + r.spend, 0);
+  const known = rows.filter((r) => r.cv !== null);
+  // 一部の広告でCVを特定できない場合、合算すると過小なCPAを出してしまうため「判定不可」に倒す
+  if (known.length !== rows.length) return { text: `${yen(spend)} / CV判定不可` };
+  const cv = known.reduce((s, r) => s + (r.cv || 0), 0);
+  const cpa = cv > 0 ? yen(spend / cv) : "-";
+  return { text: `${yen(spend)} / ${cv}CV / CPA ${cpa}`, cvLabel: known.find((r) => r.cvLabel)?.cvLabel };
+}
+
+// 「📊 通算 … ｜ 直近30日 …」の1行。両期間とも取得できなければ行を出さない。
+function metricsLine(lifetime: Map<string, AdMetrics>, recent: Map<string, AdMetrics>, ids: string[]): string[] {
+  const lt = metricsSummary(lifetime, ids);
+  const rc = metricsSummary(recent, ids);
+  if (!lt && !rc) return [];
+  const parts: string[] = [];
+  if (lt) parts.push(`通算 ${lt.text}`);
+  if (rc) parts.push(`直近30日 ${rc.text}`);
+  const label = lt?.cvLabel || rc?.cvLabel;
+  return [`　📊 ${parts.join(" ｜ ")}${label ? `（CV=${cvLabelJa(label)}）` : ""}`];
+}
+
+// ============================================================
+// 広告セットの配信中CR残数チェック（BUG-147提案B）
+// 2026-07-27にhiroyoさんが「cr214_02を停止したため、1軍が0になってしまいました」と報告。
+// 停止でその広告セットの配信が止まってしまうケースを、停止前の確認画面と完了通知で警告する。
+// ============================================================
+// 対象広告セットの配信中(ACTIVE)広告数を数える。stoppedIdsは「今回止める/止めた広告」で、
+// Meta側の反映遅延に左右されないよう手元で除外して残数を出す。失敗時は空配列（警告を出さない）。
+async function fetchAdsetActivity(token: string, adsetIds: string[], stoppedIds: string[]): Promise<AdsetActivity[]> {
+  const uniq = [...new Set(adsetIds.filter(Boolean))];
+  if (!uniq.length) return [];
+  try {
+    const fields = "name,ads.limit(200){id,effective_status}";
+    const u = `https://graph.facebook.com/${GRAPH}/?ids=${encodeURIComponent(uniq.join(","))}&fields=${encodeURIComponent(fields)}&access_token=${encodeURIComponent(token)}`;
+    const d = await fetchJsonTimeout(u, 10000);
+    if (!d || d.error) return [];
+    const stopped = new Set(stoppedIds);
+    const out: AdsetActivity[] = [];
+    for (const adsetId of uniq) {
+      const node = d?.[adsetId];
+      if (!node) continue;
+      const ads: any[] = node?.ads?.data || [];
+      const active = ads.filter((a) => String(a?.effective_status) === "ACTIVE");
+      out.push({
+        adsetId,
+        adsetName: node?.name,
+        activeBefore: active.length,
+        remainingActive: active.filter((a) => !stopped.has(String(a.id))).length,
+      });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+// 残数0になった広告セットの警告行（停止後の通知用）。0件のASが無ければ行なし。
+function adsetZeroLines(acts: AdsetActivity[] | undefined): string[] {
+  const zero = (acts || []).filter((a) => a.remainingActive === 0 && a.activeBefore > 0);
+  if (!zero.length) return [];
+  return [`　⚠️ 広告セット${zero.map((a) => `「${a.adsetName || a.adsetId}」`).join("、")}の配信中CRが0件になりました（要確認）`];
+}
+
+// 「この広告群を止めたら配信中が0件になる広告セット」の名前一覧（停止前の確認画面用）。
+// 確認画面では止める対象がボタンごとに違う（1件だけ／配信中を全部）ため、activeBefore から都度計算する。
+function adsetsGoingZero(adsets: AdsetActivity[] | undefined, stopping: MetaAd[]): string[] {
+  if (!adsets?.length) return [];
+  const cnt = new Map<string, number>();
+  for (const a of stopping) if (a.adsetId) cnt.set(a.adsetId, (cnt.get(a.adsetId) || 0) + 1);
+  return adsets
+    .filter((act) => {
+      const n = cnt.get(act.adsetId) || 0;
+      return n > 0 && act.activeBefore > 0 && act.activeBefore - n <= 0;
+    })
+    .map((act) => act.adsetName || act.adsetId);
+}
+const zeroWarn = (names: string[]): string =>
+  names.length ? `\n⚠️ *この停止で広告セット${names.map((n) => `「${n}」`).join("、")}の配信中CRが0件になります*` : "";
+
+// 停止/再開した広告が「どのCP・どのAS配下だったか」の行を組む（BUG-147）。
+// 同一CP/ASにまとまっていれば1行、複数キャンペーン/広告セットにまたがる場合はグループごとに1行
+// （どこを止めたのかが1行で分からないと、別CPの同名crを巻き込んでいないか確認できないため）。
+// 実行ログDBの「広告セットID」列用（重複除去）。どのASを触ったかを後から追える。
+const adsetIdsOf = (places: AdPlacement[] | undefined): string[] =>
+  [...new Set((places || []).map((p) => p.adsetId).filter((x): x is string => !!x))];
+
+const adPlacementOf = (a: MetaAd): AdPlacement =>
+  ({ id: a.id, name: a.name, adsetId: a.adsetId, adsetName: a.adsetName, campaignId: a.campaignId, campaignName: a.campaignName });
+
+function placementGroups(places: AdPlacement[] | undefined): string[] {
+  if (!places?.length) return [];
+  if (!places.some((p) => p.campaignName || p.adsetName)) return []; // 全て取得失敗なら出さない
+  const groups = new Map<string, number>();
+  for (const p of places) {
+    const key = `CP: ${p.campaignName || "?"} ／ AS: ${p.adsetName || "?"}`;
+    groups.set(key, (groups.get(key) || 0) + 1);
+  }
+  if (groups.size === 1) return [[...groups.keys()][0]];
+  return [...groups.entries()].map(([k, n]) => `${k}（${n}件）`);
+}
+const placementLines = (places: AdPlacement[] | undefined): string[] => placementGroups(places).map((g) => `　└ ${g}`);
+
+// BUG-147提案③: 実際に止めたMeta広告名の行。cr名(cr95_06)と広告名(jde_mak_cr95_06_…)は別物で、
+// 命名ミスや想定外の広告を掴んでいた場合に通知だけで気付けるようにする。
+// 広告名は長いので1件のときだけ全文（60字で打ち切り）、複数件は先頭＋「他N件」に畳む。
+const truncAdName = (s: string) => (s.length > 60 ? `${s.slice(0, 60)}…` : s);
+function adNameLines(places: AdPlacement[] | undefined): string[] {
+  const names = (places || []).map((p) => p.name).filter((n): n is string => !!n);
+  if (!names.length) return []; // 広告名が取れなければ行自体を出さない（従来の見た目に戻る）
+  return [`　└ 広告: ${truncAdName(names[0])}${names.length > 1 ? ` 他${names.length - 1}件` : ""}`];
 }
 
 async function metaSetStatus(token: string, adId: string, status: "PAUSED" | "ACTIVE"): Promise<void> {
@@ -378,10 +704,14 @@ async function metaSetStatus(token: string, adId: string, status: "PAUSED" | "AC
     clearTimeout(t);
   }
 }
-// 複数広告を並列で更新（直列だと多数で固まる）。成功件数を返す。
-async function setAdsStatus(token: string, ids: string[], status: "PAUSED" | "ACTIVE"): Promise<number> {
+// 複数広告を並列で更新（直列だと多数で固まる）。成功件数と、失敗があれば実際のGraph APIエラー文言を返す
+// （BUG-109: 従来は失敗件数しか分からず「トークン/権限を確認してください」としか案内できなかった）。
+interface SetAdsStatusResult { success: number; errors: string[] }
+async function setAdsStatus(token: string, ids: string[], status: "PAUSED" | "ACTIVE"): Promise<SetAdsStatusResult> {
   const r = await Promise.allSettled(ids.map((id) => metaSetStatus(token, id, status)));
-  return r.filter((x) => x.status === "fulfilled").length;
+  const success = r.filter((x) => x.status === "fulfilled").length;
+  const errors = r.filter((x): x is PromiseRejectedResult => x.status === "rejected").map((x) => String(x.reason?.message || x.reason));
+  return { success, errors };
 }
 const pauseAds = (token: string, ids: string[]) => setAdsStatus(token, ids, "PAUSED");
 const resumeAds = (token: string, ids: string[]) => setAdsStatus(token, ids, "ACTIVE");
@@ -391,8 +721,37 @@ const resumeAds = (token: string, ids: string[]) => setAdsStatus(token, ids, "AC
 // ============================================================
 interface StopResult {
   alreadyStopped?: boolean;
-  meta?: { configured: boolean; found: number; paused?: number; adNames?: string[]; adIds?: string[] };
+  meta?: { configured: boolean; found: number; paused?: number; adNames?: string[]; adIds?: string[]; errors?: string[]; places?: AdPlacement[]; metricsLines?: string[]; adsets?: AdsetActivity[] };
   sheet?: any;
+  cascade?: CascadeResult;
+}
+
+// BUG-112: 子CR(crN_NN)の集計表停止が成功した直後に呼ぶ。兄弟の子が全員停止済みになっていれば
+// GAS側が親(crN)も集計表停止する（メモ「子供が全て停止」）。親は「子持ち親はMeta未入稿」が原則だが、
+// 命名規則の例外（実は親にも広告がある）に備え、triggeredの場合はここでMeta側も念のため探して止める。
+async function cascadeCheckAndStopParent(env: Env, p: Project, target: SheetTarget, childCreative: string, date: string, timeoutMs = GAS_TIMEOUT_DEFAULT_MS): Promise<CascadeResult | undefined> {
+  let cascade: CascadeResult;
+  try {
+    cascade = await callGas(target, { action: "cascade_check", creativeName: childCreative, stopDate: date }, timeoutMs);
+  } catch (e) {
+    return { triggered: false, reason: `cascade_check失敗: ${e}` };
+  }
+  if (!cascade?.triggered || !cascade.parentId) return cascade;
+
+  const token = metaToken(env, p);
+  if (token && p.metaAdAccountId) {
+    try {
+      const ads = await metaFindAds(token, p.metaAdAccountId, cascade.parentId);
+      const active = ads.filter((a) => a.effective_status !== "PAUSED");
+      if (active.length) {
+        const r = await setAdsStatus(token, active.map((a) => a.id), "PAUSED");
+        (cascade as any).meta = { found: ads.length, paused: r.success, errors: r.errors };
+      }
+    } catch (e) {
+      (cascade as any).meta = { error: String(e) };
+    }
+  }
+  return cascade;
 }
 
 async function doStop(env: Env, p: Project, creative: string, date: string): Promise<StopResult> {
@@ -412,18 +771,42 @@ async function doStop(env: Env, p: Project, creative: string, date: string): Pro
         out.meta = { configured: true, found: ads.length, paused: 0, adNames: ads.map((a) => a.name) };
         return out;
       }
-      for (const a of active) await metaSetStatus(token, a.id, "PAUSED");
-      out.meta = { configured: true, found: ads.length, paused: active.length, adNames: active.map((a) => a.name), adIds: active.map((a) => a.id) };
+      // BUG-109: 直列awaitで無防備にthrowすると1件失敗しただけでB.集計表記録まで
+      // 到達できず（claude.ai/MCP経由のstop_creativeで発生）、失敗理由も分からなかった。
+      // setAdsStatus（Promise.allSettled）で並列実行しつつ成功件数と実際のエラー文言を取得する。
+      const activeIds = active.map((a) => a.id);
+      const r = await setAdsStatus(token, activeIds, "PAUSED");
+      // BUG-147: metaFindAds が既にCP/ASを引いているので、CP/AS行は追加のAPI呼び出しなしで出せる。
+      // 根拠数値(提案A)とAS残数(提案B)だけ追加取得する（全て並列・失敗しても停止処理は止めない）。
+      const [lifetime, recent, adsets] = await Promise.all([
+        fetchAdMetrics(token, activeIds, "maximum"),
+        fetchAdMetrics(token, activeIds, "last_30d"),
+        fetchAdsetActivity(token, active.map((a) => a.adsetId || ""), activeIds),
+      ]);
+      out.meta = {
+        configured: true, found: ads.length, paused: r.success,
+        adNames: active.map((a) => a.name), adIds: activeIds, errors: r.errors,
+        places: active.map(adPlacementOf),
+        metricsLines: metricsLine(lifetime, recent, activeIds),
+        adsets,
+      };
     }
   } else {
     out.meta = { configured: false, found: 0 };
   }
 
-  // B. 集計表記録（複数集計対象の案件は cr名で対象タブを判定）
+  // B. 集計表記録（複数集計対象の案件は cr名で対象タブを判定）。Metaが一部/全部失敗しても必ず実行する。
+  // BUG-141フォローアップ: callGasSafe()でGAS側の例外(タイムアウト等)を吸収し、Meta側の結果は
+  // 保持したまま「集計表のみ失敗」として返す（生の例外が呼び出し元にthrowされるのを防ぐ）。
   const target = await pickSheet(p, creative);
   out.sheet = target
-    ? await callGas(target, { action: "stop", creativeName: creative, stopDate: date })
+    ? await callGasSafe(target, { action: "stop", creativeName: creative, stopDate: date })
     : { success: false, message: "集計表に該当crが見つかりません(複数対象)" };
+
+  // C. 親子連動チェック（BUG-112）。集計表停止が成功した場合のみ・失敗しても本処理は止めない
+  if (target && out.sheet?.success) {
+    try { out.cascade = await cascadeCheckAndStopParent(env, p, target, creative, date); } catch { /* ベストエフォート */ }
+  }
   return out;
 }
 
@@ -432,15 +815,15 @@ async function doUndo(env: Env, p: Project, creative: string, memoMode: "full" |
   // B. 集計表undo（先に実行。これが成功＝我々が停止した証拠）
   const target = await pickSheet(p, creative);
   out.sheet = target
-    ? await callGas(target, { action: "undo", creativeName: creative, memoMode })
+    ? await callGasSafe(target, { action: "undo", creativeName: creative, memoMode })
     : { success: false, message: "集計表に該当crが見つかりません(複数対象)" };
   // A. 集計表undoが成功した時のみMeta広告をACTIVEに戻す（無関係なPAUSE広告を誤って動かさない）
   const token = metaToken(env, p);
   if (out.sheet?.success && token && p.metaAdAccountId) {
     const ads = await metaFindAds(token, p.metaAdAccountId, creative);
     const paused = ads.filter((a) => a.effective_status === "PAUSED");
-    for (const a of paused) await metaSetStatus(token, a.id, "ACTIVE");
-    out.meta = { resumed: paused.length, adNames: paused.map((a) => a.name), adIds: paused.map((a) => a.id) };
+    const r = await setAdsStatus(token, paused.map((a) => a.id), "ACTIVE");
+    out.meta = { resumed: r.success, adNames: paused.map((a) => a.name), adIds: paused.map((a) => a.id), errors: r.errors, places: paused.map(adPlacementOf) };
   }
   return out;
 }
@@ -453,16 +836,23 @@ function fmtStop(out: StopResult, creative: string, date: string): string {
   const parts: string[] = [];
   if (out.meta?.configured) {
     parts.push(out.meta.found === 0 ? "⚠️Meta広告が見つかりません" : `Meta ${out.meta.paused}件停止`);
+    if (out.meta.paused) parts.push(...placementGroups(out.meta.places)); // BUG-147: どのCP/ASを止めたか
+    if (out.meta.errors?.length) parts.push(`⚠️Meta失敗理由: ${out.meta.errors.join(" / ")}`);
   } else {
     parts.push("Meta未連携");
   }
   parts.push(out.sheet?.success ? `集計表 記録(${date})` : `集計表 失敗:${out.sheet?.message || "?"}`);
+  { const line = cascadeNotifyLine(out.cascade, (s) => `「${s}」`); if (line) parts.push(line); }
   return `✅ ${creative} を停止しました｜${parts.join(" / ")}`;
 }
 function fmtUndo(out: any, creative: string, memoMode: string): string {
   if (!out.sheet?.success) return `⚠️ ${creative}: ${out.sheet?.message || "取消情報なし"}`;
   const parts: string[] = [];
-  if (out.meta) parts.push(`Meta ${out.meta.resumed}件再開`);
+  if (out.meta) {
+    parts.push(`Meta ${out.meta.resumed}件再開`);
+    if (out.meta.resumed) parts.push(...placementGroups(out.meta.places)); // BUG-147: どのCP/ASを再開したか
+    if (out.meta.errors?.length) parts.push(`⚠️Meta失敗理由: ${out.meta.errors.join(" / ")}`);
+  }
   parts.push(`集計表 復元(${memoMode})`);
   return `✅ ${creative} の停止を取り消しました｜${parts.join(" / ")}`;
 }
@@ -475,12 +865,20 @@ function fmtPublicStop(out: StopResult, creative: string, date: string, by: stri
   } else {
     lines.push("・Meta: 未連携");
   }
+  if (out.meta?.paused) { // BUG-147
+    lines.push(...adNameLines(out.meta.places));
+    lines.push(...placementLines(out.meta.places));
+    lines.push(...(out.meta.metricsLines || []));
+    lines.push(...adsetZeroLines(out.meta.adsets));
+  }
   lines.push(out.sheet?.success ? `✅ 集計表: 記録・グレー化（${date}）` : `❌ 集計表: ${out.sheet?.message || "失敗"}`);
+  { const line = cascadeNotifyLine(out.cascade, (s) => `*${s}*`); if (line) lines.push(line); }
   return lines.join("\n");
 }
 function fmtPublicUndo(out: any, creative: string, memoMode: string, by: string): string {
   const lines = [`↩️ *${creative}* の停止を取り消しました　${by}`];
   if (out.meta) lines.push(`✅ Meta広告: ${out.meta.resumed}件 再開（ACTIVE）`);
+  if (out.meta?.resumed) lines.push(...placementLines(out.meta.places)); // BUG-147: どのCP/ASを再開したか
   lines.push(`✅ 集計表: 復元（${memoMode}）`);
   return lines.join("\n");
 }
@@ -490,21 +888,29 @@ async function notifySlack(env: Env, channelId: string, text: string): Promise<{
   if (!env.SLACK_BOT_TOKEN || !channelId) return { ok: false, error: "no token/channel" };
   try {
     const post = async () => {
-      const res = await fetch("https://slack.com/api/chat.postMessage", {
-        method: "POST",
-        headers: { "Content-Type": "application/json; charset=utf-8", Authorization: `Bearer ${env.SLACK_BOT_TOKEN}` },
-        body: JSON.stringify({ channel: channelId, text }),
-      });
+      const res = await fetchTimeout(
+        "https://slack.com/api/chat.postMessage",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json; charset=utf-8", Authorization: `Bearer ${env.SLACK_BOT_TOKEN}` },
+          body: JSON.stringify({ channel: channelId, text }),
+        },
+        15000,
+      );
       return (await res.json()) as any;
     };
     let data = await post();
     if (!data.ok && data.error === "not_in_channel") {
       // Bot未参加チャンネル（BUG-29: rcl）→ publicなら参加を試みて1回だけ再送
-      const j = await fetch("https://slack.com/api/conversations.join", {
-        method: "POST",
-        headers: { "Content-Type": "application/json; charset=utf-8", Authorization: `Bearer ${env.SLACK_BOT_TOKEN}` },
-        body: JSON.stringify({ channel: channelId }),
-      });
+      const j = await fetchTimeout(
+        "https://slack.com/api/conversations.join",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json; charset=utf-8", Authorization: `Bearer ${env.SLACK_BOT_TOKEN}` },
+          body: JSON.stringify({ channel: channelId }),
+        },
+        15000,
+      );
       const jd: any = await j.json();
       if (jd.ok) data = await post();
     }
@@ -524,23 +930,27 @@ interface LogEntry { creative: string; user: string; userId: string; action: "�
 async function logToNotion(env: Env, e: LogEntry): Promise<void> {
   if (!env.NOTION_TOKEN) return;
   try {
-    await fetch("https://api.notion.com/v1/pages", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${env.NOTION_TOKEN}`, "Notion-Version": "2022-06-28", "Content-Type": "application/json" },
-      body: JSON.stringify({
-        parent: { database_id: NOTION_LOG_DB_ID },
-        properties: {
-          "クリエイティブ": { title: [{ text: { content: e.creative } }] },
-          "実行者": { rich_text: [{ text: { content: e.user } }] },
-          "実行者ID": { rich_text: [{ text: { content: e.userId } }] },
-          "アクション": { select: { name: e.action } },
-          "案件": { select: { name: e.project } },
-          "経路": { select: { name: e.route } },
-          "Meta件数": { number: e.metaCount },
-          "集計表結果": { select: { name: e.sheetResult } },
-        },
-      }),
-    });
+    await fetchTimeout(
+      "https://api.notion.com/v1/pages",
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${env.NOTION_TOKEN}`, "Notion-Version": "2022-06-28", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          parent: { database_id: NOTION_LOG_DB_ID },
+          properties: {
+            "クリエイティブ": { title: [{ text: { content: e.creative } }] },
+            "実行者": { rich_text: [{ text: { content: e.user } }] },
+            "実行者ID": { rich_text: [{ text: { content: e.userId } }] },
+            "アクション": { select: { name: e.action } },
+            "案件": { select: { name: e.project } },
+            "経路": { select: { name: e.route } },
+            "Meta件数": { number: e.metaCount },
+            "集計表結果": { select: { name: e.sheetResult } },
+          },
+        }),
+      },
+      15000,
+    );
   } catch {
     /* ログ失敗は本処理を止めない */
   }
@@ -569,7 +979,16 @@ function stopRunPatch(out: StopResult) {
     metaResult,
     sheetResult,
     adIds: out.meta?.adIds || [],
+    adsetIds: adsetIdsOf(out.meta?.places), // BUG-147
     sheetTabs: out.sheet?.sheet ? [String(out.sheet.sheet)] : [],
+    detail: out.meta?.errors?.length || out.meta?.places?.length
+      ? {
+          metaError: out.meta?.errors || [],
+          placements: out.meta?.places?.length ? out.meta.places : undefined,
+          metrics: out.meta?.metricsLines?.length ? out.meta.metricsLines : undefined,
+          adsets: out.meta?.adsets?.length ? out.meta.adsets : undefined,
+        }
+      : undefined,
   };
 }
 function undoRunPatch(out: any) {
@@ -579,6 +998,10 @@ function undoRunPatch(out: any) {
     metaResult: out.meta ? "成功" : "未実行",
     sheetResult,
     adIds: out.meta?.adIds || [],
+    adsetIds: adsetIdsOf(out.meta?.places), // BUG-147
+    detail: out.meta?.errors?.length || out.meta?.places?.length
+      ? { metaError: out.meta?.errors || [], placements: out.meta?.places?.length ? out.meta.places : undefined }
+      : undefined,
   };
 }
 
@@ -828,6 +1251,81 @@ export class CreativeStopMCP extends McpAgent<Env> {
     this.server.tool("list_projects", "登録済み案件の一覧", {}, async () =>
       asText(PROJECTS.map((p) => ({ name: p.name, channelId: p.channelId, metaConnected: !!p.metaAdAccountId }))),
     );
+
+    // BUG-112: 「子供のクリエイティブが全て止まった時に親のクリエイティブも停止」を、機能導入前から
+    // 既にその状態になっているデータへ一括適用するための監査ツール。dryRun=trueがデフォルト
+    // （まず検出結果を確認してから dryRun=false で実行する運用を想定。cr停止くん本体は今後、
+    // 子CRを止めるたびにこの判定を自動実行する＝ここでの一括適用は主に既存データの棚卸し用）。
+    this.server.tool(
+      "cascade_audit_parents",
+      "「子CRが全員停止済みなのに親CRが未停止」の組を検出し、該当すれば親も停止（集計表メモ「子供が全て停止」＋Meta実停止を試行）。dryRun=true(既定)は検出のみで書き込みしない。",
+      {
+        project: z.string().describe("案件名。例: jdek（jde両訴求）/ jdekmak / jdekkou"),
+        dryRun: z.boolean().default(true).describe("true=検出のみ（既定）。false=実際に親を停止する"),
+        stopDate: z.string().optional().describe('メモに使う日付"M/D"。省略時は今日（実際にはcustomNote「子供が全て停止」を書くため通常は未使用）'),
+      },
+      async ({ project, dryRun, stopDate }) => {
+        const p = projectByName(project);
+        if (!p) return asText({ success: false, message: `案件不明: ${project}` });
+        const date = stopDate || todayJST();
+        const perSheet: any[] = [];
+        for (const target of p.sheets) {
+          let audit: any;
+          try {
+            audit = await callGas(target, { action: "cascade_audit", stopDate: date, dryRun });
+          } catch (e) {
+            perSheet.push({ sheetName: target.sheetName || "meta_total", error: String(e) });
+            continue;
+          }
+          // dryRun=falseで実際に親が停止された場合、Meta側も念のため探して止める（子持ち親は通常Meta未入稿）
+          if (!dryRun && audit?.results?.length) {
+            const token = metaToken(env, p);
+            for (const r of audit.results) {
+              if (!r?.stopResult?.success || !token || !p.metaAdAccountId) continue;
+              try {
+                const ads = await metaFindAds(token, p.metaAdAccountId, r.parentId);
+                const active = ads.filter((a) => a.effective_status !== "PAUSED");
+                if (active.length) {
+                  const mr = await setAdsStatus(token, active.map((a) => a.id), "PAUSED");
+                  r.meta = { found: ads.length, paused: mr.success, errors: mr.errors };
+                }
+              } catch (e) { r.meta = { error: String(e) }; }
+            }
+            if (audit.results.length) {
+              await notifySlack(env, p.channelId, `👨‍👧 親子連動停止（監査）: ${audit.results.map((r: any) => r.parentId).join(", ")} を「子供が全て停止」で自動停止しました（via Claude）`);
+            }
+          }
+          perSheet.push({ sheetName: target.sheetName || audit?.sheet || "meta_total", ...audit });
+        }
+        return asText({ project: p.name, dryRun, sheets: perSheet });
+      },
+    );
+
+    // BUG-113: 「チェックボックスはON(停止済み)なのに集計表がグレー化されていない」CRの調査で判明した、
+    // cr停止くん経由でない（手動チェック等の）過去の停止記録を一括是正するための棚卸しツール。
+    // チェックボックス・メモ文言は一切変更せず、背景色（グレー化）のみを対象範囲に再適用する。
+    this.server.tool(
+      "regray_stopped_creatives",
+      "チェックボックスがON(停止済み)なのに列群が未グレー化のCRを検出し、背景をグレー化する（チェック・メモは変更しない）。dryRun=true(既定)は検出のみ。",
+      {
+        project: z.string().describe("案件名。例: jdek（jde両訴求）/ jdekmak / jdekkou"),
+        dryRun: z.boolean().default(true).describe("true=検出のみ（既定）。false=実際にグレー化する"),
+      },
+      async ({ project, dryRun }) => {
+        const p = projectByName(project);
+        if (!p) return asText({ success: false, message: `案件不明: ${project}` });
+        const perSheet: any[] = [];
+        for (const target of p.sheets) {
+          try {
+            const r = await callGas(target, { action: "regray_check", dryRun });
+            perSheet.push({ sheetName: target.sheetName || r?.sheet || "meta_total", ...r });
+          } catch (e) {
+            perSheet.push({ sheetName: target.sheetName || "meta_total", error: String(e) });
+          }
+        }
+        return asText({ project: p.name, dryRun, sheets: perSheet });
+      },
+    );
   }
 }
 
@@ -868,7 +1366,7 @@ function adLine(a: MetaAd): string {
 }
 
 // Meta連携あり: 検索結果から停止確認ブロックを組む（2件以上は広告ごと個別選択）
-function buildStopBlocks(project: string, creative: string, date: string, ads: MetaAd[]) {
+function buildStopBlocks(project: string, creative: string, date: string, ads: MetaAd[], adsets?: AdsetActivity[]) {
   // 集計表だけ記録（Metaは触らない）ボタン共通
   const sheetOnlyBtn = { type: "button", text: { type: "plain_text", text: "集計表だけ記録" }, action_id: "do_stop_sheet", value: JSON.stringify({ a: "stop", p: project, c: creative, d: date, ad: [] }) };
   const cancelBtn = { type: "button", text: { type: "plain_text", text: "キャンセル" }, action_id: "cancel", value: JSON.stringify({ a: "cancel" }) };
@@ -901,7 +1399,7 @@ function buildStopBlocks(project: string, creative: string, date: string, ads: M
     return {
       response_type: "ephemeral",
       blocks: [
-        { type: "section", text: { type: "mrkdwn", text: `*${project}* で以下を停止します（${date}）。よろしいですか？\n${adLine(a)}` } },
+        { type: "section", text: { type: "mrkdwn", text: `*${project}* で以下を停止します（${date}）。よろしいですか？\n${adLine(a)}${zeroWarn(adsetsGoingZero(adsets, [a]))}` } },
         { type: "actions", elements: [
           { type: "button", style: "danger", text: { type: "plain_text", text: "停止する" }, action_id: "do_stop", value: JSON.stringify({ a: "stop", p: project, c: creative, d: date, ad: [a.id] }) },
           sheetOnlyBtn,
@@ -917,13 +1415,19 @@ function buildStopBlocks(project: string, creative: string, date: string, ads: M
     { type: "divider" },
   ];
   for (const a of ads) {
-    const sec: any = { type: "section", text: { type: "mrkdwn", text: adLine(a) } };
+    // BUG-147提案B: この1件を止めるとASの配信が0になる場合は、その広告の行に警告を出す
+    const warn = a.effective_status !== "PAUSED" ? zeroWarn(adsetsGoingZero(adsets, [a])) : "";
+    const sec: any = { type: "section", text: { type: "mrkdwn", text: adLine(a) + warn } };
     if (a.effective_status !== "PAUSED") {
       sec.accessory = { type: "button", style: "danger", text: { type: "plain_text", text: "この広告を停止" }, action_id: `do_stop_${a.id}`, value: JSON.stringify({ a: "stop", p: project, c: creative, d: date, ad: [a.id] }) };
     }
     blocks.push(sec);
   }
   blocks.push({ type: "divider" });
+  { // 「配信中をすべて停止」を押した場合に0件になるASの警告（個別停止時とは対象が異なるため別途計算）
+    const w = zeroWarn(adsetsGoingZero(adsets, active));
+    if (w) blocks.push({ type: "section", text: { type: "mrkdwn", text: `「配信中をすべて停止」の場合:${w}` } });
+  }
   blocks.push({ type: "actions", elements: [
     { type: "button", style: "danger", text: { type: "plain_text", text: `配信中をすべて停止 (${active.length}件)` }, action_id: "do_stop_all", value: JSON.stringify({ a: "stop", p: project, c: creative, d: date, ad: active.map((x) => x.id) }) },
     sheetOnlyBtn,
@@ -997,15 +1501,26 @@ function simpleUndoConfirm(project: string, creative: string) {
 }
 
 // 実行結果メッセージ（Slack専用・明示ID版）
-function stopLines(creative: string, date: string, paused: number, sheet: any, metaOn: boolean, by: string): string {
+// BUG-147: 停止時に付ける付加情報（CP/AS・停止判定の根拠数値・AS残数警告）
+interface StopContext { places?: AdPlacement[]; metricsLines?: string[]; adsets?: AdsetActivity[] }
+
+function stopLines(creative: string, date: string, paused: number, sheet: any, metaOn: boolean, by: string, cascade?: CascadeResult, cx?: StopContext): string {
   const lines = [`🛑 *${creative}* を停止しました${by ? `　${by}` : ""}`];
   lines.push(!metaOn ? "・Meta: 未連携" : paused > 0 ? `✅ Meta広告: ${paused}件 停止（PAUSE）` : "・Meta広告: 変更なし（集計表のみ）");
+  if (paused > 0) {
+    lines.push(...adNameLines(cx?.places));         // 実際に止めた広告名
+    lines.push(...placementLines(cx?.places));      // どのCP/ASを止めたか
+    lines.push(...(cx?.metricsLines || []));        // 停止判定の根拠数値
+    lines.push(...adsetZeroLines(cx?.adsets));      // そのASの配信が0になったか
+  }
   lines.push(sheet?.success ? `✅ 集計表: 記録・グレー化（${date}）` : `❌ 集計表: ${sheet?.message || "失敗"}`);
+  { const line = cascadeNotifyLine(cascade, (s) => `*${s}*`); if (line) lines.push(line); }
   return lines.join("\n");
 }
-function undoLines(creative: string, memoMode: string, resumed: number, sheet: any, metaOn: boolean, by: string): string {
+function undoLines(creative: string, memoMode: string, resumed: number, sheet: any, metaOn: boolean, by: string, places?: AdPlacement[]): string {
   const lines = [`↩️ *${creative}* の停止を取り消しました${by ? `　${by}` : ""}`];
   if (metaOn) lines.push(`✅ Meta広告: ${resumed}件 再開（ACTIVE）`);
+  if (metaOn && resumed > 0) lines.push(...placementLines(places)); // BUG-147: どのCP/ASを再開したか
   lines.push(sheet?.success ? `✅ 集計表: 復元（${memoMode}）` : `⚠️ 集計表: ${sheet?.message || "取消情報なし"}`);
   return lines.join("\n");
 }
@@ -1055,7 +1570,18 @@ function handleSlackCommand(env: Env, ctx: ExecutionContext, bodyText: string, s
       try {
         await postResponse(responseUrl, { response_type: "ephemeral", text: `🔎 *${creative}* のMeta広告を検索中…` });
         const ads = await metaFindAds(token, project.metaAdAccountId!, creative);
-        const blocks = command === "/cr-undo" ? buildUndoBlocks(project.name, creative, ads) : buildStopBlocks(project.name, creative, stopDate, ads);
+        let blocks: any;
+        if (command === "/cr-undo") {
+          blocks = buildUndoBlocks(project.name, creative, ads);
+        } else {
+          // BUG-147提案B: 「押す前」に、この停止でその広告セットの配信が0件になるかを警告する
+          // （事後に気付くと配信が止まったまま時間が経つため。取得失敗時は警告なしで従来通り）。
+          const active = ads.filter((a) => a.effective_status !== "PAUSED");
+          const adsets = active.length
+            ? await fetchAdsetActivity(token, active.map((a) => a.adsetId || ""), active.map((a) => a.id))
+            : [];
+          blocks = buildStopBlocks(project.name, creative, stopDate, ads, adsets);
+        }
         await postResponse(responseUrl, blocks);
       } catch (e) {
         await postResponse(responseUrl, { response_type: "ephemeral", text: `❌ Meta検索エラー: ${e}` });
@@ -1065,9 +1591,226 @@ function handleSlackCommand(env: Env, ctx: ExecutionContext, bodyText: string, s
   return new Response("", { status: 200 });
 }
 
+// BUG-147提案④: 停止直後の結果メッセージに「取消」ボタンを付ける。
+// 従来は誤停止に気付いても `/cr-undo <cr名>` を手打ちする必要があった。
+//
+// ⚠️ 付ける先は response_url の ephemeral（＝停止を実行した本人にしか見えないメッセージ）に限定する。
+//    チャンネル全員向け通知(chat.postMessage)に付けると誰でも押せてしまうため。
+// memoMode は "full"（セルごと復元）。直後の誤操作訂正なので、停止前の状態に完全に戻すのが正しい。
+// 押下後は既存のundo経路がそのまま走る（集計表復元＋渡した広告IDだけACTIVE復帰）。
+// undo側も replace_original でこのメッセージを置き換えるため、ボタンは押下後に消える。
+function undoableStopResult(text: string, project: string, creative: string, adIds: string[], paused: number, sheetOk: boolean): unknown {
+  if (!paused && !sheetOk) return { replace_original: true, text }; // 何も実行できていない＝取り消す対象がない
+  const value = JSON.stringify({ a: "undo", p: project, c: creative, m: "full", ad: adIds });
+  // Slackのbutton valueは2000字上限。多数の広告を止めた場合は溢れるので、
+  // 中途半端に広告IDを落として「集計表だけ戻る」事故を起こさないようボタン自体を出さない。
+  if (value.length > 1800) return { replace_original: true, text: `${text}\n（取消は \`/cr-undo ${creative}\` で実行できます）` };
+  return {
+    replace_original: true,
+    text,
+    blocks: [
+      { type: "section", text: { type: "mrkdwn", text } },
+      { type: "actions", elements: [
+        { type: "button", text: { type: "plain_text", text: "↩️ この停止を取り消す" }, action_id: "do_undo_after_stop", value },
+      ] },
+    ],
+  };
+}
+
 async function postResponse(url: string, body: unknown): Promise<void> {
   if (!url) return;
-  await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  try {
+    await fetchTimeout(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }, 15000);
+  } catch {
+    /* response_urlへの通知失敗は本処理を止めない（呼び出し元でnotifySlack等の後続処理を続行させるため） */
+  }
+}
+
+// ============================================================
+// 停止/取消の self-chaining continuation（BUG-159 の根治）
+// ============================================================
+// BUG-159 の一次対応（実行時間バジェット）は「打ち切られる前に切り上げる」だけで、
+// 重い集計表(GAS)を持つ案件では集計表の記録そのものを諦めることになる。
+// cr入稿くん（src/submit/continuation.ts）が既に採用している「1ホップ=1単位の仕事をして、
+// 残りは署名付きで自分自身へPOSTして繋ぐ」方式に寄せ、各ホップが**それぞれ新しい実行時間**を
+// 持てるようにする。これで集計表に十分な時間を与えつつ、結果通知も確実に届く。
+//
+//   hop0(ボタン押下) … 進捗表示・実行ログ作成・Meta停止/再開 → chain
+//   sheet            … 集計表(GAS)の記録/復元 ＋ CP/AS・実績・AS残数の取得 → chain
+//   cascade          … 親子連動チェック（停止時のみ） → chain
+//   finish           … Slack通知・結果表示・Notionログ・実行ログ終端化
+//
+// 連鎖に失敗した場合は、その実行の残り時間で続きをインラインで実行する
+// （＝従来と同じ挙動にフォールバックし、最低限 finish まで必ず到達させる）。
+export const STOP_CONTINUE_PATH = "/internal/cr-stop/continue";
+
+type StopStep = "sheet" | "cascade" | "finish";
+const STOP_NEXT: Record<StopStep, StopStep | null> = { sheet: "cascade", cascade: "finish", finish: null };
+
+interface StopChainState {
+  step: StopStep;
+  action: "stop" | "undo";
+  project: string;
+  creative: string;
+  date: string;
+  memoMode?: "full" | "tag";
+  adIds: string[];
+  responseUrl: string;
+  userId: string;
+  userName: string;
+  runLogId: string | null;
+  runLogWarn: string;
+  metaOn: boolean;
+  affected: number; // 停止できた/再開できた件数
+  metaErr: string;
+  metaErrDetail: string[];
+  startedAt: number;
+  target?: SheetTarget; // sheetホップで解決した対象タブ（後続ホップでの再解決を避ける）
+  sheet?: any;
+  cx?: StopContext;
+  cascade?: CascadeResult;
+  cascadeSkipped?: boolean;
+  chainWarn?: string;
+}
+
+// CP/AS・停止判定の根拠数値・AS残数をまとめて取る（BUG-147）。集計表(GAS)と並行して呼ぶ前提。
+async function buildStopContext(token: string, ids: string[]): Promise<StopContext> {
+  const places = await fetchAdPlacements(token, ids);
+  const [lifetime, recent, adsets] = await Promise.all([
+    fetchAdMetrics(token, ids, "maximum"),
+    fetchAdMetrics(token, ids, "last_30d"),
+    fetchAdsetActivity(token, places.map((p) => p.adsetId || ""), ids),
+  ]);
+  return { places, metricsLines: metricsLine(lifetime, recent, ids), adsets };
+}
+
+async function stopHopSheet(s: StopChainState, env: Env, budget: RunBudget): Promise<void> {
+  const p = projectByName(s.project);
+  if (!p) { s.sheet = { success: false, message: `案件不明: ${s.project}` }; return; }
+  const token = metaToken(env, p);
+  s.target = (await pickSheet(p, s.creative)) || undefined;
+  // 付加情報の取得は集計表(GAS)と並行させ、実測の待ち時間を増やさない（失敗しても停止処理は止めない）
+  const cxP: Promise<StopContext> =
+    s.affected > 0 && token
+      ? s.action === "stop"
+        ? buildStopContext(token, s.adIds)
+        : fetchAdPlacements(token, s.adIds).then((places) => ({ places }) as StopContext)
+      : Promise.resolve({} as StopContext);
+  s.sheet = s.target
+    ? await callGasSafe(
+        s.target,
+        s.action === "stop"
+          ? { action: "stop", creativeName: s.creative, stopDate: s.date }
+          : { action: "undo", creativeName: s.creative, memoMode: s.memoMode || "tag" },
+        budget,
+      )
+    : { success: false, message: "集計表に該当crなし(複数対象)" };
+  s.cx = await cxP;
+}
+
+async function stopHopCascade(s: StopChainState, env: Env, budget: RunBudget): Promise<void> {
+  // BUG-112: 子CRの集計表停止が成功したときだけ、兄弟の子が全員停止済みかを見て親も止める
+  if (s.action !== "stop" || !s.target || !s.sheet?.success) return;
+  const p = projectByName(s.project);
+  if (!p) return;
+  const ms = budget.allow(GAS_TIMEOUT_DEFAULT_MS);
+  if (ms <= 0) { s.cascadeSkipped = true; return; }
+  try { s.cascade = await cascadeCheckAndStopParent(env, p, s.target, s.creative, s.date, ms); } catch { /* ベストエフォート */ }
+}
+
+async function stopHopFinish(s: StopChainState, env: Env): Promise<void> {
+  const p = projectByName(s.project);
+  const isStop = s.action === "stop";
+  const places = s.cx?.places || [];
+  const inviteNote = (err?: string) => `\n⚠️ チャンネルへの全員通知に失敗（${err}）。このチャンネルで \`/invite @cr停止\` を実行してください。`;
+  const extra =
+    (s.metaErr ? `\n⚠️ Meta${isStop ? "停止" : "再開"}に失敗（${s.metaErr}）：${s.metaErrDetail.join(" / ") || "詳細不明"}` : "")
+    + (s.cascadeSkipped ? "\n⚠️ 実行時間の都合で親子連動チェックをスキップしました（親CRの自動停止は行われていません）" : "")
+    + (s.chainWarn || "");
+  let note = extra + s.runLogWarn;
+  if ((s.affected || s.sheet?.success) && p) {
+    const text = isStop
+      ? stopLines(s.creative, s.date, s.affected, s.sheet, s.metaOn, `by <@${s.userId}>`, s.cascade, s.cx) + extra
+      : undoLines(s.creative, s.memoMode || "tag", s.affected, s.sheet, s.metaOn, `by <@${s.userId}>`, places) + extra;
+    const r = await notifySlack(env, p.channelId, text);
+    if (!r.ok) note += inviteNote(r.error);
+  }
+  const selfText = isStop
+    ? stopLines(s.creative, s.date, s.affected, s.sheet, s.metaOn, "", s.cascade, s.cx) + note
+    : undoLines(s.creative, s.memoMode || "tag", s.affected, s.sheet, s.metaOn, "", places) + note;
+  // 終端処理は互いに独立なので並列化する（BUG-159）
+  await Promise.all([
+    postResponse(s.responseUrl, isStop
+      ? undoableStopResult(selfText, s.project, s.creative, s.adIds, s.affected, !!s.sheet?.success)
+      : { replace_original: true, text: selfText }),
+    logToNotion(env, { creative: s.creative, user: s.userName, userId: s.userId, action: isStop ? "停止" : "取消", project: s.project, route: "Slack", metaCount: s.affected, sheetResult: sheetResultLabel(s.sheet) }),
+    updateRunLog(env.NOTION_TOKEN, s.runLogId, {
+      status: !s.metaErr && sheetResultLabel(s.sheet) !== "失敗" ? "完了" : "一部失敗",
+      metaResult: !s.metaOn ? "未実行" : s.adIds.length === 0 ? "対象なし" : s.metaErr ? "失敗" : "成功",
+      sheetResult: sheetResultLabel(s.sheet),
+      adIds: s.adIds,
+      adsetIds: adsetIdsOf(places),
+      sheetTabs: s.sheet?.sheet ? [String(s.sheet.sheet)] : s.target?.sheetName ? [s.target.sheetName] : [],
+      detail: {
+        metaError: s.metaErrDetail,
+        cascade: s.cascade?.triggered ? s.cascade : undefined,
+        cascadeSkipped: s.cascadeSkipped || undefined,
+        placements: places.length ? places : undefined,
+        metrics: s.cx?.metricsLines?.length ? s.cx.metricsLines : undefined,
+        adsets: s.cx?.adsets?.length ? s.cx.adsets : undefined,
+        elapsedMs: Date.now() - s.startedAt, // 全ホップ合計の所要時間
+      },
+    }),
+  ]);
+}
+
+/** 次のホップを自分自身へPOST（署名付き）。cr入稿くんと同じくService Binding優先。 */
+async function chainStop(state: StopChainState, env: Env, senv: SubmitEnv): Promise<void> {
+  const body = JSON.stringify(state);
+  const sig = await signHmac(env.SHARED_SECRET, body);
+  const init: RequestInit = { method: "POST", headers: { "content-type": "application/json", "x-continuation-signature": sig }, body };
+  const self = (env as any).SELF_WORKER;
+  const res = self
+    ? await self.fetch(`https://self${STOP_CONTINUE_PATH}`, init)
+    : await fetchTimeout(`${(senv as any).SELF_URL}${STOP_CONTINUE_PATH}`, init, 10000);
+  if (!res.ok) throw new Error(`stop continuation連鎖失敗: ${res.status}`);
+}
+
+/** 連鎖できなかった場合に、この実行の残り時間で続きをやりきる（必ず finish まで到達させる） */
+async function runStopRemainingInline(s: StopChainState, env: Env, budget: RunBudget): Promise<void> {
+  if (s.step === "sheet") { try { await stopHopSheet(s, env, budget); } catch (e) { s.chainWarn = (s.chainWarn || "") + `\n⚠️ 集計表処理でエラー: ${e}`; } s.step = "cascade"; }
+  if (s.step === "cascade") { try { await stopHopCascade(s, env, budget); } catch { /* ベストエフォート */ } s.step = "finish"; }
+  await stopHopFinish(s, env);
+}
+
+async function runStopHop(s: StopChainState, env: Env, senv: SubmitEnv): Promise<void> {
+  const budget = startRunBudget(); // ホップごとに新しい実行時間予算
+  try {
+    if (s.step === "finish") { await stopHopFinish(s, env); return; }
+    if (s.step === "sheet") await stopHopSheet(s, env, budget);
+    else await stopHopCascade(s, env, budget);
+  } catch (e) {
+    s.chainWarn = (s.chainWarn || "") + `\n⚠️ 処理中にエラー: ${e}`;
+  }
+  const next = STOP_NEXT[s.step];
+  if (!next) return;
+  const ns: StopChainState = { ...s, step: next };
+  try {
+    await chainStop(ns, env, senv);
+  } catch (e) {
+    ns.chainWarn = (ns.chainWarn || "") + `\n⚠️ 継続処理の連鎖に失敗したため同一実行内で続行しました（${e}）`;
+    await runStopRemainingInline(ns, env, budget);
+  }
+}
+
+export async function handleStopContinue(request: Request, env: Env, ctx: ExecutionContext, senv: SubmitEnv): Promise<Response> {
+  const body = await request.text();
+  const sig = request.headers.get("x-continuation-signature") || "";
+  if (!(await verifyHmac(env.SHARED_SECRET, body, sig))) return new Response("forbidden", { status: 403 });
+  let state: StopChainState;
+  try { state = JSON.parse(body) as StopChainState; } catch { return new Response("bad request", { status: 400 }); }
+  ctx.waitUntil(runStopHop(state, env, senv));
+  return new Response("ok");
 }
 
 function handleSlackInteract(env: Env, ctx: ExecutionContext, bodyText: string, senv: SubmitEnv): Response {
@@ -1109,55 +1852,57 @@ function handleSlackInteract(env: Env, ctx: ExecutionContext, bodyText: string, 
   const ids: string[] = Array.isArray(v.ad) ? v.ad : [];
 
   // 即ACK（cold-start耐性）。進捗・結果は response_url 経由。
+  // hop0: 進捗表示・実行ログ作成・Meta停止/再開まで。以降は continuation で繋ぐ（BUG-159）。
   ctx.waitUntil(
     (async () => {
+      const startedAt = Date.now();
+      const budget = startRunBudget();
+      const isStop = v.a !== "undo";
       try {
-        await postResponse(responseUrl, { replace_original: true, text: `⏳ *${v.c}* を${v.a === "undo" ? "取消" : "停止"}実行中…` });
-        const inviteNote = (err?: string) => `\n⚠️ チャンネルへの全員通知に失敗（${err}）。このチャンネルで \`/invite @cr停止\` を実行してください。`;
+        // BUG-146: ids.length===0 は「集計表だけ記録」ボタン／Meta未連携／既存Meta広告なしの
+        // いずれかで、Metaには一切触れず集計表のみを更新する実行。従来は通常の停止と同じ
+        // 「実行中…」表示だったため、実際にはMetaを操作していないのに操作中であるかのように
+        // 見えていた（cr00等の集計表のみ運用CRで顕著）。進捗メッセージの時点で判別できるようにする。
+        const progressVerb = isStop ? "停止" : "取消";
+        await postResponse(responseUrl, {
+          replace_original: true,
+          text: ids.length === 0
+            ? `⏳ *${v.c}* の集計表${progressVerb}処理中…（Meta広告は操作しません）`
+            : `⏳ *${v.c}* を${progressVerb}実行中…`,
+        });
         // 実行ログDB（TOOL-40）: 開始時に「実行中」で作成。途中死してもチェッカーが検出できる
-        const runLogId = await createRunLog(env.NOTION_TOKEN, { tool: "cr停止くん", action: v.a === "undo" ? "取消" : "停止", project: project.name, crName: v.c, userName, userId, route: "Slack" });
-        const runLogWarn = !runLogId && env.NOTION_TOKEN ? "\n⚠️ 実行ログの記録に失敗（翌日自動チェックの対象外になります）" : "";
-        // Meta失敗は集計表を止めない（権限不足等でも集計表記録は実行し、Metaエラーは併記）
+        const runLogId = await createRunLog(env.NOTION_TOKEN, { tool: "cr停止くん", action: isStop ? "停止" : "取消", project: project.name, crName: v.c, userName, userId, route: "Slack" });
+
+        // Meta実停止/再開。失敗しても集計表の記録は必ず行う（権限不足等でもエラーを併記して継続）
+        let affected = 0;
         let metaErr = "";
-        const target = await pickSheet(project, v.c); // 複数集計対象の案件は cr名で対象タブを判定
-        if (v.a === "stop") {
-          let paused = 0;
-          if (metaOn && ids.length) { try { paused = await pauseAds(token!, ids); if (paused < ids.length) metaErr = `${ids.length - paused}件の停止に失敗`; } catch (e) { metaErr = String(e); } }
-          const sheet = target ? await callGas(target, { action: "stop", creativeName: v.c, stopDate: v.d }) : { success: false, message: "集計表に該当crなし(複数対象)" };
-          const extra = (metaErr ? `\n⚠️ Meta停止に失敗（${metaErr}）。Metaトークン/権限を確認してください。` : "");
-          let note = extra + runLogWarn;
-          if (paused || sheet?.success) {
-            const r = await notifySlack(env, project.channelId, stopLines(v.c, v.d, paused, sheet, metaOn, `by <@${userId}>`) + extra);
-            if (!r.ok) note += inviteNote(r.error);
-          }
-          await postResponse(responseUrl, { replace_original: true, text: stopLines(v.c, v.d, paused, sheet, metaOn, "") + note });
-          await logToNotion(env, { creative: v.c, user: userName, userId, action: "停止", project: project.name, route: "Slack", metaCount: paused, sheetResult: sheetResultLabel(sheet) });
-          await updateRunLog(env.NOTION_TOKEN, runLogId, {
-            status: !metaErr && sheetResultLabel(sheet) !== "失敗" ? "完了" : "一部失敗",
-            metaResult: !metaOn ? "未実行" : ids.length === 0 ? "対象なし" : metaErr ? "失敗" : "成功",
-            sheetResult: sheetResultLabel(sheet),
-            adIds: ids,
-            sheetTabs: sheet?.sheet ? [String(sheet.sheet)] : target?.sheetName ? [target.sheetName] : [],
-          });
-        } else {
-          let resumed = 0;
-          if (metaOn && ids.length) { try { resumed = await resumeAds(token!, ids); if (resumed < ids.length) metaErr = `${ids.length - resumed}件の再開に失敗`; } catch (e) { metaErr = String(e); } }
-          const sheet = target ? await callGas(target, { action: "undo", creativeName: v.c, memoMode: v.m || "tag" }) : { success: false, message: "集計表に該当crなし(複数対象)" };
-          const extra = (metaErr ? `\n⚠️ Meta再開に失敗（${metaErr}）。Metaトークン/権限を確認してください。` : "");
-          let note = extra + runLogWarn;
-          if (resumed || sheet?.success) {
-            const r = await notifySlack(env, project.channelId, undoLines(v.c, v.m || "tag", resumed, sheet, metaOn, `by <@${userId}>`) + extra);
-            if (!r.ok) note += inviteNote(r.error);
-          }
-          await postResponse(responseUrl, { replace_original: true, text: undoLines(v.c, v.m || "tag", resumed, sheet, metaOn, "") + note });
-          await logToNotion(env, { creative: v.c, user: userName, userId, action: "取消", project: project.name, route: "Slack", metaCount: resumed, sheetResult: sheetResultLabel(sheet) });
-          await updateRunLog(env.NOTION_TOKEN, runLogId, {
-            status: !metaErr && sheetResultLabel(sheet) !== "失敗" ? "完了" : "一部失敗",
-            metaResult: !metaOn ? "未実行" : ids.length === 0 ? "対象なし" : metaErr ? "失敗" : "成功",
-            sheetResult: sheetResultLabel(sheet),
-            adIds: ids,
-            sheetTabs: target?.sheetName ? [target.sheetName] : [],
-          });
+        let metaErrDetail: string[] = [];
+        if (metaOn && ids.length) {
+          try {
+            const r = isStop ? await pauseAds(token!, ids) : await resumeAds(token!, ids);
+            affected = r.success;
+            if (affected < ids.length) { metaErr = `${ids.length - affected}件の${isStop ? "停止" : "再開"}に失敗`; metaErrDetail = r.errors; }
+          } catch (e) { metaErr = String(e); metaErrDetail = [String(e)]; }
+        }
+
+        const state: StopChainState = {
+          step: "sheet",
+          action: isStop ? "stop" : "undo",
+          project: project.name,
+          creative: v.c,
+          date: v.d,
+          memoMode: v.m === "full" ? "full" : v.m === "tag" ? "tag" : undefined,
+          adIds: ids,
+          responseUrl, userId, userName, runLogId,
+          runLogWarn: !runLogId && env.NOTION_TOKEN ? "\n⚠️ 実行ログの記録に失敗（翌日自動チェックの対象外になります）" : "",
+          metaOn, affected, metaErr, metaErrDetail, startedAt,
+        };
+        // 集計表(GAS)以降は別ホップへ。連鎖できなければこの実行の残り時間でやりきる
+        try {
+          await chainStop(state, env, senv);
+        } catch (e) {
+          state.chainWarn = `\n⚠️ 継続処理の連鎖に失敗したため同一実行内で続行しました（${e}）`;
+          await runStopRemainingInline(state, env, budget);
         }
       } catch (e) {
         await postResponse(responseUrl, { replace_original: true, text: `❌ エラー: ${e}` });
@@ -1183,6 +1928,11 @@ export default {
       }
       const senv = submitEnvOf(env, url.origin);
       return url.pathname === "/slack/command" ? handleSlackCommand(env, ctx, bodyText, senv) : handleSlackInteract(env, ctx, bodyText, senv);
+    }
+
+    // --- cr停止くん: continuation（HMAC署名で自己検証。Slack署名不要）BUG-159 ---
+    if (url.pathname === STOP_CONTINUE_PATH && request.method === "POST") {
+      return handleStopContinue(request, env, ctx, submitEnvOf(env, url.origin));
     }
 
     // --- cr入稿くん: continuation（HMAC署名で自己検証。Slack署名不要）---

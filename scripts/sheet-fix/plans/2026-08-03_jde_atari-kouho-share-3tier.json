@@ -1,0 +1,13 @@
+{
+  "sheet": "1oEK8JCJg2NcseWmnxLtfNFCe5A7XGJ_DJSj7c2EW1sg",
+  "tab": "data",
+  "note": "消化予算シェア判定を3段階に拡張（kk_mak）。S6/S7を実データの分布（中央値0.11%・90%tile2.57%）に合わせて1%/3%へ調整し、3段階目『小当たり』(S8=5%)を追加。CPA基準は2段階目と共通のまま。",
+  "edits": [
+    { "cell": "R6", "expectedBefore": "当たり候補🌱 消化予算シェア下限(kk_mak用・要調整)", "after": "当たり候補🌱 消化予算シェア下限(kk_mak用)", "note": "1段階目ラベル" },
+    { "cell": "S6", "expectedBefore": "0.05", "after": "0.01", "note": "1段階目 消化予算シェア下限=1%" },
+    { "cell": "R7", "expectedBefore": "当たり候補🌱🌱 消化予算シェア下限(kk_mak用・要調整)", "after": "当たり候補🌱🌱 消化予算シェア下限(kk_mak用)", "note": "2段階目ラベル" },
+    { "cell": "S7", "expectedBefore": "0.1", "after": "0.03", "note": "2段階目 消化予算シェア下限=3%" },
+    { "cell": "R8", "expectedBefore": "", "after": "当たり候補🌱🌱🌱 小当たり 消化予算シェア下限(kk_mak用。CPA基準は🌱🌱と共通)", "note": "3段階目ラベル" },
+    { "cell": "S8", "expectedBefore": "", "after": "0.05", "note": "3段階目 消化予算シェア下限=5%" }
+  ]
+}

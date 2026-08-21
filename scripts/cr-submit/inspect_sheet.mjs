@@ -37,6 +37,54 @@ const auth = new google.auth.GoogleAuth({
 });
 const sheets = google.sheets({ version: "v4", auth });
 
+// --- --cells: 任意セルの値/数式をピンポイント読取（較正・値確認用、読み取り専用） ---
+// --colors 併用時は背景色（effectiveFormat.backgroundColor）も表示する
+// （BUG-113調査用: 「チェックボックスはONなのに背景がグレー化されていない」を切り分けるため追加）。
+if (args.cells) {
+  if (!args.tab) {
+    console.error("ERROR: --cells は --tab と併用してください。");
+    process.exit(1);
+  }
+  const cellList = args.cells.split(",").map((s) => s.trim()).filter(Boolean);
+  const ranges = cellList.map((c) => `'${args.tab}'!${c}`);
+  const [fv, fm] = await Promise.all([
+    sheets.spreadsheets.values.batchGet({ spreadsheetId: SPREADSHEET_ID, ranges, valueRenderOption: "FORMATTED_VALUE" }),
+    sheets.spreadsheets.values.batchGet({ spreadsheetId: SPREADSHEET_ID, ranges, valueRenderOption: "FORMULA" }),
+  ]);
+  let colorBySheetRange = null;
+  if (args.colors) {
+    const cres = await sheets.spreadsheets.get({
+      spreadsheetId: SPREADSHEET_ID,
+      ranges,
+      includeGridData: true,
+      fields: "sheets(data(rowData(values(effectiveFormat.backgroundColor,userEnteredFormat.backgroundColor,dataValidation))))",
+    });
+    colorBySheetRange = cres.data.sheets || [];
+  }
+  console.log(`# セル読取: ${args.tab}`);
+  for (let i = 0; i < cellList.length; i++) {
+    const v = fv.data.valueRanges[i]?.values?.[0]?.[0] ?? "";
+    const f = fm.data.valueRanges[i]?.values?.[0]?.[0] ?? "";
+    const shownF = String(f) !== String(v) ? ` （式: ${f}）` : "";
+    let colorInfo = "";
+    if (colorBySheetRange) {
+      const cell = colorBySheetRange[i]?.data?.[0]?.rowData?.[0]?.values?.[0] || {};
+      const eff = cell.effectiveFormat?.backgroundColor;
+      const usr = cell.userEnteredFormat?.backgroundColor;
+      const dv = cell.dataValidation?.condition?.type || null;
+      colorInfo = ` [背景(effective)=${rgbToHex(eff)} / 背景(userEntered)=${rgbToHex(usr)}${dv ? ` / dataValidation=${dv}` : ""}]`;
+    }
+    console.log(`${cellList[i]} = ${JSON.stringify(String(v))}${shownF}${colorInfo}`);
+  }
+  process.exit(0);
+}
+
+function rgbToHex(c) {
+  if (!c) return "(なし/白)";
+  const to255 = (x) => Math.round((x || 0) * 255);
+  return `#${[to255(c.red), to255(c.green), to255(c.blue)].map((n) => n.toString(16).padStart(2, "0")).join("")}`;
+}
+
 // --- タブ一覧＋列グループ化メタデータ ---
 const meta = await sheets.spreadsheets.get({
   spreadsheetId: SPREADSHEET_ID,
@@ -95,13 +143,27 @@ for (const sheet of targets) {
   }
 
   // --dump: 対象タブの1〜ID行の非空セルを A1:値 で全出力（実構造の目視確認用）
+  // --formulas: 値ではなく数式（FORMULA）を出力（判定式のラップ有無の確認用）。数式は長いので省略しない
+  // --rows 2,3,5: 出力対象の行を限定（判定行・親子行だけ見たいとき）
   if (args.tab && args.dump) {
-    console.log(`\n--- ${p.title} 非空セルダンプ（1〜${rows.length}行 / A1:値）---`);
-    for (let r = 0; r < rows.length; r++) {
+    let dumpRows = rows;
+    if (args.formulas) {
+      const fres = await sheets.spreadsheets.values.get({
+        spreadsheetId: SPREADSHEET_ID,
+        range,
+        valueRenderOption: "FORMULA",
+      });
+      dumpRows = fres.data.values || [];
+    }
+    const rowFilter = args.rows ? new Set(args.rows.split(",").map((x) => Number(x.trim()))) : null;
+    const label = args.formulas ? "数式" : "値";
+    console.log(`\n--- ${p.title} 非空セルダンプ（1〜${dumpRows.length}行 / A1:${label}）---`);
+    for (let r = 0; r < dumpRows.length; r++) {
+      if (rowFilter && !rowFilter.has(r + 1)) continue;
       const cells = [];
-      for (let c = 0; c < (rows[r] || []).length; c++) {
-        const v = String(rows[r][c] ?? "").trim();
-        if (v) cells.push(`${colToA1(c)}${r + 1}=${v.slice(0, 30)}`);
+      for (let c = 0; c < (dumpRows[r] || []).length; c++) {
+        const v = String(dumpRows[r][c] ?? "").trim();
+        if (v) cells.push(`${colToA1(c)}${r + 1}=${args.formulas ? v : v.slice(0, 30)}`);
       }
       if (cells.length) console.log(`[行${r + 1}] ${cells.join(" | ")}`);
     }
@@ -269,6 +331,10 @@ function parseArgs(argv) {
     else if (argv[i] === "--json") out.json = true;
     else if (argv[i] === "--dump") out.dump = true;
     else if (argv[i] === "--merges") out.merges = true;
+    else if (argv[i] === "--formulas") out.formulas = true;
+    else if (argv[i] === "--rows") out.rows = argv[++i];
+    else if (argv[i] === "--cells") out.cells = argv[++i];
+    else if (argv[i] === "--colors") out.colors = true;
   }
   return out;
 }

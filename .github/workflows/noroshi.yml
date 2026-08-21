@@ -1,0 +1,120 @@
+name: 集計表 当たり候補（noroshi）
+
+# 手動実行専用。CPAが目標を下回る「当たり候補🌱/当たり候補🌱🌱」を消化金額列の別行に表示専用で点灯させる。
+# 親（子有り）は自身の指標が使えないため配下の子バッジを OR 集約する。
+# inspect-sheet と同じ GOOGLE_SERVICE_ACCOUNT_JSON を使用。
+# mode=dry-run（デフォルト）は書き込みなし＋実データで点灯予測。apply 時のみ書き込み・undoログ保存。
+on:
+  workflow_dispatch:
+    inputs:
+      sheet:
+        description: "スプレッドシートID または URL"
+        required: true
+      tab:
+        description: "タブ名（例: kk_mak）"
+        required: true
+      target_cell:
+        description: "目標CPAセル（例: W5）"
+        required: true
+        default: "W5"
+      spendline_cell:
+        description: "消化判定ラインセル（例: W3）"
+        required: true
+        default: "W3"
+      metric_row:
+        description: "指標の判定参照行（例: 1100）"
+        required: true
+        default: "1100"
+      noroshi_row:
+        description: "当たり判定を書く行（消化金額列。例: 2＝親子判定行のプレースホルダ上）"
+        required: true
+        default: "2"
+      noroshi_col:
+        description: "判定テキストを出す列（disc=消化金額列 / memo=各ブロックのメモ列）"
+        required: true
+        type: choice
+        options:
+          - disc
+          - memo
+        default: disc
+      tier_row:
+        description: "中間行（0/1/2の判定コードを置く空き行。例: 1103。循環参照回避のため表示行とは別行）"
+        required: true
+        default: "1103"
+      share_col:
+        description: "消化予算シェアモードの全体消化列（例: C。指定時は実質cvの代わりにシェア%で判定。下限は data!S6/S7）。空なら従来の実質cvモード"
+        required: false
+        default: ""
+      settings_row_overrides:
+        description: "data設定シートの行番号を並び替えたい時のみ。--pre-cpa-row/--cand-cpa-row/--pre-share-row/--cand-share-row/--top-share-row/--top-cpa-row をスペース区切りで（例: --pre-share-row 3 --cand-share-row 5 --top-cpa-row 6 --top-share-row 7）。空なら既定(S2/S4/S6/S7/S8/S9)のまま"
+        required: false
+        default: ""
+      clear_old_row:
+        description: "行移動時に旧行の当たり式を空にする。カンマ区切りで複数可（例: 2,1103。空なら掃除しない）"
+        required: false
+        default: ""
+      id_row:
+        description: "cr識別子の行（例: 6）"
+        required: true
+        default: "6"
+      settings_tab:
+        description: "当たり候補基準の設定シート名（既定 data。基準値は data!S2:S5 を編集）"
+        required: true
+        default: "data"
+      mode:
+        description: "dry-run: 点灯予測のみ / apply: 実際に式を書き込む"
+        required: true
+        type: choice
+        options:
+          - dry-run
+          - apply
+        default: dry-run
+
+jobs:
+  noroshi:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install deps
+        working-directory: scripts/sheet-fix
+        run: npm install --no-audit --no-fund
+      - name: Generate noroshi cells
+        working-directory: scripts/sheet-fix
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SHEET: ${{ github.event.inputs.sheet }}
+          TAB: ${{ github.event.inputs.tab }}
+          TARGET_CELL: ${{ github.event.inputs.target_cell }}
+          SPENDLINE_CELL: ${{ github.event.inputs.spendline_cell }}
+          METRIC_ROW: ${{ github.event.inputs.metric_row }}
+          NOROSHI_ROW: ${{ github.event.inputs.noroshi_row }}
+          NOROSHI_COL: ${{ github.event.inputs.noroshi_col }}
+          TIER_ROW: ${{ github.event.inputs.tier_row }}
+          SHARE_COL: ${{ github.event.inputs.share_col }}
+          SETTINGS_ROW_OVERRIDES: ${{ github.event.inputs.settings_row_overrides }}
+          CLEAR_OLD_ROW: ${{ github.event.inputs.clear_old_row }}
+          ID_ROW: ${{ github.event.inputs.id_row }}
+          SETTINGS_TAB: ${{ github.event.inputs.settings_tab }}
+          MODE: ${{ github.event.inputs.mode }}
+        run: |
+          APPLY_FLAG=""
+          if [ "$MODE" = "apply" ]; then APPLY_FLAG="--apply"; fi
+          CLEAR_FLAG=""
+          if [ -n "$CLEAR_OLD_ROW" ]; then CLEAR_FLAG="--clear-old-row $CLEAR_OLD_ROW"; fi
+          SHARE_FLAG=""
+          if [ -n "$SHARE_COL" ]; then SHARE_FLAG="--share-col $SHARE_COL"; fi
+          node noroshi.mjs --sheet "$SHEET" --tab "$TAB" \
+            --target-cell "$TARGET_CELL" --spendline-cell "$SPENDLINE_CELL" \
+            --metric-row "$METRIC_ROW" --noroshi-row "$NOROSHI_ROW" --noroshi-col "$NOROSHI_COL" --tier-row "$TIER_ROW" --id-row "$ID_ROW" \
+            --settings-tab "$SETTINGS_TAB" $CLEAR_FLAG $SHARE_FLAG $SETTINGS_ROW_OVERRIDES $APPLY_FLAG --undo-out undo_log.json
+      - name: Upload undo log
+        if: github.event.inputs.mode == 'apply'
+        uses: actions/upload-artifact@v4
+        with:
+          name: noroshi-undo-log
+          path: scripts/sheet-fix/undo_log.json
+          if-no-files-found: ignore
+          retention-days: 90

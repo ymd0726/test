@@ -29,6 +29,22 @@ on:
         description: "verifyZones時、対象案件をカンマ区切りで限定（例 nrn,ssh）。空なら全案件"
         required: false
         default: ""
+      formulas:
+        description: "true でダンプを値ではなく数式（FORMULA）で出力（dump=true時のみ有効。判定式のラップ確認用）"
+        required: false
+        default: "false"
+      rows:
+        description: "ダンプ対象行をカンマ区切りで限定（例: 2,3,5。空なら全行）"
+        required: false
+        default: ""
+      cells:
+        description: "任意セルをカンマ区切りで値/式読取（例: AI1100,AU1100。tab必須。指定時はこれのみ実行）"
+        required: false
+        default: ""
+      colors:
+        description: "true で --cells の結果に背景色(effective/userEntered)も表示（グレー化漏れの調査用）"
+        required: false
+        default: "false"
 
 jobs:
   inspect:
@@ -55,8 +71,16 @@ jobs:
           DUMP=""
           if [ "${{ github.event.inputs.dump }}" = "true" ]; then DUMP="--dump"; fi
           if [ "${{ github.event.inputs.merges }}" = "true" ]; then DUMP="$DUMP --merges"; fi
+          FORMULAS=""
+          if [ "${{ github.event.inputs.formulas }}" = "true" ]; then FORMULAS="--formulas"; fi
+          ROWS=""
+          if [ -n "${{ github.event.inputs.rows }}" ]; then ROWS="--rows ${{ github.event.inputs.rows }}"; fi
+          CELLS=""
+          if [ -n "${{ github.event.inputs.cells }}" ]; then CELLS="--cells ${{ github.event.inputs.cells }}"; fi
+          COLORS=""
+          if [ "${{ github.event.inputs.colors }}" = "true" ]; then COLORS="--colors"; fi
           if [ -n "${{ github.event.inputs.tab }}" ]; then
-            node inspect_sheet.mjs --sheet "${{ github.event.inputs.sheet }}" --tab "${{ github.event.inputs.tab }}" $DUMP
+            node inspect_sheet.mjs --sheet "${{ github.event.inputs.sheet }}" --tab "${{ github.event.inputs.tab }}" $DUMP $FORMULAS $ROWS $CELLS $COLORS
           else
             node inspect_sheet.mjs --sheet "${{ github.event.inputs.sheet }}" --json
           fi

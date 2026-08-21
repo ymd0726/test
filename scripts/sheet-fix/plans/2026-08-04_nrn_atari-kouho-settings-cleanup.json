@@ -1,0 +1,18 @@
+{
+  "sheet": "1Q7iph8TxZ5C5ouBb3vjvyNMNgLUmP-Uj1stCO9TewFA",
+  "tab": "data",
+  "note": "meta_totalは消化予算シェア方式に統一済みで実質cv下限(S3/S5)が未使用になったため削除。残す設定のラベルも段階(1/2/3段階目)がひと目で分かるように整理。数値(S2,S4,S6,S7,S8,S9)はどれも変更しない。",
+  "edits": [
+    { "cell": "R1", "expectedBefore": "🌱当たり候補 判定設定（S列の数値を編集）", "after": "🌱当たり候補 判定設定（S列の数値を編集。消化予算シェア方式）", "note": "見出し" },
+    { "cell": "R2", "expectedBefore": "当たり候補🌱 CPA係数(目標CPA×)", "after": "🌱 1段階目 CPA上限倍率（目標CPA×）", "note": "1段階目CPAラベル整理" },
+    { "cell": "R3", "expectedBefore": "当たり候補🌱 実質cv下限", "after": "", "note": "未使用のため削除" },
+    { "cell": "S3", "expectedBefore": "3", "after": "", "note": "未使用のため削除" },
+    { "cell": "R4", "expectedBefore": "当たり候補🌱🌱 CPA係数(目標CPA×)", "after": "🌱🌱 2段階目 CPA上限倍率（目標CPA×）", "note": "2段階目CPAラベル整理" },
+    { "cell": "R5", "expectedBefore": "当たり候補🌱🌱 実質cv下限", "after": "", "note": "未使用のため削除" },
+    { "cell": "S5", "expectedBefore": "5", "after": "", "note": "未使用のため削除" },
+    { "cell": "R6", "expectedBefore": "当たり候補🌱 消化予算シェア下限", "after": "🌱 1段階目 消化予算シェア下限", "note": "1段階目シェアラベル整理" },
+    { "cell": "R7", "expectedBefore": "当たり候補🌱🌱 消化予算シェア下限", "after": "🌱🌱 2段階目 消化予算シェア下限", "note": "2段階目シェアラベル整理" },
+    { "cell": "R8", "expectedBefore": "当たり候補🌱🌱🌱 小当たり 消化予算シェア下限（CPA基準は🌱🌱と共通）", "after": "🌱🌱🌱 3段階目(小当たり) 消化予算シェア下限（CPA基準は独立・R9参照）", "note": "3段階目シェアラベル整理" },
+    { "cell": "R9", "expectedBefore": "当たり候補🌱🌱🌱 小当たり CPA上限倍率(目標CPA×。1.0超=許容ライン)", "after": "🌱🌱🌱 3段階目(小当たり) CPA上限倍率（目標CPA×。1.0超=許容ライン）", "note": "3段階目CPAラベル整理" }
+  ]
+}
