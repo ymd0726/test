@@ -14,24 +14,72 @@ name: Worker デプロイ（jdem-stop-mcp）
 # シークレット（GOOGLE_SERVICE_ACCOUNT_JSON 等）はデプロイでは消えない。
 # 追加・変更は Cloudflare ダッシュボード（Workers → jdem-stop-mcp →
 # Settings → Variables and Secrets）から行える。
+#
+# ⚠️ 巻き戻し防止ガード（2026-08-21 追加）
+# このWorkerには cr入稿くん と cr停止くん の両方が入っており、別々のブランチで
+# 開発されている。どのブランチからでもデプロイできるため、相手の変更を含まない
+# ブランチをデプロイすると本番が丸ごと巻き戻る。実際 2026-08-15〜08-21 の間、
+# 停止くん系ブランチからのデプロイで cr入稿くんの修正41件（BUG-49〜BUG-144）が
+# 本番から消えていた。
+# そこで「前回デプロイした commit」を deployed-worker タグで記録し、今回の ref が
+# それを祖先に含まない場合＝巻き戻しになる場合はデプロイ前に停止する。
+# 意図的に巻き戻したい場合（緊急ロールバック等）は allowRollback=true で実行する。
 on:
   workflow_dispatch:
+    inputs:
+      allowRollback:
+        description: "true で巻き戻しチェックを無視して強制デプロイ（緊急ロールバック用）"
+        required: false
+        default: "false"
 
 concurrency:
   group: deploy-worker
   cancel-in-progress: false
+
+permissions:
+  contents: write # deployed-worker タグの更新に必要
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 祖先判定に全履歴が要る
+
+      - name: 巻き戻しチェック（前回デプロイ分を含んでいるか）
+        run: |
+          set -euo pipefail
+          git fetch --tags --force origin
+          if ! PREV=$(git rev-parse -q --verify refs/tags/deployed-worker^{commit}); then
+            echo "deployed-worker タグが未作成（初回）。チェックをスキップします。"
+            exit 0
+          fi
+          echo "前回デプロイ: $PREV ($(git log -1 --format='%s' "$PREV"))"
+          echo "今回デプロイ: $GITHUB_SHA ($(git log -1 --format='%s' "$GITHUB_SHA"))"
+          if git merge-base --is-ancestor "$PREV" "$GITHUB_SHA"; then
+            echo "OK: 前回デプロイ分を含んでいます。"
+            exit 0
+          fi
+          echo "--- 本番から消える commit ---"
+          git log --oneline --no-merges "$GITHUB_SHA..$PREV" | head -50
+          echo "-----------------------------"
+          if [ "${{ github.event.inputs.allowRollback }}" = "true" ]; then
+            echo "::warning::allowRollback=true のため、上記が本番から消えることを承知でデプロイを続行します。"
+            exit 0
+          fi
+          echo "::error::この ref は前回デプロイした $PREV を含んでいません。デプロイすると上記の変更が本番から巻き戻ります。先に相手ブランチをマージしてから再実行してください（意図的な緊急ロールバックなら allowRollback=true）。"
+          exit 1
+
       - uses: actions/setup-node@v4
         with:
           node-version: "22" # wrangler 4.x は Node 22+ 必須
       - name: Install deps
         working-directory: apps/jdem-stop-mcp
         run: npm ci || npm install
+      - name: 型チェック
+        working-directory: apps/jdem-stop-mcp
+        run: npx tsc --noEmit
       # wrangler-action は古いwrangler(3.x)を入れて wrangler.jsonc を読めないため、
       # プロジェクト同梱の wrangler 4.x を直接使う
       - name: Deploy to Cloudflare
@@ -39,3 +87,11 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: npx wrangler deploy
+
+      # デプロイ成功後にのみタグを進める（失敗時は前回値のまま残す）
+      - name: デプロイ済みcommitを記録（deployed-worker タグ）
+        run: |
+          set -euo pipefail
+          git tag -f deployed-worker "$GITHUB_SHA"
+          git push --force origin refs/tags/deployed-worker
+          echo "deployed-worker → $GITHUB_SHA"
