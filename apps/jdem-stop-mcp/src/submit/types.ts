@@ -171,6 +171,12 @@ export interface ContinuationState {
   index: number;
   /** wait_ready の試行回数（バックオフ・上限用） */
   attempts: number;
+  /**
+   * sheet ステップで処理中の集計表タブのindex（BUG-188）。
+   * 複数タブ案件で全タブを1ホップ内で叩くとホップの実行時間上限を超えて
+   * Workerがサイレント終了するため、1ホップ1タブずつ連鎖する。全タブ終わったらundefined。
+   */
+  sheetIndex?: number;
   plan: SubmitPlan;
   startedAt: number;
   /**

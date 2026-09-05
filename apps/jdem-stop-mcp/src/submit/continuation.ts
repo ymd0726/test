@@ -46,8 +46,11 @@ export async function startExecution(
   ctx: ExecutionContext,
   metaToken: string,
   projectAccountId: string,
-  gasTargets: GasTarget[]
+  allGasTargets: GasTarget[]
 ): Promise<void> {
+  // 展開先タブはCR名の部位プレフィックスで絞る（BUG-188）。実行ログの「集計表タブ」も
+  // 実際に触るタブだけを残したいので、ログ作成より前に絞る。
+  const gasTargets = submitSheetTargets(allGasTargets, plan);
   // 集計表だけモード（BUG-110）はMetaステップ(upload/create_ads/activate)を全てスキップしsheetから開始
   const state: ContinuationState = {
     step: plan.sheetOnly ? "sheet" : "upload",
@@ -120,9 +123,12 @@ async function runHop(
   env: SubmitEnv,
   metaToken: string,
   accountId: string,
-  gasTargets: GasTarget[]
+  allGasTargets: GasTarget[]
 ): Promise<void> {
   const { plan } = state;
+  // 展開先タブはCR名の部位プレフィックスで絞る（BUG-188）。continuationの復元は
+  // 案件レジストリから毎ホップ引き直すため、ここでも必ず絞り直す。
+  const gasTargets = submitSheetTargets(allGasTargets, plan);
   try {
     // 現在のステップを実行ログへ記録する（BUG-143）。Slackの進捗はephemeralで流れて
     // しまう＆private未招待だと出ないため、あとから `/cr-in 進捗` で「今どこか」を
@@ -354,16 +360,24 @@ async function runHop(
       }
 
       case "sheet": {
-        await postProgress(env, plan, "📊 集計表にCR00ブロックを展開中…");
+        // 1ホップ＝1タブ（BUG-188）。複数タブ案件（una/jdek、絞り込み前のbla）で全タブを
+        // 1ホップ内で直列にGAS呼び出しすると、巨大シートでは GASタイムアウト×タブ数が
+        // ホップの実行時間上限を超え、Workerがcatchを通らずサイレント終了していた
+        // （実行ログは「実行中」のまま／エラー通知も完了通知も出ない）。BUG-119の
+        // アップロード分割と同じ考え方で、1ホップの上限を「GAS1回分」に固定する。
+        const sheetIdx = state.sheetIndex ?? 0;
+        if (sheetIdx === 0) await postProgress(env, plan, "📊 集計表にCR00ブロックを展開中…");
         // 集計内(親)ブロックは常に cr番号のみ（例 cr83）。パターン番号(_01/_02)や説明は付けない（BUG-32）。
         // パターン番号を持つ動画は集計外(子)ブロックとして展開する。単独入稿でも cr83_01 は
         // 「親cr83 / 子cr83_01」になる。パターン無し(cr82等)は親ブロックのみ（子なし単独CR）。
         const parentSheetId = sheetParentId(plan);
         const childIds = plan.videos.map((v) => v.sheetId).filter((sid) => /cr\d+_\d{2}/i.test(sid));
-        const results: string[] = [];
-        const insertedCols: string[] = [];
-        const pending: { idx: number; spreadsheetId: string; sheetName?: string; label: string }[] = [];
-        for (const t of gasTargets) {
+        // ホップをまたぐので結果はplanに溜める（連鎖ペイロードに載って次ホップへ渡る）
+        const results: string[] = (plan as any)._sheetResults || [];
+        const insertedCols: string[] = (plan as any)._sheetInsertedCols || [];
+        const pending: { idx: number; spreadsheetId: string; sheetName?: string; label: string }[] =
+          (plan as any)._sheetPending || [];
+        for (const t of gasTargets.slice(sheetIdx, sheetIdx + 1)) {
           const r = await callSheetSubmit(env.SUBMIT_GAS_URL || env.COMMON_GAS_URL, {
             action: "submitCreative",
             spreadsheetId: t.spreadsheetId,
@@ -403,7 +417,7 @@ async function runHop(
             }
           } else if (/タイムアウト/.test(r.error || "")) {
             // タイムアウトはGAS側で処理継続中の可能性が高い（クライアント切断ではGASは止まらない）。
-            // 巨大シート(kk_kou等)ではほぼ毎回25秒を超え、実際は成功しているのに❌表示になっていた
+            // 巨大シート(kk_kou/bla等)ではほぼ毎回タイムアウト上限を超え、実際は成功しているのに❌表示になっていた
             // （BUG-95）。失敗と断定せず、sheet_verifyでID行への反映を確認してから結果を出す。
             results.push(`${label}（確認中）`);
             pending.push({ idx: results.length - 1, spreadsheetId: t.spreadsheetId, sheetName: t.sheetName, label });
@@ -413,8 +427,13 @@ async function runHop(
         }
         (plan as any)._sheetResults = results;
         if (insertedCols.length) (plan as any)._sheetInsertedCols = insertedCols;
+        (plan as any)._sheetPending = pending;
+        if (sheetIdx + 1 < gasTargets.length) {
+          state.sheetIndex = sheetIdx + 1;
+          break; // 次のタブへ連鎖（ホップを分ける）
+        }
+        state.sheetIndex = undefined;
         if (pending.length > 0) {
-          (plan as any)._sheetPending = pending;
           (plan as any)._sheetCheckIds = [parentSheetId, ...childIds];
           state.step = "sheet_verify";
           state.attempts = 0;
@@ -1334,6 +1353,32 @@ function sheetParentId(plan: SubmitPlan): string {
   // plan.crKey は resolve.ts で抽出済みの「cr83」なのでそれを使う。
   const m = plan.crKey.match(/cr\d+/i);
   return m ? m[0].toLowerCase() : plan.crKey.toLowerCase();
+}
+
+/**
+ * 入稿の対象タブを、CR名（＝Meta広告名）の部位プレフィックスで絞る（BUG-188）。
+ *
+ * bla は1つの広告アカウントに face/body 両方が入っていて、部位ごとにcr番号が独立採番される。
+ * 従来は案件の全タブへ展開していたため、blaf（フェイシャル）のCRが meta_body にも
+ * 空ブロックとして作られていた（meta_body に cr19/cr20/cr22 系が消化金額0で並んでいた）。
+ * サムネ挿入側は BUG-137 で既にプレフィックス絞り込み済みで、展開側だけ取り残されていた。
+ *
+ * 副次的に、1回の入稿で叩くGASが1タブ分になるので sheet ホップの所要時間も半分になる。
+ * adNamePrefix 未設定の案件（una/jdek 等、タブが部位で分かれていない）は判別材料が無いので
+ * 従来どおり全タブが対象。
+ */
+function submitSheetTargets(gasTargets: GasTarget[], plan: SubmitPlan): GasTarget[] {
+  if (!gasTargets.some((t) => t.adNamePrefix)) return gasTargets;
+  const names = [plan.parentName, ...plan.videos.map((v) => v.adName)]
+    .filter(Boolean)
+    .map((n) => String(n).toLowerCase());
+  const hit = gasTargets.filter((t) => {
+    const prefix = t.adNamePrefix?.toLowerCase();
+    return !prefix || names.some((n) => n.startsWith(`${prefix}_`));
+  });
+  // どのプレフィックスにも一致しない（想定外の命名）→ 従来どおり全タブ。
+  // 「1つも展開されない」より「余分に展開される」ほうが気づける＆復旧が容易。
+  return hit.length ? hit : gasTargets;
 }
 
 /**

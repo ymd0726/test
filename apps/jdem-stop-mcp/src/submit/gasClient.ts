@@ -25,10 +25,14 @@ export interface SheetSubmitResult {
 }
 
 // GAS応答待ちの上限。長くしすぎるとCloudflareのhop実行上限手前でkillされ、
-// 完了通知が出ないまま「止まる」ように見える（BUG-49）。25秒で確実にabortさせ、
-// タイムアウト時も後続(notion→done)へ進めて完了通知を必ず出す。
-// ※BUG-32でGAS側の列幅コピーを高速化済みのため、再デプロイ後は25秒に十分収まる。
-const GAS_TIMEOUT_MS = 25_000;
+// 完了通知が出ないまま「止まる」ように見える（BUG-49）。確実にabortさせ、
+// タイムアウト時も後続(sheet_verify→notion→done)へ進めて完了通知を必ず出す。
+// ※BUG-32でGAS側の列幅コピーを高速化済み。
+// BUG-188: 25秒だとホップ内の他の処理（実行ログ更新・進捗投稿・次ホップ連鎖）と
+// 合わせてホップ実行上限ぎりぎりになり、bla（巨大シートで毎回上限まで掛かる案件）は
+// catchも通らずサイレント終了していた。18秒に下げて余裕を作る。18秒で返らなかった分は
+// submitCheck のポーリング（sheet_verify）が拾うので、成功が❌になることはない。
+const GAS_TIMEOUT_MS = 18_000;
 
 export async function callSheetSubmit(
   gasUrl: string,
