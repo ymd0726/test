@@ -84,7 +84,8 @@ export async function startExecution(
     plan,
     plan.sheetOnly
       ? `📊 集計表だけ展開します: *${plan.parentName}*（Metaへの入稿はしません）${logWarn}`
-      : `🚀 入稿を開始します: *${plan.parentName}*（動画 ${plan.videos.length} 本）${logWarn}`
+      : `🚀 入稿を開始します: *${plan.parentName}*（動画 ${plan.videos.length} 本）`
+        + `\n${submitTargetLines(plan)}${pausedTargetWarn(plan)}${logWarn}`
   );
   ctx.waitUntil(runHop(state, env, metaToken, projectAccountId, gasTargets));
 }
@@ -1353,6 +1354,37 @@ function sheetParentId(plan: SubmitPlan): string {
   // plan.crKey は resolve.ts で抽出済みの「cr83」なのでそれを使う。
   const m = plan.crKey.match(/cr\d+/i);
   return m ? m[0].toLowerCase() : plan.crKey.toLowerCase();
+}
+
+/**
+ * 入稿開始メッセージに出す「どこへ入れるか」の行（BUG-189）。
+ * 従来は cr名と動画本数しか出しておらず、入稿先は完了通知まで分からなかった。
+ * nrn のように酷似名の広告セットが別キャンペーンに並ぶ案件で取り違えても
+ * 気づけなかったため、開始の時点で キャンペーン / 広告セット を明示する。
+ */
+function submitTargetLines(plan: SubmitPlan): string {
+  const targets = plan.targets?.length
+    ? plan.targets
+    : [{ adsetName: plan.adsetName, campaignName: plan.campaignName }];
+  return targets
+    .map((t) => `　→ ${t.campaignName ? `*${t.campaignName}* / ` : ""}${t.adsetName}`)
+    .join("\n");
+}
+
+/**
+ * 停止中の広告セットへ入稿しようとしている場合の事前警告（BUG-189）。
+ * 完了後にも同じ趣旨の警告は出る（BUG-33）が、それだと動画アップロードの数分を
+ * 使い切ってから気づくことになる。開始直後に出して取り消す判断ができるようにする。
+ */
+function pausedTargetWarn(plan: SubmitPlan): string {
+  const targets = plan.targets?.length
+    ? plan.targets.map((t) => ({ name: t.adsetName, cp: t.campaignName, st: t.adsetEffectiveStatus }))
+    : [{ name: plan.adsetName, cp: plan.campaignName, st: plan.adsetEffectiveStatus }];
+  // 状態を持っていない経路（旧ボタン等）では何も出さない＝従来どおり
+  const paused = targets.filter((t) => t.st && t.st !== "ACTIVE");
+  if (!paused.length) return "";
+  const names = paused.map((t) => `${t.cp ? `${t.cp} / ` : ""}${t.name}`).join("、");
+  return `\n:warning: 入稿先が停止中です（${names}）。このままだと広告をONにしても *配信されません*。キャンペーンの取り違えでないか確認してください`;
 }
 
 /**

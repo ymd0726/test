@@ -211,6 +211,16 @@ async function resolveAndAsk(
                       text: truncate(`${c.effectiveStatus === "ACTIVE" ? "🟢" : "⏸"} ${c.name}`, 75),
                       emoji: true,
                     },
+                    // キャンペーン名は見出しだけでなく各選択肢にも出す（BUG-189）。
+                    // nrn のように「cp01/adset02_詳細TG_2軍(ターゲット混同)」と
+                    // 「cp06/adset02_詳細TG_ターゲット混同」という酷似名が別キャンペーンに
+                    // 並ぶ案件があり、見出しだけだとスクロール中に取り違える。
+                    // description は選択肢ごとに小さく1行付くので店舗名は埋もれない。
+                    description: {
+                      type: "plain_text",
+                      text: truncate(c.campaignName || "(キャンペーン名なし)", 75),
+                      emoji: true,
+                    },
                     value: c.id,
                   })),
                 },
@@ -609,6 +619,7 @@ async function confirmAndRun(
           adsetId: c.id,
           adsetName: c.name,
           campaignName: c.campaignName,
+          adsetEffectiveStatus: c.effectiveStatus, // 停止中セットへの入稿を開始時に警告する（BUG-189）
           sourceAdId: c.latestAd!.id,
           sourceAdName: c.latestAd!.name,
         }));
@@ -625,6 +636,7 @@ async function confirmAndRun(
       if (chosen) {
         plan.adsetName = chosen.name;
         plan.campaignName = chosen.campaignName;
+        plan.adsetEffectiveStatus = chosen.effectiveStatus; // BUG-189
         plan.sourceAdId = chosen.latestAd!.id;
         plan.sourceAdName = chosen.latestAd!.name;
       } else if (!plan.sourceAdId) {

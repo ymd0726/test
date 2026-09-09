@@ -88,6 +88,13 @@ export interface PlannedTarget {
   adsetId: string;
   adsetName: string;
   campaignName?: string;
+  /**
+   * 選択時点の広告セットの配信状態（AdsetCandidate.effectiveStatus）。BUG-189。
+   * ACTIVE以外＝広告セットかキャンペーンが停止中で、入稿しても配信されない。
+   * 入稿完了後の警告（BUG-33）だけでは動画アップロードの数分を無駄にするので、
+   * 開始メッセージの時点で知らせるために持ち回る。
+   */
+  adsetEffectiveStatus?: string;
   /** このセットのテキスト類コピー元（各セットの直近cr広告） */
   sourceAdId: string;
   sourceAdName: string;
@@ -113,6 +120,8 @@ export interface SubmitPlan {
   adsetName: string;
   /** 入稿先キャンペーン名（完了通知の表示用） */
   campaignName?: string;
+  /** 入稿先広告セットの配信状態（単一入稿時。BUG-189の開始時警告用） */
+  adsetEffectiveStatus?: string;
   /** テキスト類のコピー元広告（複数入稿時は先頭ターゲットのもの） */
   sourceAdId: string;
   sourceAdName: string;
