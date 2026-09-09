@@ -357,10 +357,33 @@ async function graphGetAllPages(path: string, token: string, maxPages: number): 
   return out;
 }
 
+/**
+ * 入稿候補から外す目印（BUG-189）。キャンペーン名か広告セット名にこの語を入れておくと
+ * /cr-in の入稿先候補に出てこなくなる。
+ *
+ * 背景: nrn には cp01_売上 の複製として cp06_売上 があり、配下に酷似名の広告セット
+ * （adset02_詳細TG_2軍(ターゲット混同) と adset02_詳細TG_ターゲット混同）が並んでいたため
+ * 取り違えて停止中のセットへ入稿された。使わないキャンペーンを名前で除外できるようにして
+ * 「そもそも候補に出さない」で防ぐ。
+ *
+ * 命名規約にしたのは、Meta側のリネームだけで効かせたいから（案件レジストリに書くと
+ * 対象を増やすたびにWorkerの再デプロイが要る）。
+ * ⚠️ 効くのは入稿の候補だけ。cr停止くんの広告検索には影響しないので、除外中のキャンペーンでも
+ *    停止・再開・集計表への記録は従来どおりできる。
+ */
+const SUBMIT_EXCLUDE_RE = /入稿対象外|入稿しない|入稿不可|使用しない|使わない/;
+
+/** 名前に除外の目印が入っているか（キャンペーン名／広告セット名のどちらでも効く） */
+export function isSubmitExcludedName(name?: string): boolean {
+  return SUBMIT_EXCLUDE_RE.test(String(name || ""));
+}
+
 export async function listAdsetCandidates(
   accountId: string,
   token: string,
-  allowlist?: string[]
+  allowlist?: string[],
+  /** 除外した「キャンペーン名 / 広告セット名」の受け取り先（確認画面に理由を出すため） */
+  out?: { excluded: string[] }
 ): Promise<AdsetCandidate[]> {
   // 店舗ごとに広告セットを持つ案件（ssh は 22店舗×2キャンペーン＝40超）では1ページ(50件)に
   // 収まらず、ページングしないと一部の店舗が候補から丸ごと消える（BUG-135）。paging.next を辿る。
@@ -376,6 +399,13 @@ export async function listAdsetCandidates(
   for (const s of adsetPages) {
     if (s.effective_status === "DELETED" || s.effective_status === "ARCHIVED") continue;
     if (allowlist && allowlist.length > 0 && !allowlist.includes(s.id)) continue;
+    // 名前で入稿対象から外す（BUG-189）。黙って消すと「候補に出ない」と別の問い合わせになるため、
+    // 何を外したかは呼び出し元へ返して確認画面に出す。
+    const campName = s.campaign?.name || "";
+    if (isSubmitExcludedName(campName) || isSubmitExcludedName(s.name)) {
+      out?.excluded.push(`${campName ? `${campName} / ` : ""}${s.name}`);
+      continue;
+    }
     const ads: any[] = s.ads?.data || [];
     const crAds = ads
       .filter((a) => /cr\d/i.test(a.name))

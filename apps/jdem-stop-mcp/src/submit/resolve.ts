@@ -280,7 +280,22 @@ export async function resolveSubmit(
 
   // 4. Meta 広告セット候補
   if (!project.metaAdAccountId) throw new Error(`案件「${project.name}」にmetaAdAccountIdが未設定です`);
-  const candidates = await listAdsetCandidates(project.metaAdAccountId, metaToken, project.adsetAllowlist);
+  // 名前に「入稿対象外」等が入ったキャンペーン/広告セットは候補から外す（BUG-189）。
+  // 外した分は黙って消さず、確認画面に理由付きで出す。
+  const excludedBox = { excluded: [] as string[] };
+  const candidates = await listAdsetCandidates(
+    project.metaAdAccountId,
+    metaToken,
+    project.adsetAllowlist,
+    excludedBox
+  );
+  if (excludedBox.excluded.length > 0) {
+    warnings.push(
+      `:information_source: 名前に「入稿対象外」等が入っているため ${excludedBox.excluded.length} セットを候補から除外しました: ` +
+        excludedBox.excluded.slice(0, 5).join(" / ") +
+        (excludedBox.excluded.length > 5 ? ` ほか${excludedBox.excluded.length - 5}件` : "")
+    );
+  }
   const usable = candidates.filter((c) => c.latestAd);
   if (usable.length === 0) {
     throw new Error(
