@@ -32,6 +32,8 @@ import type { SubmitEnv, SubmitProject } from "./submit/types";
 // ── 翌日自動チェックくん（TOOL-40）──
 import { startDailyCheck, handleCheckContinue, handleCheckRun, CHECK_CONTINUE_PATH } from "./check";
 import { createRunLog, updateRunLog } from "./check/runlog";
+// 停止マークの読み取り専用チェック（翌日自動チェックくんと同じ実装を再利用。BUG-190）
+import { sheetsToken, resolveTab, checkStopMarks } from "./check/sheets";
 import type { CheckDeps, CheckEnv } from "./check/types";
 
 const GRAPH = "v21.0"; // Meta Graph API バージョン（古くなったらここを上げる）
@@ -284,7 +286,11 @@ function cascadeNotifyLine(cascade: CascadeResult | undefined, bold: (s: string)
 // GAS呼び出しのタイムアウト。
 // BUG-147提案⑥(a) で stop/undo だけ 25秒→50秒 に延ばしたが、BUG-159 で**この延長が
 // 悪化要因だったと判明したため25秒へ戻した**。理由は下の「実行時間バジェット」を参照。
-const GAS_TIMEOUT_CRITICAL_MS = 25000; // stop / undo
+// stop / undo の集計表GAS。BUG-190: 25秒だとホップ内の他の処理（実行ログ更新・次ホップ連鎖）と
+// 合わせて Worker の1ホップ上限ぎりぎりになり、巨大シート(kk_kou等)は catch も通らず
+// サイレント終了していた。18秒に下げて余裕を作る。18秒で返らなかった分は verify ホップが
+// 読み取り専用で反映を確認するので、成功しているのに❌表示になることはない。
+const GAS_TIMEOUT_CRITICAL_MS = 18000; // stop / undo
 const GAS_TIMEOUT_DEFAULT_MS = 25000;  // find / cascade / regray / budget
 
 // ============================================================
@@ -1644,8 +1650,12 @@ async function postResponse(url: string, body: unknown): Promise<void> {
 // （＝従来と同じ挙動にフォールバックし、最低限 finish まで必ず到達させる）。
 export const STOP_CONTINUE_PATH = "/internal/cr-stop/continue";
 
-type StopStep = "sheet" | "cascade" | "finish";
-const STOP_NEXT: Record<StopStep, StopStep | null> = { sheet: "cascade", cascade: "finish", finish: null };
+// BUG-190: sheet ホップに「GAS(最大25秒)」と「Meta のCP/AS・実績・AS残数取得」が同居していて、
+// 巨大シート(kk_kou等)ではホップ1回が30秒級になり、Workerの実行上限を超えて catch も通らず
+// サイレント終了していた（jdekkou/cr237: Meta停止は成功したのに通知もログ更新も出ない）。
+// GAS だけの sheet ホップに切り分け、Meta取得と反映確認は次の verify ホップ（新しい実行時間）へ回す。
+type StopStep = "sheet" | "verify" | "cascade" | "finish";
+const STOP_NEXT: Record<StopStep, StopStep | null> = { sheet: "verify", verify: "cascade", cascade: "finish", finish: null };
 
 interface StopChainState {
   step: StopStep;
@@ -1667,6 +1677,8 @@ interface StopChainState {
   startedAt: number;
   target?: SheetTarget; // sheetホップで解決した対象タブ（後続ホップでの再解決を避ける）
   sheet?: any;
+  /** sheetホップのGASがタイムアウトした（verifyホップで実際に反映されたか読みに行く）BUG-190 */
+  sheetTimedOut?: boolean;
   cx?: StopContext;
   cascade?: CascadeResult;
   cascadeSkipped?: boolean;
@@ -1684,18 +1696,16 @@ async function buildStopContext(token: string, ids: string[]): Promise<StopConte
   return { places, metricsLines: metricsLine(lifetime, recent, ids), adsets };
 }
 
+/**
+ * 集計表(GAS)への記録だけを行うホップ（BUG-190）。
+ * 以前はここで Meta の CP/AS・実績・AS残数取得も並行して回していたが、GASが上限まで掛かる
+ * 巨大シートではホップ1回が長くなりすぎて Worker にサイレント終了させられていた。
+ * Meta取得は verify ホップ（新しい実行時間）へ移し、このホップは「GAS 1回分」に固定する。
+ */
 async function stopHopSheet(s: StopChainState, env: Env, budget: RunBudget): Promise<void> {
   const p = projectByName(s.project);
   if (!p) { s.sheet = { success: false, message: `案件不明: ${s.project}` }; return; }
-  const token = metaToken(env, p);
   s.target = (await pickSheet(p, s.creative)) || undefined;
-  // 付加情報の取得は集計表(GAS)と並行させ、実測の待ち時間を増やさない（失敗しても停止処理は止めない）
-  const cxP: Promise<StopContext> =
-    s.affected > 0 && token
-      ? s.action === "stop"
-        ? buildStopContext(token, s.adIds)
-        : fetchAdPlacements(token, s.adIds).then((places) => ({ places }) as StopContext)
-      : Promise.resolve({} as StopContext);
   s.sheet = s.target
     ? await callGasSafe(
         s.target,
@@ -1705,7 +1715,63 @@ async function stopHopSheet(s: StopChainState, env: Env, budget: RunBudget): Pro
         budget,
       )
     : { success: false, message: "集計表に該当crなし(複数対象)" };
-  s.cx = await cxP;
+  // タイムアウトはGAS側で処理継続中の可能性が高い（クライアント切断ではGASは止まらない）。
+  // verifyホップで実際に停止マークが付いたかを読みに行くので、ここでは失敗と断定しない。
+  if (!s.sheet?.success && /aborted|AbortError|タイムアウト|上限に達した/i.test(String(s.sheet?.message || ""))) {
+    s.sheetTimedOut = true;
+  }
+}
+
+/**
+ * 反映確認＋Meta付加情報の取得ホップ（BUG-190）。
+ *
+ * ① sheetホップのGASがタイムアウトしていたら、翌日自動チェックくんと同じ読み取り専用の
+ *    停止マーク判定（checkStopMarks）で「実は書けていた」かを確認する。GASは無変更で使える。
+ *    これがあるので、GASの待ち時間を短くしても「成功しているのに❌集計表:失敗」にはならない。
+ * ② 完了通知に出す CP/AS・実績・AS残数を取る（失敗しても停止処理は止めない）。
+ */
+async function stopHopVerify(s: StopChainState, env: Env, budget: RunBudget): Promise<void> {
+  const p = projectByName(s.project);
+  if (!p) return;
+
+  // 取消(undo)は memoMode によってチェックボックスを触らない場合があり、読み取りだけでは
+  // 「戻せた」と断定できない。誤って成功と言うより従来どおり再実行を案内するほうが安全なので
+  // 反映確認は停止(stop)のみに掛ける。
+  if (s.sheetTimedOut && s.action === "stop" && s.target && env.GOOGLE_SERVICE_ACCOUNT_JSON) {
+    try {
+      const token = await sheetsToken(env.GOOGLE_SERVICE_ACCOUNT_JSON);
+      const tab = s.target.sheetName || (await resolveTab(token, s.target.spreadsheetId, s.target.sheetName)) || "";
+      // 数秒差でGASが書き終わることが多いので、予算の許す範囲で数回だけ見直す
+      for (let i = 0; i < 3; i++) {
+        const marks = await checkStopMarks(token, s.target.spreadsheetId, tab, s.creative);
+        if (marks.found && marks.checkboxOn === true) {
+          s.sheet = {
+            success: true,
+            message: `GAS応答待ちタイムアウト後、集計表への反映を確認しました（タブ: ${tab}）`,
+          };
+          break;
+        }
+        if (i === 2 || budget.allow(8000) <= 0) break;
+        await new Promise((r) => setTimeout(r, 5000));
+      }
+    } catch (e) {
+      // 確認できなかっただけ。s.sheet は元の「失敗＋再実行案内」のまま残す
+      s.chainWarn = (s.chainWarn || "") + `\n⚠️ 集計表への反映確認に失敗（${e}）`;
+    }
+  }
+
+  const token = metaToken(env, p);
+  if (s.affected > 0 && token) {
+    try {
+      s.cx = s.action === "stop"
+        ? await buildStopContext(token, s.adIds)
+        : ({ places: await fetchAdPlacements(token, s.adIds) } as StopContext);
+    } catch {
+      s.cx = {} as StopContext; // 表示用の付加情報。取れなくても停止処理は止めない
+    }
+  } else {
+    s.cx = {} as StopContext;
+  }
 }
 
 async function stopHopCascade(s: StopChainState, env: Env, budget: RunBudget): Promise<void> {
@@ -1778,7 +1844,8 @@ async function chainStop(state: StopChainState, env: Env, senv: SubmitEnv): Prom
 
 /** 連鎖できなかった場合に、この実行の残り時間で続きをやりきる（必ず finish まで到達させる） */
 async function runStopRemainingInline(s: StopChainState, env: Env, budget: RunBudget): Promise<void> {
-  if (s.step === "sheet") { try { await stopHopSheet(s, env, budget); } catch (e) { s.chainWarn = (s.chainWarn || "") + `\n⚠️ 集計表処理でエラー: ${e}`; } s.step = "cascade"; }
+  if (s.step === "sheet") { try { await stopHopSheet(s, env, budget); } catch (e) { s.chainWarn = (s.chainWarn || "") + `\n⚠️ 集計表処理でエラー: ${e}`; } s.step = "verify"; }
+  if (s.step === "verify") { try { await stopHopVerify(s, env, budget); } catch { /* ベストエフォート */ } s.step = "cascade"; }
   if (s.step === "cascade") { try { await stopHopCascade(s, env, budget); } catch { /* ベストエフォート */ } s.step = "finish"; }
   await stopHopFinish(s, env);
 }
@@ -1788,6 +1855,7 @@ async function runStopHop(s: StopChainState, env: Env, senv: SubmitEnv): Promise
   try {
     if (s.step === "finish") { await stopHopFinish(s, env); return; }
     if (s.step === "sheet") await stopHopSheet(s, env, budget);
+    else if (s.step === "verify") await stopHopVerify(s, env, budget);
     else await stopHopCascade(s, env, budget);
   } catch (e) {
     s.chainWarn = (s.chainWarn || "") + `\n⚠️ 処理中にエラー: ${e}`;
